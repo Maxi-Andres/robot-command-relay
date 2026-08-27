@@ -32,7 +32,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BIND = os.environ.get("RELAY_BIND", "0.0.0.0")
+BIND = os.environ.get("RELAY_BIND", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
 PORT = int(os.environ.get("RELAY_PORT", "8092"))
 TOKEN_FILE = os.environ.get("RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
 TOKEN = os.environ.get("RELAY_TOKEN", "")

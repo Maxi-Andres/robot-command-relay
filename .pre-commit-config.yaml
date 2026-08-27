@@ -1,0 +1,29 @@
+# Commit gate for code that runs ON THE ROBOT. ruff is pinned to py38 in ruff.toml, so this
+# also enforces the deploy constraint: 3.9+ syntax cannot get committed.
+# The full suite and the dependency audit run in CI (.github/workflows/ci.yml).
+fail_fast: false
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff (lint, py38 target)
+        entry: ruff check --force-exclude
+        language: system
+        types: [python]
+      - id: pytest
+        name: pytest
+        # exit 5 = "no tests collected" — see the note in the AI-VL configs.
+        entry: bash -c 'python3 -m pytest -q; rc=$?; [ $rc -eq 5 ] && exit 0; exit $rc'
+        language: system
+        pass_filenames: false
+        always_run: true

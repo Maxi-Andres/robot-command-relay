@@ -1,0 +1,33 @@
+# Lint + format for code that runs ON THE ROBOT.
+#
+# target-version is 3.8 deliberately: the robot's Jetson ships Ubuntu 20.04 with Python 3.8,
+# and this code is stdlib-only for that reason. Pinning it here makes ruff REFUSE to suggest
+# 3.9+ syntax that would break on the robot — the linter enforces the deploy constraint.
+target-version = "py38"
+line-length = 100
+exclude = ["__pycache__", "frigate/media", "bin"]
+
+[lint]
+select = [
+  "E", "W", "F",
+  "I",
+  "UP",            # bounded by target-version above, so it only suggests 3.8-safe rewrites
+  "B",
+  "SIM",
+  "S",             # security — this tier is the one exposed to the network
+  "RUF",
+]
+ignore = [
+  "S101",
+  "S603", "S607",  # subprocess: pgrep and the gstreamer/ffmpeg pipelines
+  "RUF001", "RUF002", "RUF003",  # ambiguous unicode: the prose uses real typography (— ℹ −) on purpose
+  "S110",    # try-except-pass: deliberate here — logging must never break a control path.
+             # New code still owes a log line; standard §6 covers it and the review catches it.
+  "S310",    # urlopen with a configured URL (HEC endpoint, MJPEG stream) — audited, not user input
+  "S108",    # /var/tmp for the spool and audit log: chosen so a full disk cannot fill $HOME
+  "SIM105",  # explicit try/except reads clearer than contextlib.suppress in teardown paths
+  "E501",
+]
+
+[format]
+quote-style = "double"
