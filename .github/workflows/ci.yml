@@ -17,7 +17,12 @@ jobs:
       - name: Lint (py38 target)
         run: ruff check --output-format=github
       - name: Test
-        run: pytest -q
+        # exit 5 = "no tests collected". A repo without a suite yet must not fail CI; a repo
+        # whose suite breaks must. Mirrors the pre-commit gate exactly.
+        run: |
+          pytest -q; rc=$?
+          [ $rc -eq 5 ] && exit 0
+          exit $rc
       # The C++ here links against the Unitree SDK, which is not vendored — it is cloned on
       # the robot and on the dev box. Nothing to compile in CI; the tests cover the Python
       # layer and read the C++ dispatch table as text where it matters.

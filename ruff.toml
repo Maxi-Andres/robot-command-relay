@@ -14,6 +14,7 @@ select = [
   "UP",            # bounded by target-version above, so it only suggests 3.8-safe rewrites
   "B",
   "SIM",
+  "FA",            # PEP 585/604 syntax without the __future__ import — breaks on 3.8
   "S",             # security — this tier is the one exposed to the network
   "RUF",
 ]

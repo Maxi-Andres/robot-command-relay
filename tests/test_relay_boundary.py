@@ -4,6 +4,10 @@ agrees with the one in C++.
 This service is the only remote path that can move the robot, so the tests here are about
 refusal, not capability. Nothing touches DDS or spawns `command_sender`.
 """
+# Lazy annotations: this repo targets Python 3.8 (the robot's Jetson), where `set[str]`
+# in an evaluated annotation is a TypeError. CI on 3.8 caught it; ruff's FA rule now does.
+from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
