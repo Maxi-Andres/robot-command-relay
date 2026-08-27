@@ -1,0 +1,4 @@
+command_sender
+*.o
+__pycache__/
+relay.env

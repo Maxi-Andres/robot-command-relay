@@ -1,0 +1,45 @@
+# Remote command relay, for the robot's own Jetson.
+#
+#   cp relay/relay.env.example relay/relay.env          # then review the safety limits
+#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > ~/.relay_token && chmod 600 ~/.relay_token
+#   sudo cp systemd/robot-command-relay.service /etc/systemd/system/
+#   sudo systemctl enable --now robot-command-relay
+#
+# This is the ONE service here that can move the robot. Unlike the telemetry agent it is not
+# read-only, which is why it carries a token, a rate limit, a verb allowlist and a dead-man
+# switch. Keep it reachable only over the VPN.
+[Unit]
+Description=Robot remote command relay (HTTP -> DDS)
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+User=unitree
+WorkingDirectory=/home/unitree/robot-command-relay
+# Defaults first, then the config file: systemd applies these IN ORDER and the last one
+# wins, so EnvironmentFile must come after the Environment lines.
+Environment=RELAY_BIND=0.0.0.0
+Environment=RELAY_PORT=8092
+Environment=DDS_IFACE=eth0
+Environment=MAX_VX=0.6
+Environment=MAX_VY=0.4
+Environment=MAX_VYAW=1.0
+Environment=DEADMAN_MS=1500
+Environment=SENDER_BIN=/home/unitree/robot-command-relay/command_sender
+EnvironmentFile=-/home/unitree/robot-command-relay/relay.env
+ExecStart=/usr/bin/python3 /home/unitree/robot-command-relay/relay_server.py
+Restart=always
+RestartSec=5
+# Stopping the unit closes command_sender's stdin, which makes it StopMove before exiting —
+# so a restart or a shutdown can never leave the robot walking. SIGTERM, never SIGKILL first.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# It must never compete with the robot's own control stack.
+MemoryMax=256M
+CPUQuota=25%
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

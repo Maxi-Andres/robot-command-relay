@@ -1,0 +1,108 @@
+# robot-command-relay
+
+The remote command path for a Unitree robot. **It runs on the robot's own high-level
+computer**, and it is the only component in this ecosystem that can make the robot move.
+
+Split out of `robot-telemetry-agent` (formerly `robot-splunk-bridge`), which is read-only.
+They shared a repo because they share a build recipe and a deploy target, but nothing else:
+a name that said "splunk" made the robot's control path invisible to anyone auditing it.
+
+## Why on the robot
+
+DDS cannot be read or published across a subnet boundary on these robots. Measured on a Go2:
+
+| From | DDS topics visible |
+|---|---|
+| The robot's own subnet (`192.168.123.0/24`) | **122** |
+| Another subnet, routed (ping works, 1.3 ms) | **2** |
+| Another subnet with explicit unicast DDS peers | **3** |
+
+So the process that publishes commands has to live next to the robot's DDS, and what
+crosses the network is HTTP. Full reasoning: `robot-splunk-docs/RED-Y-DDS.md`.
+
+## Shape
+
+```
+AI-VL executor (anywhere) ──HTTPS/VPN──▶ relay_server.py ──stdin──▶ command_sender ──DDS──▶ 🤖
+                                         allowlist, rate limit      clamp, dead-man
+                                         token, audit log           allowlist by construction
+```
+
+- **`relay_server.py`** — stdlib only (the robot has Python 3.8). Bearer token on every
+  request, per-second rate limit, verb translation (no passthrough), audit log.
+- **`src/command_sender.cpp`** — native Unitree SDK, no ROS2. Owns the safety envelope:
+  velocity clamp, dead-man switch, and a dispatch table with no generic `api_id` path, so
+  acrobatics simply do not exist here. Closing its stdin sends `StopMove` before exiting.
+
+## Defences, from outside in
+
+1. **Bearer token** on every request, separate from the Splunk token.
+2. **Rate limit** per second, so a stuck caller cannot flood the control bus.
+3. **No passthrough.** Verbs are translated to a fixed line protocol; an unknown verb is
+   rejected here and would be rejected again by `command_sender`.
+4. **Velocity clamp** to `MAX_VX` / `MAX_VY` / `MAX_VYAW`, whatever the caller asks for.
+5. **Dead-man switch** in `command_sender`, not here, so it still protects the robot if
+   this process hangs or is killed.
+6. **EOF stops the robot.** If the HTTP layer dies, stdin closes and `StopMove` is sent.
+7. **Audit log**: one line per command with time, source address, verb and result.
+
+## Deploy to the robot
+
+```bash
+ssh unitree@<robot-jetson>
+git clone https://github.com/unitreerobotics/unitree_sdk2.git ~/unitree_sdk2
+git clone <this-repo> ~/robot-command-relay
+cd ~/robot-command-relay && ./build.sh
+
+printf '%s' 'A-LONG-RANDOM-STRING' > ~/.relay_token && chmod 600 ~/.relay_token
+sudo cp systemd/robot-command-relay.service /etc/systemd/system/
+sudo systemctl enable --now robot-command-relay
+```
+
+Updating later: `git pull && ./build.sh && sudo systemctl restart robot-command-relay`.
+The rebuild is **not** optional — the binary is gitignored, so a pull brings new source
+without rebuilding it.
+
+The token lives in `~/.relay_token`, outside the repo: a pull never overwrites it and a
+push never leaks it.
+
+## Build
+
+```bash
+UNITREE_SDK2_DIR=~/unitree_sdk2 ./build.sh     # x86_64 or aarch64, same command
+```
+
+## Run
+
+```bash
+RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
+```
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RELAY_BIND` | `0.0.0.0` | Address to listen on. Should be the VPN-facing address only |
+| `RELAY_PORT` | `8092` | HTTP port the AI-VL executor forwards to |
+| `RELAY_TOKEN_FILE` | `~/.relay_token` | Read when `RELAY_TOKEN` is unset; refuses to start without a token |
+| `DDS_IFACE` | `eth0` | Interface CycloneDDS binds to. **Required** — `Init(0, iface)` alone receives nothing |
+| `MAX_VX` / `MAX_VY` / `MAX_VYAW` | `0.6` / `0.4` / `1.0` | Velocity clamps, enforced in `command_sender` |
+| `DEADMAN_MS` | `1500` | A movement not refreshed within this window is stopped automatically |
+| `MAX_PER_SEC` | `20` | Rate limit |
+| `AUDIT_LOG` | `/var/tmp/robot-relay-audit.log` | One line per command |
+
+## Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Sender liveness, allowed verbs, and what the robot reports about its own video, telemetry and safety limits |
+| `POST /cmd` | `{verb, vx?, vy?, vyaw?}` — the only endpoint that can move the robot |
+
+Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
+`recovery_stand`, `sit`, `rise_sit`, `hello`, `keepalive`.
+
+## Who calls this
+
+The AI-VL robot executor (`unitree_ros2/robot_executor/`), when a robot's transport is set
+to `relay` instead of `dds`. That mode is what works once the robot is itinerant and no
+longer shares a subnet with the server.
