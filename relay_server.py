@@ -30,6 +30,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIND = os.environ.get("RELAY_BIND", "0.0.0.0")  # noqa: S104  # known finding P0-1: binds broadly, no auth yet
@@ -49,6 +51,140 @@ VERBS = {"stop_move", "stand_up", "stand_down", "damp", "balance_stand",
 
 def log(msg):
     print(f"[relay] {msg}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# Video tuning — the authenticated front door for the live-view knobs
+#
+# WHY IT LIVES HERE: mjpeg_server binds 0.0.0.0 with no authentication (known finding
+# P0-1), so a WRITE route on it reachable from the network would make that worse. This
+# relay already has the token, and its /health already reports the video config. So it
+# validates, and only then calls mjpeg_server from 127.0.0.1 — which is the only address
+# that endpoint accepts.
+#
+# The allowlist is the same shape as VERBS above, and for the same reason: a generic
+# "write any key" would let a typo (NIC=eth9) take the video off the air on a robot in the
+# field, recoverable only over SSH — the exact trip this feature exists to save.
+#
+# ONLY live-tunable keys belong here. Anything the GStreamer pipeline reads at launch
+# (BITRATE, MAXFPS, IDR_FRAMES…) needs a service restart, which needs privileges this
+# process does not have; leaving those out is deliberate, not an oversight.
+# --------------------------------------------------------------------------- #
+VIDEO_ENV = os.environ.get(
+    "VIDEO_ENV", "/home/unitree/robot-video-pipeline/robot/video.env")
+MJPEG_LOCAL = os.environ.get("MJPEG_LOCAL", "http://127.0.0.1:8093")
+# key -> (env name, cast, min, max). Mirrors mjpeg_server.LIVE_PARAMS: the two run in
+# different repos on the same machine, so the boundary forbids a shared module — they are
+# kept honest by a test on each side. If you change one, change the other.
+VIDEO_PARAMS = {
+    "fps":     ("MJPEG_FPS", float, 0.0, 60.0),
+    "width":   ("MJPEG_WIDTH", int, 0, 1920),
+    "quality": ("MJPEG_QUALITY", int, 1, 100),
+}
+
+
+def validate_video(body):
+    """{fps,width,quality} -> {ENV_NAME: value}. Raises ValueError.
+
+    Everything is validated BEFORE anything is written, so a bad value in a two-key request
+    cannot leave the file half-updated.
+    """
+    unknown = set(body) - set(VIDEO_PARAMS)
+    if unknown:
+        raise ValueError(f"unknown parameter(s): {sorted(unknown)}; "
+                         f"allowed: {sorted(VIDEO_PARAMS)}")
+    if not body:
+        raise ValueError("nothing to set")
+    out = {}
+    for key, raw in body.items():
+        name, cast, lo, hi = VIDEO_PARAMS[key]
+        try:
+            value = cast(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"'{key}' must be {cast.__name__}, got {raw!r}") from None
+        if not lo <= value <= hi:
+            raise ValueError(f"'{key}' must be between {lo} and {hi}, got {value}")
+        out[name] = value
+    return out
+
+
+def read_env_file(path):
+    """KEY=VALUE pairs from an env file. Missing file = {}, never an error."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def write_env_keys(path, updates):
+    """Replace these keys in an env file, keeping every other line and its order.
+
+    Atomic (write-then-rename): a half-written video.env would leave run-video.sh unable to
+    start, and this file is read on every restart of the publisher.
+
+    Twin of `_set_env_keys` in unitree_ros2/robot_executor/robot_executor_service.py — the
+    two live on different machines so the boundary forbids sharing the module. Each has its
+    own test.
+    """
+    lines = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        pass
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") \
+            else ""
+        if key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out).rstrip("\n") + "\n")
+    os.replace(tmp, path)
+
+
+def mjpeg_live():
+    """The publisher's RUNNING knobs, or {} if it is not answering.
+
+    Never raises: this is reporting, and a video publisher that is down must not take the
+    relay's status endpoint down with it.
+    """
+    try:
+        with urllib.request.urlopen(f"{MJPEG_LOCAL}/health", timeout=2) as r:
+            d = json.loads(r.read())
+        return {"fps": d.get("fps_cap") or 0, "width": d.get("width"),
+                "quality": d.get("quality")}
+    except Exception:
+        return {}
+
+
+def mjpeg_apply(body):
+    """Push {fps,width,quality} to the publisher on localhost. {'error': …} on failure."""
+    try:
+        req = urllib.request.Request(
+            f"{MJPEG_LOCAL}/config", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            d = json.loads(r.read() or b"{}")
+        return {k: d.get(k) for k in VIDEO_PARAMS if k in d}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:200].decode("utf-8", "replace")
+        return {"error": f"publisher refused it: HTTP {exc.code}: {detail}"}
+    except Exception as exc:
+        return {"error": f"video publisher unreachable on {MJPEG_LOCAL}: {exc}"}
 
 
 def audit(addr, verb, detail, result):
@@ -215,7 +351,64 @@ class Handler(BaseHTTPRequestHandler):
         got = self.headers.get("Authorization", "")
         return got.startswith("Bearer ") and got[7:] == self.server.token
 
+    def _video_config(self):
+        """POST /video-config {fps?, width?, quality?, persist?}
+
+        Applies the values to the running publisher immediately, and with persist=true
+        also writes them to video.env so they survive the next restart. Applying and
+        saving are separate on purpose: tuning while driving wants the former, and only
+        the values you settle on deserve the latter.
+        """
+        if not self._authorised():
+            audit(self.client_address[0], "video-config", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        persist = bool(body.pop("persist", False))
+        try:
+            env_updates = validate_video(body)
+        except ValueError as exc:
+            audit(self.client_address[0], "video-config", str(body), "rejected")
+            return self._json(400, {"ok": False, "error": str(exc)})
+
+        applied = mjpeg_apply(body)
+        if applied.get("error"):
+            audit(self.client_address[0], "video-config", str(body), "publisher-unreachable")
+            return self._json(502, {"ok": False, "error": applied["error"]})
+
+        saved = False
+        if persist:
+            try:
+                write_env_keys(VIDEO_ENV, env_updates)
+                saved = True
+            except OSError as exc:
+                # The live change already took: report the partial success honestly rather
+                # than pretending the whole request failed.
+                audit(self.client_address[0], "video-config", str(body), "applied-not-saved")
+                return self._json(200, {"ok": True, "running": applied, "saved": False,
+                                        "error": f"applied but not saved: {exc}"})
+        audit(self.client_address[0], "video-config", str(body),
+              "applied+saved" if saved else "applied")
+        return self._json(200, {"ok": True, "running": applied, "saved": saved})
+
     def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/video-config":
+            if not self._authorised():
+                return self._json(401, {"error": "unauthorised"})
+            # RUNNING and SAVED are different things and the UI must be able to show both:
+            # editing video.env without restarting is exactly how this report started
+            # lying before, which is why /health reads /proc instead of the file.
+            saved = read_env_file(VIDEO_ENV)
+            return self._json(200, {
+                "ok": True,
+                "running": mjpeg_live(),
+                "saved": {k: saved.get(name) for k, (name, *_) in VIDEO_PARAMS.items()},
+                "limits": {k: {"min": lo, "max": hi}
+                           for k, (_n, _c, lo, hi) in VIDEO_PARAMS.items()},
+            })
         if self.path.split("?")[0] != "/health":
             return self._json(404, {"error": "not found"})
         proc = self.server.sender.proc
@@ -229,6 +422,8 @@ class Handler(BaseHTTPRequestHandler):
                          "limits": limits_status()})
 
     def do_POST(self):
+        if self.path.split("?")[0].rstrip("/") == "/video-config":
+            return self._video_config()
         if self.path.split("?")[0] != "/cmd":
             return self._json(404, {"error": "not found"})
         if not self._authorised():

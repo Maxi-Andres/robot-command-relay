@@ -145,3 +145,85 @@ def test_token_comparison_is_constant_time():
     import inspect
     src = inspect.getsource(relay_server.Handler._authorised)
     assert "compare_digest" in src
+
+
+# --------------------------------------------------------------------------- #
+# Video tuning: the allowlist and the env writer
+#
+# This route writes a file on the robot and retunes the video the operator steers by, so
+# the tests are again about REFUSAL. A value that gets through and ruins the stream on a
+# robot in the field can only be undone over SSH — the exact trip the feature removes.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("body, expect", [
+    ({"fps": 0}, {"MJPEG_FPS": 0.0}),
+    ({"fps": 60}, {"MJPEG_FPS": 60.0}),
+    ({"width": 0}, {"MJPEG_WIDTH": 0}),
+    ({"width": 1920}, {"MJPEG_WIDTH": 1920}),
+    ({"quality": 1}, {"MJPEG_QUALITY": 1}),
+    ({"quality": 100}, {"MJPEG_QUALITY": 100}),
+    ({"fps": 5, "width": 640, "quality": 55},
+     {"MJPEG_FPS": 5.0, "MJPEG_WIDTH": 640, "MJPEG_QUALITY": 55}),
+])
+def test_valid_video_params_map_to_env_keys(body, expect):
+    assert relay_server.validate_video(body) == expect
+
+
+@pytest.mark.parametrize("body", [
+    {"fps": -1}, {"fps": 61}, {"fps": "fast"},
+    {"width": -1}, {"width": 4096},
+    {"quality": 0}, {"quality": 101},
+    {"bitrate": 4000000},      # real knob, but needs a pipeline restart — not live
+    {"NIC": "eth9"},           # would take the video off the air; must never reach the file
+    {"PUBLISH_HOST": "evil"},  # nor may an arbitrary env key be smuggled through
+    {},                        # an empty request is a mistake, not a no-op
+])
+def test_bad_video_params_are_refused(body):
+    with pytest.raises(ValueError):
+        relay_server.validate_video(body)
+
+
+def test_the_allowlist_agrees_with_the_publisher_on_the_same_machine():
+    """The defect: the relay and mjpeg_server drifting apart, so the relay accepts a value
+    the publisher then rejects — or worse, silently clamps.
+
+    They are separate repos on one machine and the network boundary forbids a shared
+    module, so this comparison is the only thing keeping the two copies honest. It is the
+    same reason the MJPEG parser is tested on both sides.
+    """
+    publisher = (Path.home() / "Desktop/robot-ecosystem/robot-video-pipeline/robot"
+                 / "mjpeg_server.py")
+    if not publisher.exists():
+        pytest.skip("the video-pipeline repo is not checked out next to this one")
+    src = publisher.read_text(encoding="utf-8")
+    for key, (_env, cast, lo, hi) in relay_server.VIDEO_PARAMS.items():
+        pattern = rf'"{key}":\s*\("[A-Z_]+",\s*{cast.__name__},\s*([0-9.]+),\s*([0-9.]+)\)'
+        m = re.search(pattern, src)
+        assert m, f"'{key}' is missing from mjpeg_server.LIVE_PARAMS (or changed shape)"
+        assert (float(m.group(1)), float(m.group(2))) == (float(lo), float(hi)), (
+            f"'{key}' range differs: relay {lo}-{hi}, publisher {m.group(1)}-{m.group(2)}")
+
+
+def test_writing_env_keys_preserves_everything_else(tmp_path):
+    """The defect: rewriting video.env from scratch and losing PUBLISH_HOST, the comments,
+    or the operator's other settings. run-video.sh REFUSES to start without PUBLISH_HOST,
+    so that mistake takes the video off the air until someone SSHes in."""
+    f = tmp_path / "video.env"
+    f.write_text("# a comment\nPUBLISH_HOST=192.168.20.99\nMJPEG_FPS=0\nBITRATE=600000\n")
+    relay_server.write_env_keys(str(f), {"MJPEG_FPS": 15, "MJPEG_WIDTH": 640})
+    out = f.read_text().splitlines()
+    assert "# a comment" in out, "comments were dropped"
+    assert "PUBLISH_HOST=192.168.20.99" in out, "an unrelated key was lost"
+    assert "BITRATE=600000" in out
+    assert "MJPEG_FPS=15" in out, "the key was not replaced in place"
+    assert "MJPEG_WIDTH=640" in out, "a new key was not appended"
+    assert sum(1 for line in out if line.startswith("MJPEG_FPS=")) == 1, "duplicated key"
+
+
+def test_writing_env_keys_is_atomic(tmp_path):
+    """The defect: a half-written video.env. run-video.sh reads it on every restart, so a
+    truncated file is a publisher that will not come back."""
+    f = tmp_path / "video.env"
+    f.write_text("PUBLISH_HOST=x\n")
+    relay_server.write_env_keys(str(f), {"MJPEG_FPS": 5})
+    assert not (tmp_path / "video.env.tmp").exists(), "the temp file was left behind"
+    assert f.read_text().endswith("\n")
