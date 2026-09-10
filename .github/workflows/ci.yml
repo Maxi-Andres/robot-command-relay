@@ -1,0 +1,27 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  check:
+    # ubuntu-22.04 on purpose: this code is deployed to the robot's Jetson, which runs
+    # Ubuntu 20.04 with Python 3.8. Testing on a newer interpreter would pass syntax the
+    # robot rejects, so CI runs the version the robot actually has.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install tools
+        run: pip install ruff pytest
+      - name: Lint (py38 target)
+        run: ruff check --output-format=github
+      - name: Test
+        # exit 5 = "no tests collected". A repo without a suite yet must not fail CI; a repo
+        # whose suite breaks must. Mirrors the pre-commit gate exactly.
+        # `|| [ $? -eq 5 ]` and not `; rc=$?`: Actions runs this with `bash -e`, which aborts
+        # the script at the failing command before any exit code can be captured.
+        run: pytest -q || [ $? -eq 5 ]
+      # The C++ here links against the Unitree SDK, which is not vendored — it is cloned on
+      # the robot and on the dev box. Nothing to compile in CI; the tests cover the Python
+      # layer and read the C++ dispatch table as text where it matters.
