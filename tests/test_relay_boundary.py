@@ -172,7 +172,10 @@ def test_valid_video_params_map_to_env_keys(body, expect):
     {"fps": -1}, {"fps": 61}, {"fps": "fast"},
     {"width": -1}, {"width": 4096},
     {"quality": 0}, {"quality": 101},
-    {"bitrate": 4000000},      # real knob, but needs a pipeline restart — not live
+    {"bitrate": 100},          # 100 bps: the floor exists because 60 kbps was live on the robot
+    {"bitrate": 99000000},     # and the ceiling, for the same class of typo
+    {"nvr": 2},                # a flag is 0 or 1
+    {"idr": 0},                # a keyframe interval of zero frames is meaningless
     {"NIC": "eth9"},           # would take the video off the air; must never reach the file
     {"PUBLISH_HOST": "evil"},  # nor may an arbitrary env key be smuggled through
     {},                        # an empty request is a mistake, not a no-op
@@ -195,7 +198,9 @@ def test_the_allowlist_agrees_with_the_publisher_on_the_same_machine():
     if not publisher.exists():
         pytest.skip("the video-pipeline repo is not checked out next to this one")
     src = publisher.read_text(encoding="utf-8")
-    for key, (_env, cast, lo, hi) in relay_server.VIDEO_PARAMS.items():
+    for key, (_env, cast, lo, hi, live) in relay_server.VIDEO_PARAMS.items():
+        if not live:
+            continue   # restart-only knobs are the relay's alone; the publisher never sees them
         pattern = rf'"{key}":\s*\("[A-Z_]+",\s*{cast.__name__},\s*([0-9.]+),\s*([0-9.]+)\)'
         m = re.search(pattern, src)
         assert m, f"'{key}' is missing from mjpeg_server.LIVE_PARAMS (or changed shape)"
@@ -227,3 +232,33 @@ def test_writing_env_keys_is_atomic(tmp_path):
     relay_server.write_env_keys(str(f), {"MJPEG_FPS": 5})
     assert not (tmp_path / "video.env.tmp").exists(), "the temp file was left behind"
     assert f.read_text().endswith("\n")
+
+
+@pytest.mark.parametrize("key, live", [
+    ("fps", True), ("width", True), ("quality", True),
+    ("bitrate", False), ("maxfps", False), ("idr", False), ("nvr", False),
+])
+def test_each_knob_declares_whether_it_applies_live(key, live):
+    """The operator has to know, BEFORE touching a control while driving, whether it
+    costs five seconds of black screen. That fact belongs to the robot, so the UI reads
+    it from here instead of hardcoding its own idea of which is which."""
+    assert relay_server.VIDEO_PARAMS[key][4] is live
+    assert (key in relay_server.LIVE_KEYS) is live
+
+
+def test_restart_only_knobs_are_split_out_from_the_live_ones():
+    """The defect: pushing a restart-only key to the publisher, which does not know it.
+    It would be accepted, do nothing, and report success — a control that lies."""
+    live, deferred = relay_server.split_live(
+        {"fps": 10, "bitrate": 2000000, "nvr": 1})
+    assert live == {"fps": 10}
+    assert deferred == {"bitrate": 2000000, "nvr": 1}
+
+
+def test_the_bitrate_floor_would_have_caught_the_value_that_was_live_on_the_robot():
+    """Regression for a real one: BITRATE=60000 (60 kbps for 1080p H.264) sat in the
+    robot's video.env, almost certainly a missing zero, and nothing rejected it because
+    nothing checked. Found 2026-09-10."""
+    with pytest.raises(ValueError, match="between"):
+        relay_server.validate_video({"bitrate": 60000})
+    assert relay_server.validate_video({"bitrate": 600000}) == {"BITRATE": 600000}

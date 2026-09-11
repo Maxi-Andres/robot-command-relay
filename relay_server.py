@@ -66,21 +66,38 @@ def log(msg):
 # "write any key" would let a typo (NIC=eth9) take the video off the air on a robot in the
 # field, recoverable only over SSH — the exact trip this feature exists to save.
 #
-# ONLY live-tunable keys belong here. Anything the GStreamer pipeline reads at launch
-# (BITRATE, MAXFPS, IDR_FRAMES…) needs a service restart, which needs privileges this
-# process does not have; leaving those out is deliberate, not an oversight.
+# Two kinds of key live here, and the difference is visible to the caller (see `live`
+# below). The live ones apply instantly; the rest can only be WRITTEN to video.env,
+# because restarting the video service needs privileges this process does not have.
+# Saving them is still the point: it is what removes the SSH trip.
 # --------------------------------------------------------------------------- #
 VIDEO_ENV = os.environ.get(
     "VIDEO_ENV", "/home/unitree/robot-video-pipeline/robot/video.env")
 MJPEG_LOCAL = os.environ.get("MJPEG_LOCAL", "http://127.0.0.1:8093")
-# key -> (env name, cast, min, max). Mirrors mjpeg_server.LIVE_PARAMS: the two run in
-# different repos on the same machine, so the boundary forbids a shared module — they are
-# kept honest by a test on each side. If you change one, change the other.
+# key -> (env name, cast, min, max, live)
+#
+# live=True  : mjpeg_server reads it per frame, so it applies instantly with no restart.
+#              These three mirror mjpeg_server.LIVE_PARAMS — the two run in different repos
+#              on the same machine, so the boundary forbids a shared module and a test on
+#              each side keeps them honest. Change one, change the other.
+# live=False : run-video.sh interpolates it into the gst-launch command line when the
+#              service starts, so it can only be SAVED here; it takes effect on the next
+#              restart of robot-video. Writing them is still worth it — it is the whole
+#              reason this endpoint exists — but nothing here can apply them.
+#
+# The ranges are not decoration. BITRATE sat at 60000 on the robot (60 kbps for 1080p
+# H.264, almost certainly a missing zero) and nobody noticed because nothing checked it;
+# the floor below refuses that value now.
 VIDEO_PARAMS = {
-    "fps":     ("MJPEG_FPS", float, 0.0, 60.0),
-    "width":   ("MJPEG_WIDTH", int, 0, 1920),
-    "quality": ("MJPEG_QUALITY", int, 1, 100),
+    "fps":     ("MJPEG_FPS", float, 0.0, 60.0, True),
+    "width":   ("MJPEG_WIDTH", int, 0, 1920, True),
+    "quality": ("MJPEG_QUALITY", int, 1, 100, True),
+    "bitrate": ("BITRATE", int, 200000, 8000000, False),
+    "maxfps":  ("MAXFPS", int, 0, 30, False),
+    "idr":     ("IDR_FRAMES", int, 1, 300, False),
+    "nvr":     ("NVR_ENABLE", int, 0, 1, False),
 }
+LIVE_KEYS = {k for k, v in VIDEO_PARAMS.items() if v[4]}
 
 
 def validate_video(body):
@@ -97,7 +114,7 @@ def validate_video(body):
         raise ValueError("nothing to set")
     out = {}
     for key, raw in body.items():
-        name, cast, lo, hi = VIDEO_PARAMS[key]
+        name, cast, lo, hi, _live = VIDEO_PARAMS[key]
         try:
             value = cast(raw)
         except (TypeError, ValueError):
@@ -106,6 +123,13 @@ def validate_video(body):
             raise ValueError(f"'{key}' must be between {lo} and {hi}, got {value}")
         out[name] = value
     return out
+
+
+def split_live(body):
+    """(live subset, restart-only subset). Only the first can be pushed to the publisher."""
+    live = {k: v for k, v in body.items() if k in LIVE_KEYS}
+    deferred = {k: v for k, v in body.items() if k not in LIVE_KEYS}
+    return live, deferred
 
 
 def read_env_file(path):
@@ -374,10 +398,23 @@ class Handler(BaseHTTPRequestHandler):
             audit(self.client_address[0], "video-config", str(body), "rejected")
             return self._json(400, {"ok": False, "error": str(exc)})
 
-        applied = mjpeg_apply(body)
-        if applied.get("error"):
-            audit(self.client_address[0], "video-config", str(body), "publisher-unreachable")
-            return self._json(502, {"ok": False, "error": applied["error"]})
+        live, deferred = split_live(body)
+        # A restart-only knob that is not being saved would do nothing at all, silently.
+        # Refuse instead: a control that appears to work and does not is worse than one
+        # that says no.
+        if deferred and not persist:
+            return self._json(400, {
+                "ok": False,
+                "error": f"{sorted(deferred)} only take effect when the video service "
+                         f"restarts, so they must be saved — send persist=true"})
+
+        applied = {}
+        if live:
+            applied = mjpeg_apply(live)
+            if applied.get("error"):
+                audit(self.client_address[0], "video-config", str(body),
+                      "publisher-unreachable")
+                return self._json(502, {"ok": False, "error": applied["error"]})
 
         saved = False
         if persist:
@@ -392,7 +429,12 @@ class Handler(BaseHTTPRequestHandler):
                                         "error": f"applied but not saved: {exc}"})
         audit(self.client_address[0], "video-config", str(body),
               "applied+saved" if saved else "applied")
-        return self._json(200, {"ok": True, "running": applied, "saved": saved})
+        return self._json(200, {
+            "ok": True, "running": applied, "saved": saved,
+            # Named explicitly so the UI can say WHICH values are waiting, instead of a
+            # blanket "restart to apply" the operator has to decode.
+            "pending_restart": sorted(deferred),
+        })
 
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/") == "/video-config":
@@ -406,8 +448,11 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "running": mjpeg_live(),
                 "saved": {k: saved.get(name) for k, (name, *_) in VIDEO_PARAMS.items()},
-                "limits": {k: {"min": lo, "max": hi}
-                           for k, (_n, _c, lo, hi) in VIDEO_PARAMS.items()},
+                # `live` tells the UI which knobs apply instantly and which cost a restart
+                # of the video service — the difference the operator must see BEFORE
+                # touching one while driving.
+                "limits": {k: {"min": lo, "max": hi, "live": live}
+                           for k, (_n, _c, lo, hi, live) in VIDEO_PARAMS.items()},
             })
         if self.path.split("?")[0] != "/health":
             return self._json(404, {"error": "not found"})
