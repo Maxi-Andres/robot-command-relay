@@ -74,6 +74,12 @@ def log(msg):
 VIDEO_ENV = os.environ.get(
     "VIDEO_ENV", "/home/unitree/robot-video-pipeline/robot/video.env")
 MJPEG_LOCAL = os.environ.get("MJPEG_LOCAL", "http://127.0.0.1:8093")
+# Newest battery reading, written by the telemetry shipper (see its snapshot_battery()).
+BATTERY_FILE = os.environ.get("BATTERY_FILE", "/var/tmp/robot-battery.json")
+# Past this age the reading is reported as stale instead of as the truth. The reader's
+# default period is 3 s, so anything beyond a few periods means the telemetry pipeline
+# stopped — and a battery percentage frozen at 95% is the easiest stale value to believe.
+BATTERY_STALE_S = float(os.environ.get("BATTERY_STALE_S", "20"))
 # key -> (env name, cast, min, max, live)
 #
 # live=True  : mjpeg_server reads it per frame, so it applies instantly with no restart.
@@ -238,6 +244,52 @@ def _proc_env(pattern):
                 if "=" in kv)
     except Exception:
         return {}
+
+
+def battery_status():
+    """Charge, health and whether it is charging. {} when there is no reading to give.
+
+    THE SOURCE is the telemetry shipper's snapshot file: the battery already crosses that
+    process on its way to Splunk, so the app gets it without a second DDS subscriber. This
+    endpoint only reads and interprets.
+
+    ⚠️ THE SIGN CONVENTION IS THE ONE THING TO GET RIGHT, and it is MEASURED, not assumed.
+    Same Go2, same minute, 2026-09-21, lifted off its wireless dock between the two readings:
+
+        on the dock   current  +471 / +475     volt 32783 mV
+        off the dock  current -5678 / -5557    volt 32538 mV
+
+    So POSITIVE = CHARGING. The magnitudes corroborate it: 5.6 A at 32.5 V is ~185 W, which is
+    a Go2 standing with LiDAR, DDS and video running, and the pack voltage dropped 245 mV the
+    moment the charger left. One constant, in one place, because getting it backwards makes
+    the app say "charging" while the robot drains — a wrong answer that looks right, which is
+    worse than no answer.
+
+    Never raises: a missing or half-written file must not take the relay's status endpoint
+    down with it.
+    """
+    try:
+        with open(BATTERY_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict) or "soc" not in d:
+        return {}
+    age = round(time.time() - float(d.get("at") or 0), 1)
+    current = d.get("current")
+    return {
+        "percent": d.get("soc"),
+        "charging": (current > 0) if isinstance(current, (int, float)) else None,
+        "current": current,
+        "volts": round((d.get("volt_mv") or 0) / 1000.0, 2),
+        "cycles": d.get("cycles"),
+        "temp_c": max(x for x in (d.get("mcu_ntc"), d.get("bq_ntc")) if x is not None)
+        if (d.get("mcu_ntc") is not None or d.get("bq_ntc") is not None) else None,
+        "age_s": age,
+        # Reported, not hidden: a consumer that trusts a frozen reading will happily show 95%
+        # on a robot that has been off for an hour.
+        "stale": age > BATTERY_STALE_S,
+    }
 
 
 def telemetry_status():
@@ -463,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
                          # Everything below is configured ON THE ROBOT: the app can only
                          # read it, so the robot reports it instead of the app guessing.
                          "video": video_status(),
+                         "battery": battery_status(),
                          "telemetry": telemetry_status(),
                          "limits": limits_status()})
 
