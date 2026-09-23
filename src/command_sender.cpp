@@ -106,7 +106,7 @@ int main() {
     MAX_VX = env_f("MAX_VX", 0.6f);
     MAX_VY = env_f("MAX_VY", 0.4f);
     MAX_VYAW = env_f("MAX_VYAW", 1.0f);
-    DEADMAN_MS = (long)env_f("DEADMAN_MS", 1500);
+    DEADMAN_MS = (long)env_f("DEADMAN_MS", 1000);
 
     std::cerr << "[sender] iface=" << iface << " clamp vx=" << MAX_VX
               << " vy=" << MAX_VY << " vyaw=" << MAX_VYAW

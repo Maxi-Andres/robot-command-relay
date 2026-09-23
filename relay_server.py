@@ -24,8 +24,13 @@ agent it is not read-only. Defences, from outside in:
 
 Standard library only: nothing to install on the robot (Python 3.8 there).
 """
+import hashlib
+import hmac
 import json
+import math
 import os
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -42,6 +47,12 @@ SENDER = os.environ.get("SENDER_BIN", "./command_sender")
 AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/tmp/robot-relay-audit.log")
 MAX_PER_SEC = float(os.environ.get("MAX_PER_SEC", "20"))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", "3"))
+
+# UDP port for continuous teleop (`move` and `stop_move` only). 0 = off, the default: the
+# HTTP path below is then the only way in, exactly as before. See the UDP block further down.
+_udp = os.environ.get("RELAY_UDP_PORT", "0").strip()
+RELAY_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(_udp) <= 65535 \
+    else 0
 
 # Mirrors command_sender's dispatch table. Kept here too so a bad verb is refused before it
 # reaches the control process — defence in depth, not a single gate.
@@ -316,7 +327,7 @@ def limits_status():
         "max_vx": os.environ.get("MAX_VX", "0.6"),
         "max_vy": os.environ.get("MAX_VY", "0.4"),
         "max_vyaw": os.environ.get("MAX_VYAW", "1.0"),
-        "deadman_ms": os.environ.get("DEADMAN_MS", "1500"),
+        "deadman_ms": os.environ.get("DEADMAN_MS", "1000"),
         "max_per_sec": str(MAX_PER_SEC),
         "dds_iface": os.environ.get("DDS_IFACE", "eth0"),
     }
@@ -345,6 +356,159 @@ def video_status():
         }
     except Exception as exc:                     # never let this break the relay
         return {"running": False, "error": str(exc)}
+
+
+# --------------------------------------------------------------------------- #
+# Continuous teleop over UDP — `move` and `stop_move`, nothing else.
+#
+# WHY: over Starlink (measured 2026-09-23: 3.4-4% loss, in bursts) every HTTP command opens a
+# new TCP connection — two round trips, 178 ms median for a keepalive, and a lost SYN costs a
+# full second before TCP retries. For a `move` that is superseded 100 ms later anyway, none
+# of that waiting buys anything: a lost datagram is simply replaced by the next one, and the
+# dead-man in command_sender still stops the robot if they all stop arriving.
+#
+# WHY ONLY THESE TWO: the discrete verbs (stand_up, sit, damp, ...) are rare, need their
+# answer, and would need retransmission — i.e. TCP. They stay on HTTP. A stop comes over
+# BOTH paths from the executor, and whichever lands first wins.
+#
+# AUTHENTICATION, per datagram: HMAC-SHA256 keyed with the relay token, truncated to 16 bytes.
+# The token itself never crosses the network on this path (on the HTTP path it does, in the
+# clear, in every Authorization header). A datagram that fails any check gets NO reply, so
+# this port cannot be used to reflect traffic at anyone.
+#
+# ORDER AND REPLAY, with one number: `ts`, the executor's wall clock when it sent the
+# command. It must be STRICTLY greater than the last one accepted, and within
+# UDP_CLOCK_WINDOW_S of this robot's clock (both machines run NTP; measured offset 3-16 ms).
+# The same `ts` rides on the HTTP commands, and a stop from either path raises the bar — so
+# a `move` delayed in the network can never land after a stop and restart the robot, which
+# is the race the engineering standard names (§3, "commands that supersede each other").
+#
+# WIRE FORMAT, little-endian. SECOND COPY in unitree_ros2/robot_executor
+# (`RelayTransport`); both test suites assert the same golden bytes — change one, change both.
+#   command  "RC" | version u8 | kind u8 (1 move, 2 stop) | ts f64 | vx f32 | vy f32
+#            | vyaw f32 | mac[16]                                          = 40 bytes
+#   ack      "RA" | version u8 | status u8 (0 ok, 1 sender error) | ts f64 | mac[16] = 28
+# --------------------------------------------------------------------------- #
+UDP_VERSION = 1
+UDP_CMD = struct.Struct("<2sBBdfff")
+UDP_ACK = struct.Struct("<2sBBd")
+UDP_MAC_LEN = 16
+UDP_KIND_MOVE = 1
+UDP_KIND_STOP = 2
+# Wider than any NTP error seen here, narrower than anything a replay would need.
+UDP_CLOCK_WINDOW_S = 1.0
+# A stop that carries no `ts` (an executor older than this file) still has to beat every
+# move already in flight. Robot clock plus a margin larger than the worst one-way delay
+# measured over Starlink (379 ms RTT) does that; a new move within it is refused, which is
+# what someone who just pressed stop wants anyway.
+STOP_MARGIN_S = 0.5
+
+
+def udp_mac(key, payload):
+    return hmac.new(key, payload, hashlib.sha256).digest()[:UDP_MAC_LEN]
+
+
+def decode_command(datagram, key, robot_now):
+    """(kind, ts, vx, vy, vyaw) from an authenticated datagram. Raises ValueError(reason).
+
+    The MAC is checked FIRST and in constant time, before a single field is trusted: an
+    unauthenticated datagram tells the sender nothing, not even which check it failed.
+    """
+    if len(datagram) != UDP_CMD.size + UDP_MAC_LEN:
+        raise ValueError("size")
+    body, mac = datagram[:UDP_CMD.size], datagram[UDP_CMD.size:]
+    if not hmac.compare_digest(mac, udp_mac(key, body)):
+        raise ValueError("mac")
+    magic, version, kind, ts, vx, vy, vyaw = UDP_CMD.unpack(body)
+    if magic != b"RC" or version != UDP_VERSION or kind not in (UDP_KIND_MOVE, UDP_KIND_STOP):
+        raise ValueError("format")
+    # NaN survives float() and every clamp (NaN > limit is False), and would reach Move().
+    if not all(math.isfinite(x) for x in (ts, vx, vy, vyaw)):
+        raise ValueError("format")
+    if abs(robot_now - ts) > UDP_CLOCK_WINDOW_S:
+        raise ValueError("clock")
+    return kind, ts, vx, vy, vyaw
+
+
+def encode_ack(key, status, ts):
+    body = UDP_ACK.pack(b"RA", UDP_VERSION, status, ts)
+    return body + udp_mac(key, body)
+
+
+class CommandOrder:
+    """The newest-wins rule for movement, shared by the UDP and HTTP paths.
+
+    A move is admitted only if its `ts` is strictly newer than everything admitted so far.
+    A stop is NEVER refused — it only raises the bar, so nothing sent before it can move the
+    robot afterwards.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def admit_move(self, ts):
+        with self._lock:
+            if ts <= self._last:
+                return False
+            self._last = ts
+            return True
+
+    def stop(self, ts, robot_now):
+        with self._lock:
+            self._last = max(self._last, ts if ts is not None else robot_now + STOP_MARGIN_S)
+
+
+class UdpControl:
+    """Datagram in, at most one command to command_sender, at most one ack out."""
+
+    def __init__(self, key, sender, limiter, order):
+        self.key = key
+        self.sender = sender
+        self.limiter = limiter
+        self.order = order
+        self.stats = {"accepted": 0, "size": 0, "mac": 0, "format": 0, "clock": 0,
+                      "stale": 0, "limited": 0}
+
+    def process(self, datagram, src, robot_now):
+        """Return the ack to send back, or None to stay silent."""
+        try:
+            kind, ts, vx, vy, vyaw = decode_command(datagram, self.key, robot_now)
+        except ValueError as exc:
+            self.stats[str(exc)] += 1
+            return None
+        if kind == UDP_KIND_STOP:
+            # Not rate limited: repeating a stop is harmless, refusing one is not.
+            self.order.stop(ts, robot_now)
+            line, verb, detail = "stop_move", "stop_move", "-"
+        else:
+            if not self.order.admit_move(ts):
+                self.stats["stale"] += 1
+                return None
+            if not self.limiter.allow():
+                self.stats["limited"] += 1
+                return None
+            line = f"move {vx:.3f} {vy:.3f} {vyaw:.3f}"
+            verb, detail = "move", f"vx={vx:.3f} vy={vy:.3f} vyaw={vyaw:.3f}"
+        reply = self.sender.send(line)
+        audit(f"{src}/udp", verb, detail, reply)
+        self.stats["accepted"] += 1
+        return encode_ack(self.key, 0 if reply.startswith("ok") else 1, ts)
+
+    def serve(self, sock):
+        while True:
+            try:
+                datagram, src = sock.recvfrom(128)
+            except OSError as exc:
+                log(f"udp control: recv failed: {exc}")
+                time.sleep(0.1)
+                continue
+            ack = self.process(datagram, src[0], time.time())
+            if ack is not None:
+                try:
+                    sock.sendto(ack, src)
+                except OSError:
+                    pass                    # the ack is diagnostics; the command already ran
 
 
 class Sender:
@@ -517,7 +681,9 @@ class Handler(BaseHTTPRequestHandler):
                          "video": video_status(),
                          "battery": battery_status(),
                          "telemetry": telemetry_status(),
-                         "limits": limits_status()})
+                         "limits": limits_status(),
+                         "udp": ({"port": RELAY_UDP_PORT, **self.server.udp.stats}
+                                 if self.server.udp else {"port": 0})})
 
     def do_POST(self):
         if self.path.split("?")[0].rstrip("/") == "/video-config":
@@ -527,9 +693,6 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised():
             audit(self.client_address[0], "-", "-", "unauthorised")
             return self._json(401, {"error": "unauthorised"})
-        if not self.server.limiter.allow():
-            return self._json(429, {"error": "rate limited"})
-
         try:
             n = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(n) or b"{}")
@@ -538,6 +701,21 @@ class Handler(BaseHTTPRequestHandler):
 
         verb = str(payload.get("verb", ""))
         src = self.client_address[0]
+        # A stop is never rate limited: repeating one is harmless, refusing one is not.
+        if verb != "stop_move" and not self.server.limiter.allow():
+            return self._json(429, {"error": "rate limited"})
+        # Optional `ts`, the executor's clock at send time — the same ordering the UDP path
+        # uses, so the two paths cannot overtake each other. Absent = an older executor.
+        ts = payload.get("ts")
+        if ts is not None:
+            try:
+                ts = float(ts)
+            except (TypeError, ValueError):
+                return self._json(400, {"error": "ts must be a number"})
+            if not math.isfinite(ts):
+                return self._json(400, {"error": "ts must be finite"})
+        if verb == "stop_move":
+            self.server.order.stop(ts, time.time())
 
         if verb == "move":
             try:
@@ -546,6 +724,13 @@ class Handler(BaseHTTPRequestHandler):
                 vyaw = float(payload.get("vyaw", 0))
             except (TypeError, ValueError):
                 return self._json(400, {"error": "vx/vy/vyaw must be numbers"})
+            # NaN passes float() and every clamp, all the way into Move().
+            if not all(math.isfinite(v) for v in (vx, vy, vyaw)):
+                return self._json(400, {"error": "vx/vy/vyaw must be finite"})
+            if ts is not None and not self.server.order.admit_move(ts):
+                audit(src, verb, f"ts={ts:.3f}", "rejected-stale")
+                return self._json(409, {"ok": False, "reply": "err stale: a newer command "
+                                        "or a stop already arrived"})
             # Values are clamped again in command_sender: this is convenience, not the limit.
             line = f"move {vx:.3f} {vy:.3f} {vyaw:.3f}"
             detail = f"vx={vx:.3f} vy={vy:.3f} vyaw={vyaw:.3f}"
@@ -576,6 +761,15 @@ def main():
     srv.token = token
     srv.sender = Sender([SENDER])
     srv.limiter = RateLimiter(MAX_PER_SEC)
+    srv.order = CommandOrder()
+    srv.udp = None
+    if RELAY_UDP_PORT:
+        srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order)
+        usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        usock.bind((BIND, RELAY_UDP_PORT))
+        threading.Thread(target=srv.udp.serve, args=(usock,), name="udp-control",
+                         daemon=True).start()
+        log(f"udp teleop on {BIND}:{RELAY_UDP_PORT} (move/stop_move only, HMAC)")
     log(f"listening on {BIND}:{PORT}  audit={AUDIT_LOG}  limit={MAX_PER_SEC}/s")
     try:
         srv.serve_forever()

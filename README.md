@@ -87,7 +87,8 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `RELAY_TOKEN_FILE` | `~/.relay_token` | Read when `RELAY_TOKEN` is unset; refuses to start without a token |
 | `DDS_IFACE` | `eth0` | Interface CycloneDDS binds to. **Required** — `Init(0, iface)` alone receives nothing |
 | `MAX_VX` / `MAX_VY` / `MAX_VYAW` | `0.6` / `0.4` / `1.0` | Velocity clamps, enforced in `command_sender` |
-| `DEADMAN_MS` | `1500` | A movement not refreshed within this window is stopped automatically |
+| `DEADMAN_MS` | `1000` | A movement not refreshed within this window is stopped automatically |
+| `RELAY_UDP_PORT` | `0` (off) | UDP port for continuous teleop: `move` and `stop_move` only, HMAC-authenticated with the relay token. See the UDP block in `relay_server.py` |
 | `MAX_PER_SEC` | `20` | Rate limit |
 | `AUDIT_LOG` | `/var/tmp/robot-relay-audit.log` | One line per command |
 
@@ -96,7 +97,8 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Sender liveness, allowed verbs, and what the robot reports about its own video, telemetry and safety limits |
-| `POST /cmd` | `{verb, vx?, vy?, vyaw?}` — the only endpoint that can move the robot |
+| `POST /cmd` | `{verb, vx?, vy?, vyaw?, ts?}` — moves the robot. `ts` (the caller's clock) orders it against the UDP path: a `move` older than the last accepted command or stop is refused with 409 |
+| UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 
 Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
 `recovery_stand`, `sit`, `rise_sit`, `hello`, `keepalive`.

@@ -26,7 +26,7 @@ Environment=DDS_IFACE=eth0
 Environment=MAX_VX=0.6
 Environment=MAX_VY=0.4
 Environment=MAX_VYAW=1.0
-Environment=DEADMAN_MS=1500
+Environment=DEADMAN_MS=1000
 Environment=SENDER_BIN=/home/unitree/robot-command-relay/command_sender
 EnvironmentFile=-/home/unitree/robot-command-relay/relay.env
 ExecStart=/usr/bin/python3 /home/unitree/robot-command-relay/relay_server.py
