@@ -20,6 +20,19 @@ DDS cannot be read or published across a subnet boundary on these robots. Measur
 So the process that publishes commands has to live next to the robot's DDS, and what
 crosses the network is HTTP. Full reasoning: `robot-splunk-docs/RED-Y-DDS.md`.
 
+
+## Go2 vs G1
+
+**`host/g1/uplink-failover.sh`** (+ `.service`, runs as root on the G1's PC2) is not part of
+the relay: it is host config for the G1, kept here because the relay is what depends most on
+the uplink. On the G1, eth0 is the internal bus and never loses carrier, so unplugging the
+external cable never triggers a failover; the script probes the wired gateway and demotes
+the wired default route when it stops answering. Test: `tests/test_uplink_failover.sh`.
+
+This repo serves both robots. Files prefixed `go2_` run only on the Go2, `g1_` (or under
+`host/g1/`) only on the G1, unprefixed ones on both; `ROBOT_MODEL` picks the variant. The
+full map — what runs where, per repo — is `robot-splunk-docs/QUE-CORRE-EN-CADA-ROBOT.md`.
+
 ## Shape
 
 ```

@@ -1,0 +1,25 @@
+# Cable when the cable works, WiFi when it does not — on the G1's PC2.
+# eth0 never loses carrier on this robot (it is the internal bus), so this probes the wired
+# gateway instead of waiting for a link-down that never comes. See uplink-failover.sh.
+#   cd host/g1 && sudo install -m 755 uplink-failover.sh /usr/local/sbin/uplink-failover.sh
+#   sudo cp uplink-failover.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uplink-failover
+[Unit]
+Description=Uplink failover (cable -> WiFi when the wired gateway stops answering)
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+# root: it edits the routing table. It touches only the default routes via the wired
+# gateway, never the 192.168.123.0/24 bus route to PC1.
+Environment=IFACE=eth0
+Environment=GW=192.168.123.1
+ExecStart=/usr/local/sbin/uplink-failover.sh
+Restart=always
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
