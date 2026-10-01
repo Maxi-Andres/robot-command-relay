@@ -12,8 +12,11 @@
 //
 //   KEPT      stop_move      velocity 0. The stop.
 //             stand_up       FSM 4   — observed: the Unitree app's Ready/Preparation.
-//             walk_waist     FSM 501 — observed: walk on THIS robot (3-DoF waist). `move`
+//             walk_waist     FSM 501 — observed: walk with the waist FREE (3-DoF). `move`
 //                            does nothing until the robot is in a locomotion mode.
+//             start          FSM 500 — confirmed off the wire 2026-10-01: the app's Walk with
+//                            the waist LOCKED (1-DoF). ONE of these two exists at a time —
+//                            see G1_WAIST_LOCK below.
 //             squat          FSM 706 — confirmed off the wire: the app's Squat AND Squat up,
 //                            one toggle (down and parked, or up and back to locomotion).
 //             lie_up         FSM 702 — confirmed: the app's Lie up, getting up off the floor.
@@ -22,14 +25,20 @@
 //             wave_hand      the built-in gesture, one shot (needs a locomotion mode).
 //
 //   EXCLUDED  squat via the SDK's Squat()  FSM 2 — observed HALF-FALLING on this robot.
-//             start          FSM 500 — the SDK's Start(), the 1-DoF-waist variant's walk; this
-//                            robot's is 501. Not verified here, so not sent.
+//             the walk of the OTHER waist setting (G1_WAIST_LOCK below).
 //             damp           FSM 1 — limp: collapses from any standing posture. The executor
 //                            marks it dangerous too; it is not a remote stop for a humanoid.
 //             zero_torque    FSM 0 — every motor limp at once.
 //             sit            FSM 3 — the SDK's, never observed on this robot.
-//             run, climb, set_fsm_id, set_speed_mode, switch_mode, user ctrl, shake_hand
+//             run (801 locked / 802 free, both confirmed), climb, set_fsm_id, set_speed_mode, switch_mode, user ctrl, shake_hand
 //                            (a two-stage gesture a dropped link would leave half-done).
+//
+// THE WAIST LOCK PICKS THE WALK. It is a setting of the Unitree app, not a command: with the
+// waist locked the app sends 500 for Walk and 801 for Run, with it free 501 and 802 (all four
+// read off the bus 2026-10-01; no request of its own is sent when the lock is toggled). This
+// process cannot read the setting, so relay.env declares it — G1_WAIST_LOCK=1 for a locked
+// waist — and only the matching walk is in the table: the other one would drive a locked robot
+// with the free-waist controller, or the reverse. relay_server.py drops the same verb.
 //
 // `move` uses the SDK's non-continuous mode: the robot itself drops the velocity after 1 s.
 // That is a second dead-man, on the robot, under the one in sender_core.hpp.
@@ -53,10 +62,11 @@ int main() {
         c->SetTimeout(5.0f);
         c->Init();
         // Every verb the relay can perform. Anything absent here cannot be commanded at all.
-        const std::map<std::string, sender::Call> VERBS = {
+        std::map<std::string, sender::Call> VERBS = {
             {"stop_move",      [c] { return c->StopMove(); }},
             {"stand_up",       [c] { return c->SetFsmId(4); }},
             {"walk_waist",     [c] { return c->SetFsmId(501); }},
+            {"start",          [c] { return c->SetFsmId(500); }},
             {"squat",          [c] { return c->SetFsmId(706); }},
             {"lie_up",         [c] { return c->SetFsmId(702); }},
             {"balance_stand",  [c] { return c->BalanceStand(); }},
@@ -64,6 +74,8 @@ int main() {
             {"low_stand",      [c] { return c->LowStand(); }},
             {"wave_hand",      [c] { return c->WaveHand(); }},
         };
+        const char* lock = getenv("G1_WAIST_LOCK");
+        VERBS.erase(lock && std::string(lock) == "1" ? "walk_waist" : "start");
         sender::Robot r;
         r.move = [c](float vx, float vy, float vyaw) { return c->Move(vx, vy, vyaw, false); };
         r.stop_move = [c] { return c->StopMove(); };

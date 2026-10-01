@@ -132,7 +132,8 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 
 Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
-`recovery_stand`, `sit`, `rise_sit`, `hello`, `keepalive`.
+`recovery_stand`, `sit`, `rise_sit`, `hello`, `stretch`, `scrape`, `heart`, `pose_on`,
+`pose_off`, `keepalive` (Go2; the G1's narrower set is in `g1_command_sender.cpp`).
 
 ## Who calls this
 

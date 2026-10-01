@@ -64,12 +64,27 @@ RELAY_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(
 # tests/test_relay_boundary.py reads both and fails if they drift.
 VERBS_BY_MODEL = {
     "go2": {"stop_move", "stand_up", "stand_down", "damp", "balance_stand",
-            "recovery_stand", "sit", "rise_sit", "hello", "keepalive"},
+            "recovery_stand", "sit", "rise_sit", "hello", "stretch", "scrape", "heart",
+            "pose_on", "pose_off", "keepalive"},
     # Narrower on purpose: the G1 falls. Why each verb is in or out: g1_command_sender.cpp.
-    "g1": {"stop_move", "stand_up", "walk_waist", "squat", "lie_up", "balance_stand",
+    # Lists BOTH walks; verbs_for() keeps the one matching the waist lock.
+    "g1": {"stop_move", "stand_up", "walk_waist", "start", "squat", "lie_up", "balance_stand",
            "high_stand", "low_stand", "wave_hand", "keepalive"},
 }
-VERBS = VERBS_BY_MODEL[ROBOT_MODEL]
+
+
+def verbs_for(model, waist_locked):
+    """The verbs this relay accepts. On the G1 only ONE walk: 500 (`start`) with the waist
+    locked, 501 (`walk_waist`) with it free — the lock is an app setting this process cannot
+    read, so relay.env declares it (G1_WAIST_LOCK=1). g1_command_sender drops the same one."""
+    verbs = set(VERBS_BY_MODEL[model])
+    if model == "g1":
+        verbs.discard("walk_waist" if waist_locked else "start")
+    return verbs
+
+
+G1_WAIST_LOCK = os.environ.get("G1_WAIST_LOCK", "").strip() == "1"
+VERBS = verbs_for(ROBOT_MODEL, G1_WAIST_LOCK)
 
 
 def log(msg):

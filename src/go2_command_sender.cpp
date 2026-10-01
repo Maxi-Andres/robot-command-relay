@@ -33,6 +33,15 @@ int main() {
             {"sit",            [c] { return c->Sit(); }},
             {"rise_sit",       [c] { return c->RiseSit(); }},
             {"hello",          [c] { return c->Hello(); }},
+            // Gestures with all four feet on the ground or sitting: no jump, no flip.
+            {"stretch",        [c] { return c->Stretch(); }},
+            {"scrape",         [c] { return c->Scrape(); }},
+            {"heart",          [c] { return c->Heart(); }},
+            // Pose is a mode, not a gesture: while it is on, the robot holds its feet and a
+            // move tilts the body instead of walking. One verb per side because verbs carry
+            // no arguments — the sender's whole input is "verb [vx vy vyaw]".
+            {"pose_on",        [c] { return c->Pose(true); }},
+            {"pose_off",       [c] { return c->Pose(false); }},
         };
         sender::Robot r;
         r.move = [c](float vx, float vy, float vyaw) { return c->Move(vx, vy, vyaw); };

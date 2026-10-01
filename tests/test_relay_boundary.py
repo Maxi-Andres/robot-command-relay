@@ -80,10 +80,34 @@ def test_the_g1_cannot_be_dropped_from_the_network():
     observed half-falling. Any of them, sent to a G1 on its feet, can drop it.
     See g1_command_sender.cpp.
     """
-    for verb in ["zero_torque", "damp", "start", "squat_sdk", "user_ctrl",
+    for verb in ["zero_torque", "damp", "squat_sdk", "user_ctrl",
                  "switch_to_user_ctrl", "shake_hand", "set_fsm_id", "run", "climb"]:
         assert verb not in relay_server.VERBS_BY_MODEL["g1"]
         assert verb not in _sender_verbs("g1")
+
+
+@pytest.mark.parametrize("locked,walk,other", [(True, "start", "walk_waist"),
+                                                (False, "walk_waist", "start")])
+def test_the_g1_walks_with_the_controller_of_its_waist(locked, walk, other):
+    """Catches: a locked-waist G1 driven with the free-waist controller (501), or the reverse.
+
+    The waist lock is a Unitree app setting, read off the bus 2026-10-01: Walk is 500 locked and
+    501 free, and nothing is published when the lock is toggled. Exactly one walk is offered.
+    """
+    verbs = relay_server.verbs_for("g1", locked)
+    assert walk in verbs and other not in verbs
+
+
+def test_the_waist_lock_does_not_touch_the_go2():
+    assert relay_server.verbs_for("go2", True) == relay_server.verbs_for("go2", False)
+
+
+def test_the_g1_sender_drops_the_walk_of_the_other_waist():
+    """The C++ table lists both walks (so the parity test above sees them) and must erase one,
+    keyed on the same variable as the relay."""
+    src = (REPO / "src" / "g1_command_sender.cpp").read_text(encoding="utf-8")
+    assert re.search(r'getenv\("G1_WAIST_LOCK"\)', src)
+    assert re.search(r'VERBS\.erase\(.*"walk_waist"\s*:\s*"start"\)', src)
 
 
 @pytest.mark.parametrize("sender,model,ok", [
