@@ -53,16 +53,9 @@ def test_python_and_cpp_allowlists_agree(model):
     assert python_verbs == _sender_verbs(model)
 
 
-@pytest.mark.parametrize("model", MODELS)
-def test_acrobatics_are_absent_from_the_allowlist(model):
-    """Catches: someone adding a flip or a handstand to the remote path.
-
-    These exist in the robot's SDK and are deliberately unreachable from the network: the
-    relay cannot be the way a flip gets triggered from another continent.
-    """
-    for verb in ["front_flip", "back_flip", "handstand", "walk_upright", "dance1", "front_jump"]:
-        assert verb not in relay_server.VERBS_BY_MODEL[model]
-        assert verb not in _sender_verbs(model)
+# Until 2026-10-01 a test here kept the acrobatics OFF the relay. The operator chose to reach
+# them, gated by the executor's safe mode (DANGEROUS_SKILLS, tested in robot_executor). The
+# relay itself has no safe mode: it trusts the token holder, like every other verb.
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -72,30 +65,31 @@ def test_stop_is_always_in_the_allowlist(model):
     assert "stop_move" in _sender_verbs(model)
 
 
-def test_the_g1_cannot_be_dropped_from_the_network():
-    """Catches: someone adding the verbs that make a STANDING humanoid fall.
+def test_what_misbehaved_on_this_g1_stays_off_the_network():
+    """Catches: re-adding what was SEEN to go wrong on this robot, or what nobody controls.
 
-    zero_torque and damp go limp; user_ctrl hands the joints to a controller the relay is not;
-    start (FSM 500) and the SDK's squat (FSM 2) are the wrong ids on THIS robot, the second
-    observed half-falling. Any of them, sent to a G1 on its feet, can drop it.
-    See g1_command_sender.cpp.
+    High five started it falling backwards (2026-10-01); the SDK's squat (FSM 2) half-falls;
+    sit (FSM 3) was never observed; user_ctrl hands the joints to a controller the relay is
+    not; set_fsm_id would let a caller pick any state. See g1_command_sender.cpp.
     """
-    for verb in ["zero_torque", "damp", "squat_sdk", "user_ctrl",
-                 "switch_to_user_ctrl", "shake_hand", "set_fsm_id", "run", "climb"]:
+    for verb in ["action_high_five", "arm_high_five", "squat_sdk", "sit", "user_ctrl",
+                 "switch_to_user_ctrl", "set_fsm_id", "set_speed_mode", "switch_mode"]:
         assert verb not in relay_server.VERBS_BY_MODEL["g1"]
         assert verb not in _sender_verbs("g1")
 
 
-@pytest.mark.parametrize("locked,walk,other", [(True, "start", "walk_waist"),
-                                                (False, "walk_waist", "start")])
-def test_the_g1_walks_with_the_controller_of_its_waist(locked, walk, other):
-    """Catches: a locked-waist G1 driven with the free-waist controller (501), or the reverse.
+@pytest.mark.parametrize("locked,mine,other", [
+    (True, {"start", "run"}, {"walk_waist", "run_waist"}),
+    (False, {"walk_waist", "run_waist"}, {"start", "run"}),
+])
+def test_the_g1_walks_with_the_controller_of_its_waist(locked, mine, other):
+    """Catches: a locked-waist G1 driven with the free-waist controller (501/802), or the reverse.
 
     The waist lock is a Unitree app setting, read off the bus 2026-10-01: Walk is 500 locked and
-    501 free, and nothing is published when the lock is toggled. Exactly one walk is offered.
+    501 free, Run 801 and 802, and nothing is published when the lock is toggled.
     """
     verbs = relay_server.verbs_for("g1", locked)
-    assert walk in verbs and other not in verbs
+    assert mine <= verbs and not other & verbs
 
 
 def test_the_waist_lock_does_not_touch_the_go2():
@@ -108,6 +102,24 @@ def test_the_g1_sender_drops_the_walk_of_the_other_waist():
     src = (REPO / "src" / "g1_command_sender.cpp").read_text(encoding="utf-8")
     assert re.search(r'getenv\("G1_WAIST_LOCK"\)', src)
     assert re.search(r'VERBS\.erase\(.*"walk_waist"\s*:\s*"start"\)', src)
+    assert re.search(r'VERBS\.erase\(.*"run_waist"\s*:\s*"run"\)', src)
+
+
+def test_the_g1_stop_also_ends_a_running_action():
+    """Mid-action the robot ignores velocity and mode changes (2026-10-01): only api 7100 ends
+    it. The stop verb must send it, or STOP would not stop a hug."""
+    src = (REPO / "src" / "g1_command_sender.cpp").read_text(encoding="utf-8")
+    stop = re.search(r'\{"stop_move",\s*\[[^\]]*\]\s*\{(.*?)\}\},', src, re.S)
+    assert stop and "end_action()" in stop.group(1) and "StopMove()" in stop.group(1)
+    assert re.search(r"end_action = \[c\] \{.*?_fsm_api\(END_ACTION", src, re.S)
+    assert '"fsm_id":550,"api_id":2' in src
+
+
+def test_the_g1_actions_are_refused_outside_run():
+    """From Walk the robot answers 0 to an action and does nothing (2026-10-01): the sender
+    must check the FSM first, or the operator reads "ok" for a hug that never happened."""
+    src = (REPO / "src" / "g1_command_sender.cpp").read_text(encoding="utf-8")
+    assert re.search(r"GetFsmId\(fsm\).*if \(fsm != run_fsm\) return NOT_IN_RUN", src, re.S)
 
 
 @pytest.mark.parametrize("sender,model,ok", [

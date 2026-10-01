@@ -44,7 +44,7 @@ convenience calls — its header says why each verb is in or out. In short: no `
 
 | | Go2 | G1 |
 |---|---|---|
-| env | `relay.env.example` | `relay.g1.env.example` (`ROBOT_MODEL=g1`, clamps 0.3 / 0.2 / 0.5) |
+| env | `relay.env.example` | `relay.g1.env.example` (`ROBOT_MODEL=g1`, clamps 1.2 / 0.5 / 1.2) |
 | unit | `systemd/robot-command-relay.service` | `systemd/robot-command-relay.g1.service`, installed under the same name |
 
 This repo serves both robots. Files prefixed `go2_` run only on the Go2, `g1_` (or under

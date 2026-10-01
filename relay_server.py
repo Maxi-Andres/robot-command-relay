@@ -59,27 +59,47 @@ _udp = os.environ.get("RELAY_UDP_PORT", "0").strip()
 RELAY_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(_udp) <= 65535 \
     else 0
 
+# The G1's arm actions and dances (ids and why high five is out: g1_command_sender.cpp).
+G1_ACTIONS = (
+    {f"action_{a}" for a in ("hug", "clap", "face_wave", "left_kiss", "heart", "hands_up",
+                             "x_ray", "right_hand_up", "reject", "shake_hand")}
+    | {f"arm_{a}" for a in ("release_arm", "turn_back_wave", "two_hand_kiss", "right_kiss",
+                            "right_heart", "high_wave", "box_win_left", "box_win_right",
+                            "box_win_both", "hand_on_heart", "hands_up_right", "forward_push")}
+    | {f"dance_{d}" for d in ("waist_drum", "scratch_head", "spin_discs", "throw_money")}
+    | {"stop_dance"}
+)
+# The Go2's whole SDK action set since 2026-10-01: what can hurt the robot is gated by the
+# executor's safe mode, not left out here.
+GO2_ACROBATICS = {"dance1", "dance2", "front_jump", "front_pounce", "front_flip", "back_flip",
+                  "left_flip", "handstand_on", "handstand_off", "walk_upright_on",
+                  "walk_upright_off"}
+GO2_GAITS = {f"gait_{g}" for g in ("classic", "free_walk", "trot_run", "static_walk",
+                                     "economic", "cross_step")}
+
 # Mirrors each sender's dispatch table (src/<robot>_command_sender.cpp). Kept here too so a bad
 # verb is refused before it reaches the control process — defence in depth, not a single gate.
 # tests/test_relay_boundary.py reads both and fails if they drift.
 VERBS_BY_MODEL = {
     "go2": {"stop_move", "stand_up", "stand_down", "damp", "balance_stand",
             "recovery_stand", "sit", "rise_sit", "hello", "stretch", "scrape", "heart",
-            "pose_on", "pose_off", "keepalive"},
-    # Narrower on purpose: the G1 falls. Why each verb is in or out: g1_command_sender.cpp.
-    # Lists BOTH walks; verbs_for() keeps the one matching the waist lock.
-    "g1": {"stop_move", "stand_up", "walk_waist", "start", "squat", "lie_up", "balance_stand",
-           "high_stand", "low_stand", "wave_hand", "keepalive"},
+            "pose_on", "pose_off", "keepalive", *GO2_ACROBATICS, *GO2_GAITS},
+    # Why each verb is in or out: g1_command_sender.cpp. Lists both walks and both runs;
+    # verbs_for() keeps the pair matching the waist lock.
+    "g1": {"stop_move", "stand_up", "walk_waist", "start", "run", "run_waist", "climb",
+           "squat", "lie_up", "damp", "zero_torque", "balance_stand", "high_stand",
+           "low_stand", "wave_hand", "keepalive", *G1_ACTIONS},
 }
 
 
 def verbs_for(model, waist_locked):
-    """The verbs this relay accepts. On the G1 only ONE walk: 500 (`start`) with the waist
-    locked, 501 (`walk_waist`) with it free — the lock is an app setting this process cannot
-    read, so relay.env declares it (G1_WAIST_LOCK=1). g1_command_sender drops the same one."""
+    """The verbs this relay accepts. On the G1 only ONE walk and ONE run: 500 / 801 (`start`,
+    `run`) with the waist locked, 501 / 802 (`walk_waist`, `run_waist`) with it free — the lock
+    is an app setting this process cannot read, so relay.env declares it (G1_WAIST_LOCK=1).
+    g1_command_sender drops the same ones."""
     verbs = set(VERBS_BY_MODEL[model])
     if model == "g1":
-        verbs.discard("walk_waist" if waist_locked else "start")
+        verbs -= {"walk_waist", "run_waist"} if waist_locked else {"start", "run"}
     return verbs
 
 
