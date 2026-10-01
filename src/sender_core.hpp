@@ -15,11 +15,16 @@
 //      running.
 //   4. EOF STOPS THE ROBOT. If the HTTP layer dies, stdin closes, and StopMove is sent before
 //      exiting rather than leaving the last command latched.
+//   5. JOYSTICK ONLY INSIDE ITS MODE. A robot may offer `joy` (the Go2: its pose mode reads the
+//      app's joystick topic, not the Move api). It is accepted only after one of the robot's
+//      `joy_on` verbs and until ANY other verb — outside pose the same sticks would WALK the
+//      robot, around every clamp above. The last value is re-published every 100 ms, like the
+//      app does, and turned to zero once it is DEADMAN_MS old.
 //
 // Protocol (whitespace-separated, one command per line) — deliberately NOT JSON: the only
 // producer is relay_server.py, and a hand-written JSON parser here would be pure attack surface.
 //
-//   move <vx> <vy> <vyaw>  |  keepalive  |  <verb from the robot's table>
+//   move <vx> <vy> <vyaw>  |  joy <lx> <ly> <rx> <ry>  |  keepalive  |  <verb from the table>
 //
 // Answers one line per command on stdout: "ok <verb>" or "err <reason>".
 #pragma once
@@ -51,6 +56,9 @@ struct Robot {
     Call stop_move;
     std::map<std::string, Call> verbs;    // the discrete verbs; move/keepalive are handled here
     std::set<std::string> stops_motion;   // verbs after which no movement is in flight
+    // Optional: publish joystick sticks (each -1..1). Empty = the robot has no `joy`.
+    std::function<void(float, float, float, float)> joy;
+    std::set<std::string> joy_on;         // verbs after which `joy` is accepted
 };
 
 struct Limits {
@@ -105,9 +113,29 @@ inline int run(const char* tag, Limits defaults, const std::function<Robot()>& m
     std::atomic<bool> moving{false};
     std::atomic<bool> running{true};
 
+    // Joystick state (rule 5). All of it is touched under `mu` only.
+    bool joy_enabled = false, joy_live = false;
+    long long last_joy_ms = 0;
+    float joy_v[4] = {0, 0, 0, 0};
+    auto joy_zero = [&] {                 // caller holds mu
+        if (robot.joy && joy_live) robot.joy(0, 0, 0, 0);
+        joy_live = false;
+    };
+
     std::thread deadman([&] {
         while (running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (joy_live) {
+                    if (now_ms() - last_joy_ms < deadman_ms) {
+                        robot.joy(joy_v[0], joy_v[1], joy_v[2], joy_v[3]);
+                    } else {
+                        joy_zero();
+                        std::cout << "ev deadman_joy_zero" << std::endl;
+                    }
+                }
+            }
             if (!moving.load()) continue;
             if (now_ms() - last_move_ms.load() < deadman_ms) continue;
             {
@@ -155,6 +183,30 @@ inline int run(const char* tag, Limits defaults, const std::function<Robot()>& m
             continue;
         }
 
+        if (verb == "joy") {
+            float v[4];
+            if (!robot.joy) {
+                std::cout << "err unknown verb" << std::endl;
+                continue;
+            }
+            if (!(is >> v[0] >> v[1] >> v[2] >> v[3])) {
+                std::cout << "err joy needs lx ly rx ry" << std::endl;
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            if (!joy_enabled) {
+                std::cout << "err joy only in pose" << std::endl;   // outside it, sticks walk
+                continue;
+            }
+            for (int i = 0; i < 4; ++i) joy_v[i] = clamp(v[i], 1.0f);
+            robot.joy(joy_v[0], joy_v[1], joy_v[2], joy_v[3]);
+            joy_live = true;
+            last_joy_ms = now_ms();
+            std::cout << "ok joy " << joy_v[0] << "," << joy_v[1] << "," << joy_v[2] << ","
+                      << joy_v[3] << std::endl;
+            continue;
+        }
+
         auto it = robot.verbs.find(verb);
         if (it == robot.verbs.end()) {
             std::cout << "err unknown verb" << std::endl;   // never reaches the robot
@@ -163,7 +215,11 @@ inline int run(const char* tag, Limits defaults, const std::function<Robot()>& m
         int32_t r;
         {
             std::lock_guard<std::mutex> lk(mu);
+            // Any verb ends a joystick session first (rule 5); a joy_on verb starts one after.
+            joy_zero();
+            joy_enabled = false;
             r = it->second();
+            if (r == 0 && robot.joy_on.count(verb)) joy_enabled = true;
         }
         if (robot.stops_motion.count(verb)) moving.store(false);
         std::cout << (r == 0 ? "ok " : "err ") << verb << " " << r << std::endl;
@@ -173,6 +229,7 @@ inline int run(const char* tag, Limits defaults, const std::function<Robot()>& m
     std::cerr << "[" << tag << "] stdin closed — stopping the robot" << std::endl;
     {
         std::lock_guard<std::mutex> lk(mu);
+        joy_zero();
         robot.stop_move();
     }
     running.store(false);

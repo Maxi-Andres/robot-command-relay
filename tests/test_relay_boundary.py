@@ -328,3 +328,19 @@ def test_the_bitrate_floor_would_have_caught_the_value_that_was_live_on_the_robo
     with pytest.raises(ValueError, match="between"):
         relay_server.validate_video({"bitrate": 60000})
     assert relay_server.validate_video({"bitrate": 600000}) == {"BITRATE": 600000}
+
+
+def test_joy_exists_only_where_a_sender_publishes_it():
+    """Catches: the G1 relay accepting `joy` — its sender has no joystick, and the line would
+    come back "err unknown verb" mid-drive."""
+    assert {"go2"} == relay_server.JOY_MODELS
+
+
+def test_the_go2_joy_is_tied_to_pose():
+    """Outside pose the same sticks WALK the Go2, around every velocity clamp (2026-10-01): the
+    sender must only enable joy after pose_on, and publish on the topic the app uses."""
+    src = (REPO / "src" / "go2_command_sender.cpp").read_text(encoding="utf-8")
+    assert 'r.joy_on = {"pose_on"};' in src
+    assert '"rt/wirelesscontroller"' in src
+    core = (REPO / "src" / "sender_core.hpp").read_text(encoding="utf-8")
+    assert "err joy only in pose" in core

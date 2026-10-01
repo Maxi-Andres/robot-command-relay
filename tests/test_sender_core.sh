@@ -11,6 +11,7 @@
 #   2. move is clamped to the robot's limits
 #   3. a move not refreshed within DEADMAN_MS is stopped automatically
 #   4. closing stdin stops the robot before exiting
+#   5. joy is refused outside pose, ends with any other verb, and zeroes when not refreshed
 set -u
 SDK="${UNITREE_SDK2_DIR:-$HOME/unitree_sdk2}"
 ARCH="$(uname -m)"
@@ -44,5 +45,19 @@ expect "EOF stops the robot"           "stdin closed"                err
 [ "$(grep -c 'call stop_move' "$BASE/err")" -ge 2 ] \
   && echo "  ok    stop_move sent by dead-man AND at EOF" \
   || { echo "  FAIL  expected 2+ stop_move calls"; fail=1; }
-[ "$fail" = 0 ] && echo PASS || { echo "--- out"; cat "$BASE/out"; echo "--- err"; cat "$BASE/err"; }
+# Rule 5: refused before pose; accepted (clamped) after; zeroed by the dead-man; ended by a verb.
+{ echo "joy 0 0 0.4 0"; echo "pose_on"; echo "joy 0 0 2 -0.3"; sleep 1.5; \
+  echo "joy 0 0 0.5 0"; echo "wave_hand"; echo "joy 0 0 0.6 0"; } \
+  | DDS_IFACE=lo DEADMAN_MS=1000 timeout 20 "$BASE/fake" >"$BASE/jout" 2>"$BASE/jerr"
+expect "joy refused outside pose"      "err joy only in pose"        jout
+refute "refused joy never published"   "call joy 0.00 0.00 0.40"     jerr
+expect "joy clamped to the stick range" "call joy 0.00 0.00 1.00 -0.30" jerr
+expect "stale joy zeroed by dead-man"  "ev deadman_joy_zero"         jout
+expect "zeroed sticks published"       "call joy 0.00 0.00 0.00 0.00" jerr
+refute "any other verb ends pose joy"  "call joy 0.00 0.00 0.60"     jerr
+[ "$(grep -c 'err joy only in pose' "$BASE/jout")" = 2 ] \
+  && echo "  ok    joy refused again after wave_hand" \
+  || { echo "  FAIL  expected joy refused before pose AND after wave_hand"; fail=1; }
+
+[ "$fail" = 0 ] && echo PASS || { echo "--- out"; cat "$BASE/out" "$BASE/jout"; echo "--- err"; cat "$BASE/err" "$BASE/jerr"; }
 exit "$fail"

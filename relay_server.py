@@ -105,6 +105,11 @@ def verbs_for(model, waist_locked):
 
 G1_WAIST_LOCK = os.environ.get("G1_WAIST_LOCK", "").strip() == "1"
 VERBS = verbs_for(ROBOT_MODEL, G1_WAIST_LOCK)
+# Verbs that carry numbers, handled before the table on both sides (sender_core.hpp): `move`,
+# and `joy` on the robots whose sender publishes a joystick — the Go2, for its pose mode.
+# The sender accepts `joy` only after pose_on; this layer just validates the numbers.
+JOY_MODELS = {"go2"}
+ARG_VERBS = {"move"} | ({"joy"} if ROBOT_MODEL in JOY_MODELS else set())
 
 
 def log(msg):
@@ -737,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True,
                          "sender_alive": bool(proc and proc.poll() is None),
                          "robot_model": ROBOT_MODEL,
-                         "verbs": sorted(VERBS | {"move"}),
+                         "verbs": sorted(VERBS | ARG_VERBS),
                          # Everything below is configured ON THE ROBOT: the app can only
                          # read it, so the robot reports it instead of the app guessing.
                          "video": video_status(),
@@ -796,12 +801,22 @@ class Handler(BaseHTTPRequestHandler):
             # Values are clamped again in command_sender: this is convenience, not the limit.
             line = f"move {vx:.3f} {vy:.3f} {vyaw:.3f}"
             detail = f"vx={vx:.3f} vy={vy:.3f} vyaw={vyaw:.3f}"
+        elif verb == "joy" and "joy" in ARG_VERBS:
+            try:
+                sticks = [float(payload.get(k, 0)) for k in ("lx", "ly", "rx", "ry")]
+            except (TypeError, ValueError):
+                return self._json(400, {"error": "lx/ly/rx/ry must be numbers"})
+            if not all(math.isfinite(v) for v in sticks):
+                return self._json(400, {"error": "lx/ly/rx/ry must be finite"})
+            # Clamped to -1..1 again in the sender, which also refuses it outside pose.
+            line = "joy " + " ".join(f"{v:.3f}" for v in sticks)
+            detail = "lx={:.3f} ly={:.3f} rx={:.3f} ry={:.3f}".format(*sticks)
         elif verb in VERBS:
             line, detail = verb, "-"
         else:
             audit(src, verb or "-", "-", "rejected-unknown-verb")
             return self._json(400, {"error": f"unknown verb '{verb}'",
-                                    "allowed": sorted(VERBS | {"move"})})
+                                    "allowed": sorted(VERBS | ARG_VERBS)})
 
         reply = self.server.sender.send(line)
         audit(src, verb, detail, reply)
