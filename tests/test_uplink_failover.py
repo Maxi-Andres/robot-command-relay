@@ -13,4 +13,4 @@ def test_uplink_failover_harness():
     r = subprocess.run(["bash", str(HERE / "test_uplink_failover.sh")],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert r.stdout.count("PASS") == 5, r.stdout
+    assert r.stdout.count("PASS") == 6, r.stdout
