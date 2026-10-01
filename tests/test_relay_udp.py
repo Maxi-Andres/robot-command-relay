@@ -176,7 +176,7 @@ def test_the_ack_echoes_the_command_and_reports_a_sender_error():
 def test_the_dead_man_defaults_are_one_second_everywhere():
     """Catches: the window changed in one of the four places that declare it and not the
     others — the C++ default, the unit file, the example env and what /health reports."""
-    cpp = (REPO / "src" / "command_sender.cpp").read_text(encoding="utf-8")
+    cpp = (REPO / "src" / "sender_core.hpp").read_text(encoding="utf-8")
     unit = (REPO / "systemd" / "robot-command-relay.service").read_text(encoding="utf-8")
     env = (REPO / "relay.env.example").read_text(encoding="utf-8")
     assert 'env_f("DEADMAN_MS", 1000)' in cpp

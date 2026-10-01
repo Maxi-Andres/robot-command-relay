@@ -19,52 +19,82 @@ sys.path.insert(0, str(REPO))
 
 import relay_server  # noqa: E402
 
-
 # --------------------------------------------------------------------------- #
 # The allowlist, and the copy of it that lives in C++
 # --------------------------------------------------------------------------- #
-def _sender_verbs() -> set[str]:
-    """The verbs `command_sender.cpp` actually dispatches, read out of its VERBS map.
+MODELS = sorted(relay_server.VERBS_BY_MODEL)
+
+
+def _sender_verbs(model: str = "go2") -> set[str]:
+    """The verbs `<model>_command_sender.cpp` actually dispatches, read out of its VERBS map.
 
     Parsing the C++ is deliberate. The two lists are duplicated ON PURPOSE — defence in
     depth, and the boundary forbids sharing code with a binary — so the only way to keep them
     honest is a test that reads both.
     """
-    src = (REPO / "src" / "command_sender.cpp").read_text(encoding="utf-8")
-    table = re.search(r"VERBS\s*=\s*\{(.*?)\n\};", src, re.S)
-    assert table, "could not find the VERBS dispatch table in command_sender.cpp"
+    src = (REPO / "src" / f"{model}_command_sender.cpp").read_text(encoding="utf-8")
+    table = re.search(r"VERBS\s*=\s*\{(.*?)\n\s*\};", src, re.S)
+    assert table, f"could not find the VERBS dispatch table in {model}_command_sender.cpp"
     verbs = set(re.findall(r'\{\s*"(\w+)"', table.group(1)))
     # `move` and `keepalive` are handled before the table (they take arguments / refresh the
     # dead-man rather than dispatching a client call), so they are added here explicitly.
     return verbs | {"move", "keepalive"}
 
 
-def test_python_and_cpp_allowlists_agree():
+@pytest.mark.parametrize("model", MODELS)
+def test_python_and_cpp_allowlists_agree(model):
     """Catches: a verb added to one side only.
 
     Added to C++ alone, it is unreachable — confusing but safe. Added to Python alone, the
     relay accepts a command that `command_sender` then refuses, which surfaces as a useless
     502 mid-drive. Either way the two must not drift.
     """
-    python_verbs = relay_server.VERBS | {"move"}
-    assert python_verbs == _sender_verbs()
+    python_verbs = relay_server.VERBS_BY_MODEL[model] | {"move"}
+    assert python_verbs == _sender_verbs(model)
 
 
-def test_acrobatics_are_absent_from_the_allowlist():
+@pytest.mark.parametrize("model", MODELS)
+def test_acrobatics_are_absent_from_the_allowlist(model):
     """Catches: someone adding a flip or a handstand to the remote path.
 
     These exist in the robot's SDK and are deliberately unreachable from the network: the
     relay cannot be the way a flip gets triggered from another continent.
     """
     for verb in ["front_flip", "back_flip", "handstand", "walk_upright", "dance1", "front_jump"]:
-        assert verb not in relay_server.VERBS
-        assert verb not in _sender_verbs()
+        assert verb not in relay_server.VERBS_BY_MODEL[model]
+        assert verb not in _sender_verbs(model)
 
 
-def test_stop_is_always_in_the_allowlist():
+@pytest.mark.parametrize("model", MODELS)
+def test_stop_is_always_in_the_allowlist(model):
     """Catches: a refactor that removes the one verb you cannot afford to lose."""
-    assert "stop_move" in relay_server.VERBS
-    assert "stop_move" in _sender_verbs()
+    assert "stop_move" in relay_server.VERBS_BY_MODEL[model]
+    assert "stop_move" in _sender_verbs(model)
+
+
+def test_the_g1_cannot_be_dropped_from_the_network():
+    """Catches: someone adding the verbs that make a STANDING humanoid fall.
+
+    zero_torque and damp go limp; user_ctrl hands the joints to a controller the relay is not;
+    start (FSM 500) and the SDK's squat (FSM 2) are the wrong ids on THIS robot, the second
+    observed half-falling. Any of them, sent to a G1 on its feet, can drop it.
+    See g1_command_sender.cpp.
+    """
+    for verb in ["zero_torque", "damp", "start", "squat_sdk", "user_ctrl",
+                 "switch_to_user_ctrl", "shake_hand", "set_fsm_id", "run", "climb"]:
+        assert verb not in relay_server.VERBS_BY_MODEL["g1"]
+        assert verb not in _sender_verbs("g1")
+
+
+@pytest.mark.parametrize("sender,model,ok", [
+    ("/home/unitree/robot-command-relay/go2_command_sender", "go2", True),
+    ("./g1_command_sender", "g1", True),
+    ("/home/unitree/robot-command-relay/command_sender", "go2", False),   # the stale binary
+    ("./go2_command_sender", "g1", False),                                # wrong robot
+])
+def test_the_sender_binary_must_name_the_robot(sender, model, ok):
+    """Catches: a relay starting on yesterday's binary, or on the other robot's."""
+    assert (relay_server.sender_mismatch(sender, model) == "") is ok
 
 
 # --------------------------------------------------------------------------- #

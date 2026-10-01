@@ -43,7 +43,12 @@ BIND = os.environ.get("RELAY_BIND", "0.0.0.0")  # noqa: S104  # known finding P0
 PORT = int(os.environ.get("RELAY_PORT", "8092"))
 TOKEN_FILE = os.environ.get("RELAY_TOKEN_FILE", os.path.expanduser("~/.relay_token"))
 TOKEN = os.environ.get("RELAY_TOKEN", "")
-SENDER = os.environ.get("SENDER_BIN", "./command_sender")
+# WHICH ROBOT this relay drives. It picks the sender binary and the verb allowlist below; the
+# HTTP layer, the rate limit, the UDP path and the audit log are the same for both robots.
+ROBOT_MODEL = os.environ.get("ROBOT_MODEL", "go2")
+if ROBOT_MODEL not in ("go2", "g1"):
+    raise SystemExit(f"ROBOT_MODEL must be go2 or g1 (got {ROBOT_MODEL!r})")
+SENDER = os.environ.get("SENDER_BIN", f"./{ROBOT_MODEL}_command_sender")
 AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/tmp/robot-relay-audit.log")
 MAX_PER_SEC = float(os.environ.get("MAX_PER_SEC", "20"))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", "3"))
@@ -54,14 +59,35 @@ _udp = os.environ.get("RELAY_UDP_PORT", "0").strip()
 RELAY_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(_udp) <= 65535 \
     else 0
 
-# Mirrors command_sender's dispatch table. Kept here too so a bad verb is refused before it
-# reaches the control process — defence in depth, not a single gate.
-VERBS = {"stop_move", "stand_up", "stand_down", "damp", "balance_stand",
-         "recovery_stand", "sit", "rise_sit", "hello", "keepalive"}
+# Mirrors each sender's dispatch table (src/<robot>_command_sender.cpp). Kept here too so a bad
+# verb is refused before it reaches the control process — defence in depth, not a single gate.
+# tests/test_relay_boundary.py reads both and fails if they drift.
+VERBS_BY_MODEL = {
+    "go2": {"stop_move", "stand_up", "stand_down", "damp", "balance_stand",
+            "recovery_stand", "sit", "rise_sit", "hello", "keepalive"},
+    # Narrower on purpose: the G1 falls. Why each verb is in or out: g1_command_sender.cpp.
+    "g1": {"stop_move", "stand_up", "walk_waist", "squat", "lie_up", "balance_stand",
+           "high_stand", "low_stand", "wave_hand", "keepalive"},
+}
+VERBS = VERBS_BY_MODEL[ROBOT_MODEL]
 
 
 def log(msg):
     print(f"[relay] {msg}", file=sys.stderr, flush=True)
+
+
+def sender_mismatch(sender, model):
+    """Why `sender` is the wrong binary for `model`, or "" if it is the right one.
+
+    THE TRAP THIS CATCHES: until 2026-10-01 the sender was `command_sender`, and the installed
+    unit and relay.env both pin SENDER_BIN to that path. After a pull + build the new binary is
+    `go2_command_sender` but the OLD one is still on disk, so a stale SENDER_BIN keeps running
+    yesterday's code with no error anywhere. Worse, a G1 pointed at a Go2 sender would accept
+    Go2 verbs. So the file name must say the robot.
+    """
+    name = os.path.basename(sender)
+    want = f"{model}_command_sender"
+    return "" if name == want else f"SENDER_BIN is {sender!r} but ROBOT_MODEL={model} needs {want}"
 
 
 # --------------------------------------------------------------------------- #
@@ -675,6 +701,7 @@ class Handler(BaseHTTPRequestHandler):
         proc = self.server.sender.proc
         self._json(200, {"ok": True,
                          "sender_alive": bool(proc and proc.poll() is None),
+                         "robot_model": ROBOT_MODEL,
                          "verbs": sorted(VERBS | {"move"}),
                          # Everything below is configured ON THE ROBOT: the app can only
                          # read it, so the robot reports it instead of the app guessing.
@@ -759,6 +786,13 @@ def main():
 
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.token = token
+    bad = sender_mismatch(SENDER, ROBOT_MODEL)
+    if bad:
+        # Refuse rather than run the wrong code: a relay that does not start leaves the robot
+        # still; one that starts on the wrong sender drives it with the wrong rules.
+        log(f"REFUSING TO START: {bad}. Fix SENDER_BIN in relay.env (or delete it: the default "
+            f"follows ROBOT_MODEL) and in the installed unit, then restart.")
+        sys.exit(2)
     srv.sender = Sender([SENDER])
     srv.limiter = RateLimiter(MAX_PER_SEC)
     srv.order = CommandOrder()

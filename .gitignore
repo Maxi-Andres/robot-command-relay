@@ -1,3 +1,6 @@
+go2_command_sender
+g1_command_sender
+# pre-rename binary name (renamed 2026-10-01), still on robots built before
 command_sender
 *.o
 __pycache__/

@@ -19,7 +19,14 @@ LIBS=("$SDK/lib/$ARCH/libunitree_sdk2.a" -L"$SDK/thirdparty/lib/$ARCH" -lddscxx 
       -Wl,-rpath,"$SDK/thirdparty/lib/$ARCH" -lpthread)
 
 
-# Command relay: the only binary here that can MOVE the robot. Safety (verb allowlist,
-# velocity clamp, dead-man switch) lives inside it, not in the HTTP layer above it.
-g++ -O2 -std=c++17 src/command_sender.cpp -o command_sender "${INCS[@]}" "${LIBS[@]}"
-echo "built ./command_sender ($ARCH)"
+# Command senders: the only binaries here that can MOVE a robot. Safety (verb allowlist,
+# velocity clamp, dead-man switch) lives inside them — in the shared src/sender_core.hpp —
+# not in the HTTP layer above. One per robot: relay_server.py runs the one ROBOT_MODEL names.
+for robot in go2 g1; do
+  g++ -O2 -std=c++17 "src/${robot}_command_sender.cpp" -o "${robot}_command_sender" \
+      "${INCS[@]}" "${LIBS[@]}"
+  echo "built ./${robot}_command_sender ($ARCH)"
+done
+# Flush before returning: the robots are powered off by their switch, and on 2026-10-01 a
+# power-off right after a build left binaries at 0 bytes (robot-telemetry-agent, same recipe).
+sync

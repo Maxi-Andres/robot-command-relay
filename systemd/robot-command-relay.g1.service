@@ -1,3 +1,7 @@
+# The G1's relay unit, installed under the SAME name as the Go2's:
+#   sudo cp systemd/robot-command-relay.g1.service /etc/systemd/system/robot-command-relay.service
+# Differs from robot-command-relay.service only in ROBOT_MODEL=g1 and the lower clamps
+# (see src/g1_command_sender.cpp for why they are lower).
 # Remote command relay, for the robot's own Jetson.
 #
 #   cp relay/relay.env.example relay/relay.env          # then review the safety limits
@@ -23,11 +27,11 @@ WorkingDirectory=/home/unitree/robot-command-relay
 Environment=RELAY_BIND=0.0.0.0
 Environment=RELAY_PORT=8092
 Environment=DDS_IFACE=eth0
-Environment=MAX_VX=0.6
-Environment=MAX_VY=0.4
-Environment=MAX_VYAW=1.0
+Environment=MAX_VX=0.3
+Environment=MAX_VY=0.2
+Environment=MAX_VYAW=0.5
 Environment=DEADMAN_MS=1000
-Environment=ROBOT_MODEL=go2
+Environment=ROBOT_MODEL=g1
 EnvironmentFile=-/home/unitree/robot-command-relay/relay.env
 ExecStart=/usr/bin/python3 /home/unitree/robot-command-relay/relay_server.py
 Restart=always

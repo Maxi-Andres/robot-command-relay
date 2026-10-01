@@ -29,6 +29,24 @@ the uplink. On the G1, eth0 is the internal bus and never loses carrier, so unpl
 external cable never triggers a failover; the script probes the wired gateway and demotes
 the wired default route when it stops answering. Test: `tests/test_uplink_failover.sh`.
 
+**The senders.** `src/sender_core.hpp` is the safety envelope — allowlist by construction,
+velocity clamp, dead-man switch, EOF stops the robot — and it is ONE file for both robots.
+`src/go2_command_sender.cpp` (was `command_sender.cpp` until 2026-10-01) and
+`src/g1_command_sender.cpp` add only their SDK client and verb table. `./build.sh` builds
+both; `relay_server.py` runs the one `ROBOT_MODEL` names, with that robot's allowlist
+(`VERBS_BY_MODEL`), and **refuses to start** if `SENDER_BIN` names another binary — the stale
+`command_sender` included. Test the envelope with a fake robot: `bash tests/test_sender_core.sh`
+(needs the SDK; CI skips it).
+
+The G1's table is narrower and uses the FSM ids measured on this robot, not the SDK's
+convenience calls — its header says why each verb is in or out. In short: no `damp`, no
+`zero_torque`, no SDK `Squat()` (observed half-falling), walk is FSM 501.
+
+| | Go2 | G1 |
+|---|---|---|
+| env | `relay.env.example` | `relay.g1.env.example` (`ROBOT_MODEL=g1`, clamps 0.3 / 0.2 / 0.5) |
+| unit | `systemd/robot-command-relay.service` | `systemd/robot-command-relay.g1.service`, installed under the same name |
+
 This repo serves both robots. Files prefixed `go2_` run only on the Go2, `g1_` (or under
 `host/g1/`) only on the G1, unprefixed ones on both; `ROBOT_MODEL` picks the variant. The
 full map — what runs where, per repo — is `robot-splunk-docs/QUE-CORRE-EN-CADA-ROBOT.md`.
