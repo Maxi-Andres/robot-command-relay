@@ -175,12 +175,22 @@ VIDEO_PARAMS = {
     "fps":     ("MJPEG_FPS", float, 0.0, 60.0, True),
     "width":   ("MJPEG_WIDTH", int, 0, 1920, True),
     "quality": ("MJPEG_QUALITY", int, 1, 100, True),
+    # The DRIVE view: all-intra H.264 over UDP, what Drive shows. Live on the publisher too,
+    # and they were missing here, which is why tuning them on 2026-10-07 took SSH.
+    "h264_qp":    ("H264_QP", int, 10, 51, True),
+    "h264_width": ("H264_WIDTH", int, 64, 1920, True),
     "bitrate": ("BITRATE", int, 200000, 8000000, False),
     "maxfps":  ("MAXFPS", int, 0, 30, False),
     "idr":     ("IDR_FRAMES", int, 1, 300, False),
     "nvr":     ("NVR_ENABLE", int, 0, 1, False),
 }
 LIVE_KEYS = {k for k, v in VIDEO_PARAMS.items() if v[4]}
+
+
+def h264_height_for(width):
+    """Twin of mjpeg_server.h264_height_for: 16:9, even. Persisting H264_WIDTH without the
+    height it implies would bring the stretched picture back on the next restart."""
+    return max(2, round(width * 9 / 16 / 2) * 2)
 
 
 def validate_video(body):
@@ -205,6 +215,8 @@ def validate_video(body):
         if not lo <= value <= hi:
             raise ValueError(f"'{key}' must be between {lo} and {hi}, got {value}")
         out[name] = value
+    if "H264_WIDTH" in out:
+        out["H264_HEIGHT"] = h264_height_for(out["H264_WIDTH"])
     return out
 
 
@@ -272,8 +284,14 @@ def mjpeg_live():
     try:
         with urllib.request.urlopen(f"{MJPEG_LOCAL}/health", timeout=2) as r:
             d = json.loads(r.read())
-        return {"fps": d.get("fps_cap") or 0, "width": d.get("width"),
-                "quality": d.get("quality")}
+        out = {"fps": d.get("fps_cap") or 0, "width": d.get("width"),
+               "quality": d.get("quality")}
+        if d.get("h264_qp") is not None:
+            out["h264_qp"] = d["h264_qp"]
+        size = str(d.get("h264_size") or "")
+        if "x" in size:
+            out["h264_width"] = int(size.split("x")[0])
+        return out
     except Exception:
         return {}
 

@@ -229,6 +229,10 @@ def test_token_comparison_is_constant_time():
     ({"quality": 100}, {"MJPEG_QUALITY": 100}),
     ({"fps": 5, "width": 640, "quality": 55},
      {"MJPEG_FPS": 5.0, "MJPEG_WIDTH": 640, "MJPEG_QUALITY": 55}),
+    ({"h264_qp": 38}, {"H264_QP": 38}),
+    # the width carries its height, or a restart brings the stretched picture back
+    ({"h264_width": 640}, {"H264_WIDTH": 640, "H264_HEIGHT": 360}),
+    ({"h264_width": 480}, {"H264_WIDTH": 480, "H264_HEIGHT": 270}),
 ])
 def test_valid_video_params_map_to_env_keys(body, expect):
     assert relay_server.validate_video(body) == expect
@@ -242,6 +246,9 @@ def test_valid_video_params_map_to_env_keys(body, expect):
     {"bitrate": 99000000},     # and the ceiling, for the same class of typo
     {"nvr": 2},                # a flag is 0 or 1
     {"idr": 0},                # a keyframe interval of zero frames is meaningless
+    {"h264_qp": 9}, {"h264_qp": 52},   # outside H.264's QP range
+    {"h264_width": 63}, {"h264_width": 4096},
+    {"h264_height": 360},      # derived from the width, never set on its own
     {"NIC": "eth9"},           # would take the video off the air; must never reach the file
     {"PUBLISH_HOST": "evil"},  # nor may an arbitrary env key be smuggled through
     {},                        # an empty request is a mistake, not a no-op
@@ -267,7 +274,8 @@ def test_the_allowlist_agrees_with_the_publisher_on_the_same_machine():
     for key, (_env, cast, lo, hi, live) in relay_server.VIDEO_PARAMS.items():
         if not live:
             continue   # restart-only knobs are the relay's alone; the publisher never sees them
-        pattern = rf'"{key}":\s*\("[A-Z_]+",\s*{cast.__name__},\s*([0-9.]+),\s*([0-9.]+)\)'
+        # [A-Z0-9_]: env names can hold digits (H264_QP) — [A-Z_] made those look missing.
+        pattern = rf'"{key}":\s*\("[A-Z0-9_]+",\s*{cast.__name__},\s*([0-9.]+),\s*([0-9.]+)\)'
         m = re.search(pattern, src)
         assert m, f"'{key}' is missing from mjpeg_server.LIVE_PARAMS (or changed shape)"
         assert (float(m.group(1)), float(m.group(2))) == (float(lo), float(hi)), (
@@ -302,6 +310,7 @@ def test_writing_env_keys_is_atomic(tmp_path):
 
 @pytest.mark.parametrize("key, live", [
     ("fps", True), ("width", True), ("quality", True),
+    ("h264_qp", True), ("h264_width", True),
     ("bitrate", False), ("maxfps", False), ("idr", False), ("nvr", False),
 ])
 def test_each_knob_declares_whether_it_applies_live(key, live):
