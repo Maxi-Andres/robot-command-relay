@@ -162,6 +162,11 @@ def sender_mismatch(sender, model):
 VIDEO_ENV = os.environ.get(
     "VIDEO_ENV", "/home/unitree/robot-video-pipeline/robot/video.env")
 MJPEG_LOCAL = os.environ.get("MJPEG_LOCAL", "http://127.0.0.1:8093")
+# camera_source, the process in front of mjpeg_server that picks WHICH camera is sent. Same
+# localhost-only contract as MJPEG_LOCAL. Its choices mirror camera_source.CAMERAS — two repos,
+# one machine, so a test on this side keeps the copies honest.
+CAMERA_LOCAL = os.environ.get("CAMERA_LOCAL", "http://127.0.0.1:8094")
+CAMERAS = ("front", "rs_color", "rs_depth")
 # Newest battery reading, written by the telemetry shipper (see its snapshot_battery()).
 BATTERY_FILE = os.environ.get("BATTERY_FILE", "/var/tmp/robot-battery.json")
 # Past this age the reading is reported as stale instead of as the truth. The reader's
@@ -305,6 +310,51 @@ def mjpeg_live():
         return out
     except Exception:
         return {}
+
+
+def validate_camera(value):
+    """The camera name, or ValueError. An allowlist like every other knob here."""
+    if value not in CAMERAS:
+        raise ValueError(f"'camera' must be one of {list(CAMERAS)}, got {value!r}")
+    return value
+
+
+def camera_live():
+    """{'camera': …, 'camera_error': …} from camera_source, or {} if it is not answering.
+
+    Never raises, for the same reason as mjpeg_live(). camera_error is why the last switch
+    did not land (no RealSense, library missing) — the UI shows it instead of guessing."""
+    try:
+        with urllib.request.urlopen(f"{CAMERA_LOCAL}/camera", timeout=2) as r:
+            d = json.loads(r.read())
+        return {"camera": d.get("camera"), "camera_error": d.get("error")}
+    except Exception:
+        return {}
+
+
+def camera_apply(camera):
+    """Switch the camera on localhost. {'error': …} only when it could not be ASKED.
+
+    A switch that was asked but fell back (no RealSense) is not an error here: the picture is
+    still on, and the answer says which camera is running and why. The timeout covers
+    camera_source's own wait for the RealSense to open (CAMERA_SWITCH_WAIT_S, 3 s) and stays
+    inside the executor's 5 s to this relay."""
+    try:
+        req = urllib.request.Request(
+            f"{CAMERA_LOCAL}/camera", data=json.dumps({"camera": camera}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            d = json.loads(r.read() or b"{}")
+        out = {"camera": d.get("camera"), "camera_error": d.get("error")}
+        if d.get("pending"):
+            out["camera_pending"] = d["pending"]
+        return out
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:200].decode("utf-8", "replace")
+        return {"error": f"camera switch refused it: HTTP {exc.code}: {detail}"}
+    except Exception as exc:
+        return {"error": f"camera switch unreachable on {CAMERA_LOCAL}: {exc} "
+                         f"(is the video service running a version with camera_source?)"}
 
 
 def mjpeg_apply(body):
@@ -797,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
         return got.startswith("Bearer ") and got[7:] == self.server.token
 
     def _video_config(self):
-        """POST /video-config {fps?, width?, quality?, persist?}
+        """POST /video-config {fps?, width?, quality?, camera?, persist?}
 
         Applies the values to the running publisher immediately, and with persist=true
         also writes them to video.env so they survive the next restart. Applying and
@@ -813,8 +863,15 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json(400, {"error": "bad json"})
         persist = bool(body.pop("persist", False))
+        # The camera is not a number with a range, and it is applied by camera_source rather
+        # than mjpeg_server, so it travels beside VIDEO_PARAMS instead of inside it.
+        camera = body.pop("camera", None)
         try:
-            env_updates = validate_video(body)
+            env_updates = {}
+            if camera is not None:
+                env_updates["CAMERA"] = validate_camera(camera)
+            if body or camera is None:          # an empty request is still refused
+                env_updates.update(validate_video(body))
         except ValueError as exc:
             audit(self.client_address[0], "video-config", str(body), "rejected")
             return self._json(400, {"ok": False, "error": str(exc)})
@@ -836,6 +893,14 @@ class Handler(BaseHTTPRequestHandler):
                 audit(self.client_address[0], "video-config", str(body),
                       "publisher-unreachable")
                 return self._json(502, {"ok": False, "error": applied["error"]})
+        if camera is not None:
+            switched = camera_apply(camera)
+            if switched.get("error"):
+                audit(self.client_address[0], "video-config", f"camera={camera}",
+                      "camera-switch-unreachable")
+                return self._json(502, {"ok": False, "error": switched["error"]})
+            applied.update(switched)
+            body["camera"] = camera             # so the audit line below records it
 
         saved = False
         if persist:
@@ -906,13 +971,16 @@ class Handler(BaseHTTPRequestHandler):
             saved = read_env_file(VIDEO_ENV)
             return self._json(200, {
                 "ok": True,
-                "running": mjpeg_live(),
-                "saved": {k: saved.get(name) for k, (name, *_) in VIDEO_PARAMS.items()},
+                "running": {**mjpeg_live(), **camera_live()},
+                "saved": {**{k: saved.get(name) for k, (name, *_) in VIDEO_PARAMS.items()},
+                          "camera": saved.get("CAMERA")},
                 # `live` tells the UI which knobs apply instantly and which cost a restart
                 # of the video service — the difference the operator must see BEFORE
                 # touching one while driving.
                 "limits": {k: {"min": lo, "max": hi, "live": live}
                            for k, (_n, _c, lo, hi, live) in VIDEO_PARAMS.items()},
+                # Not a range, so not in `limits`: a client iterating those expects min/max.
+                "cameras": list(CAMERAS),
             })
         if self.path.split("?")[0] != "/health":
             return self._json(404, {"error": "not found"})

@@ -308,6 +308,72 @@ def test_writing_env_keys_is_atomic(tmp_path):
     assert f.read_text().endswith("\n")
 
 
+@pytest.mark.parametrize("camera", ["front", "rs_color", "rs_depth"])
+def test_each_camera_is_accepted(camera):
+    assert relay_server.validate_camera(camera) == camera
+
+
+@pytest.mark.parametrize("camera", ["rear", "", None, 0, "FRONT", "/dev/video0"])
+def test_an_unknown_camera_is_refused(camera):
+    """The camera is an allowlist like every verb here: the name reaches video.env on persist,
+    and a value run-video.sh does not know would start the video on a camera that is not."""
+    with pytest.raises(ValueError):
+        relay_server.validate_camera(camera)
+
+
+def test_the_cameras_agree_with_camera_source_on_the_same_machine():
+    """The defect: the relay offering a camera that camera_source does not have, so the app
+    shows a button that can only fail. Same reason as the publisher check above."""
+    source = (Path.home() / "Desktop/robot-ecosystem/robot-video-pipeline/robot"
+              / "camera_source.py")
+    if not source.exists():
+        pytest.skip("the video-pipeline repo is not checked out next to this one")
+    m = re.search(r"^CAMERAS = (\(.*?\))$", source.read_text(encoding="utf-8"), re.M)
+    assert m, "CAMERAS is missing from camera_source.py (or changed shape)"
+    assert eval(m.group(1)) == relay_server.CAMERAS  # noqa: S307 — a literal tuple from our own repo
+
+
+def test_camera_apply_reports_a_fallback_as_running_not_as_failure(monkeypatch):
+    """No RealSense plugged in: the switch falls back to the robot's camera. The picture is
+    still on, so the relay must answer 200 with the reason — not 502, which the app would
+    show as "the robot is not answering"."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Fake(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers["Content-Length"])
+            asked = json.loads(self.rfile.read(n))["camera"]
+            body = json.dumps({"ok": True, "camera": "front",
+                               "error": f"{asked}: no RealSense camera connected"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(relay_server, "CAMERA_LOCAL",
+                            f"http://127.0.0.1:{srv.server_address[1]}")
+        got = relay_server.camera_apply("rs_depth")
+    finally:
+        srv.shutdown()
+    assert "error" not in got
+    assert got["camera"] == "front"
+    assert "no RealSense" in got["camera_error"]
+
+
+def test_camera_apply_says_when_nothing_answers(monkeypatch):
+    """An older robot-video without camera_source: an honest error, not a silent no-op."""
+    monkeypatch.setattr(relay_server, "CAMERA_LOCAL", "http://127.0.0.1:9")
+    assert "unreachable" in relay_server.camera_apply("rs_color")["error"]
+
+
 @pytest.mark.parametrize("key, live", [
     ("fps", True), ("width", True), ("quality", True),
     ("h264_qp", True), ("h264_width", True),
