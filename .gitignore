@@ -6,3 +6,4 @@ command_sender
 __pycache__/
 relay.env
 g1_joint_bridge
+go2_audio_sender

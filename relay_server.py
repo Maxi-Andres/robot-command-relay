@@ -33,6 +33,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -52,6 +53,16 @@ SENDER = os.environ.get("SENDER_BIN", f"./{ROBOT_MODEL}_command_sender")
 AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/tmp/robot-relay-audit.log")
 MAX_PER_SEC = float(os.environ.get("MAX_PER_SEC", "20"))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", "3"))
+
+# The Go2's own speaker (POST /audio/*), through go2_audio_sender. Go2 only: the G1's audio is
+# a different SDK client and is not wired here. The limits bound what one request can make the
+# robot say: a phrase, not a playlist. The upload is ~100 ms per 60 KB block (measured
+# 2026-10-14), so the reply timeout covers the largest WAV allowed with room to spare.
+AUDIO_SENDER = os.environ.get("AUDIO_SENDER_BIN", "./go2_audio_sender")
+AUDIO_MAX_BYTES = int(os.environ.get("AUDIO_MAX_BYTES", str(4 * 1024 * 1024)))
+AUDIO_MAX_S = float(os.environ.get("AUDIO_MAX_S", "30"))
+AUDIO_REPLY_TIMEOUT = float(os.environ.get("AUDIO_REPLY_TIMEOUT", "15"))
+VOLUME_MAX = 10      # the Go2's VUI scale, 0-10 (the robot read back 10 at full volume)
 
 # UDP port for continuous teleop (`move` and `stop_move` only). 0 = off, the default: the
 # HTTP path below is then the only way in, exactly as before. See the UDP block further down.
@@ -373,6 +384,47 @@ def mjpeg_apply(body):
         return {"error": f"video publisher unreachable on {MJPEG_LOCAL}: {exc}"}
 
 
+def parse_wav(data):
+    """{'rate','channels','seconds'} for a playable WAV, or ValueError saying why not.
+
+    The speaker takes 16-bit PCM WAV (Piper's 22.05 kHz mono and 44.1 kHz were both heard on
+    the robot, 2026-10-14). Everything else is refused here rather than handed to a service
+    whose failure modes nobody has documented: a request that cannot play must say so."""
+    if len(data) > AUDIO_MAX_BYTES:
+        raise ValueError(f"audio is {len(data)} bytes; the limit is {AUDIO_MAX_BYTES}")
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a WAV file (RIFF/WAVE header missing)")
+    fmt = None
+    i = 12
+    while i + 8 <= len(data):
+        cid, size = data[i:i + 4], struct.unpack("<I", data[i + 4:i + 8])[0]
+        if cid == b"fmt " and size >= 16:
+            fmt = struct.unpack("<HHIIHH", data[i + 8:i + 24])
+        elif cid == b"data":
+            if fmt is None:
+                raise ValueError("WAV data chunk comes before its fmt chunk")
+            tag, channels, rate, byte_rate, _align, bits = fmt
+            if tag != 1 or bits != 16:
+                raise ValueError(f"must be 16-bit PCM (format {tag}, {bits} bits)")
+            if channels not in (1, 2) or not 8000 <= rate <= 48000:
+                raise ValueError(f"must be mono or stereo at 8-48 kHz ({channels} ch, {rate} Hz)")
+            seconds = min(size, len(data) - i - 8) / byte_rate
+            if seconds > AUDIO_MAX_S:
+                raise ValueError(f"{seconds:.1f} s of audio; the limit is {AUDIO_MAX_S:g} s")
+            return {"rate": rate, "channels": channels, "seconds": round(seconds, 2)}
+        i += 8 + size + (size & 1)
+    raise ValueError("WAV has no data chunk")
+
+
+def validate_volume(value):
+    """The volume level as an int 0-10, or ValueError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+        raise ValueError(f"'level' must be a whole number, got {value!r}")
+    if not 0 <= value <= VOLUME_MAX:
+        raise ValueError(f"'level' must be between 0 and {VOLUME_MAX}, got {value}")
+    return int(value)
+
+
 def audit(addr, verb, detail, result):
     line = (f'{time.strftime("%Y-%m-%dT%H:%M:%S")} src={addr} verb={verb} '
             f'{detail} result={result}\n')
@@ -657,33 +709,43 @@ class UdpControl:
 
 
 class Sender:
-    """Owns the long-lived command_sender child. One DDS participant, created once."""
+    """Owns a long-lived sender child. One DDS participant, created once.
 
-    def __init__(self, argv):
+    The command sender starts with the relay; the audio sender (`lazy`) starts the first time
+    something is said, so a relay that never speaks costs nothing extra."""
+
+    def __init__(self, argv, label="command_sender", timeout=None, lazy=False):
         self.argv = argv
+        self.label = label
+        self.timeout = timeout
         self.lock = threading.Lock()
         self.proc = None
-        self._spawn()
+        if not lazy:
+            self._spawn()
 
     def _spawn(self):
         self.proc = subprocess.Popen(
             self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             text=True, bufsize=1)
-        log(f"command_sender started (pid {self.proc.pid})")
+        log(f"{self.label} started (pid {self.proc.pid})")
 
     def send(self, line):
         """Write one command, read its reply. Serialised: the protocol is one-in-one-out."""
         with self.lock:
             if self.proc is None or self.proc.poll() is not None:
-                log("command_sender is gone — respawning")
-                self._spawn()
+                if self.proc is not None:
+                    log(f"{self.label} is gone — respawning")
+                try:
+                    self._spawn()
+                except OSError as exc:
+                    return f"err sender-start {exc}"
             try:
                 self.proc.stdin.write(line + "\n")
                 self.proc.stdin.flush()
             except (BrokenPipeError, ValueError) as exc:
                 return f"err sender-write {exc}"
 
-            deadline = time.time() + REPLY_TIMEOUT
+            deadline = time.time() + (self.timeout or REPLY_TIMEOUT)
             while time.time() < deadline:
                 reply = self.proc.stdout.readline()
                 if not reply:
@@ -960,6 +1022,8 @@ class Handler(BaseHTTPRequestHandler):
             audit(src, "joints-stream", "-", "closed")
 
     def do_GET(self):
+        if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
+            return self._audio("GET")
         if self.path.split("?")[0].rstrip("/") == "/joints/stream":
             return self._joint_stream()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
@@ -998,9 +1062,74 @@ class Handler(BaseHTTPRequestHandler):
                          "udp": ({"port": RELAY_UDP_PORT, **self.server.udp.stats}
                                  if self.server.udp else {"port": 0}),
                          "joints": (self.server.joints.status() if self.server.joints
-                                    else {"running": False, "available": False})})
+                                    else {"running": False, "available": False}),
+                         "audio": {"available": self.server.audio is not None}})
+
+    def _audio(self, method):
+        """The Go2's speaker. All of it needs the token, like every other route that acts.
+
+          POST /audio/say     body: a WAV        -> {ok, seconds}   (replies once uploaded)
+          POST /audio/stop                       -> {ok}
+          GET  /audio/volume                     -> {ok, volume}
+          POST /audio/volume  {"level": 0-10}    -> {ok, volume}
+        """
+        src = self.client_address[0]
+        path = self.path.split("?")[0].rstrip("/")
+        if not self._authorised():
+            audit(src, "audio", path, "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        if self.server.audio is None:
+            return self._json(404, {"ok": False,
+                                    "error": f"no speaker API on a {ROBOT_MODEL} relay"})
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        if n > AUDIO_MAX_BYTES:
+            return self._json(413, {"ok": False, "error": f"over {AUDIO_MAX_BYTES} bytes"})
+        body = self.rfile.read(n) if n else b""
+
+        if method == "GET" and path == "/audio/volume":
+            line = "volume"
+        elif method == "POST" and path == "/audio/volume":
+            try:
+                level = validate_volume(json.loads(body or b"{}").get("level"))
+            except (ValueError, AttributeError) as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            line = f"volume {level}"
+        elif method == "POST" and path == "/audio/stop":
+            line = "stop"
+        elif method == "POST" and path == "/audio/say":
+            try:
+                info = parse_wav(body)
+            except ValueError as exc:
+                audit(src, "audio-say", f"bytes={len(body)}", "rejected")
+                return self._json(400, {"ok": False, "error": str(exc)})
+            # A file, not the bytes on the pipe: the sender's protocol is one text line.
+            with tempfile.NamedTemporaryFile(prefix="relay-say-", suffix=".wav",
+                                             delete=False) as fh:
+                fh.write(body)
+            try:
+                reply = self.server.audio.send(f"say {fh.name}")
+            finally:
+                os.unlink(fh.name)
+            audit(src, "audio-say", f"seconds={info['seconds']} rate={info['rate']}", reply)
+            if not reply.startswith("ok"):
+                return self._json(502, {"ok": False, "error": reply})
+            return self._json(200, {"ok": True, "seconds": info["seconds"]})
+        else:
+            return self._json(404, {"error": "not found"})
+
+        reply = self.server.audio.send(line)
+        if line != "volume":
+            audit(src, "audio", line, reply)
+        if not reply.startswith("ok"):
+            return self._json(502, {"ok": False, "error": reply})
+        out = {"ok": True}
+        if reply.startswith("ok volume "):
+            out["volume"] = int(reply.split()[-1])
+        return self._json(200, out)
 
     def do_POST(self):
+        if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
+            return self._audio("POST")
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             return self._video_config()
         if self.path.split("?")[0] != "/cmd":
@@ -1096,6 +1225,14 @@ def main():
     srv.order = CommandOrder()
     # Started lazily by the first viewer, so a relay nobody watches costs nothing extra.
     srv.joints = JointStream([JOINT_BRIDGE]) if ROBOT_MODEL == "g1" else None
+    # The speaker: Go2 only, and only if the binary was built (a relay pulled but not rebuilt
+    # keeps working, it just has no /audio).
+    srv.audio = None
+    if ROBOT_MODEL == "go2" and os.access(AUDIO_SENDER, os.X_OK):
+        srv.audio = Sender([AUDIO_SENDER, os.environ.get("DDS_IFACE", "eth0")],
+                           label="audio_sender", timeout=AUDIO_REPLY_TIMEOUT, lazy=True)
+    elif ROBOT_MODEL == "go2":
+        log(f"no {AUDIO_SENDER}: /audio is off until ./build.sh is run")
     srv.udp = None
     if RELAY_UDP_PORT:
         srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order)
@@ -1119,6 +1256,13 @@ def main():
             pass
         if srv.joints is not None:
             srv.joints.stop()
+        # EOF makes the audio sender leave megaphone mode before it exits.
+        if srv.audio is not None and srv.audio.proc is not None:
+            try:
+                srv.audio.proc.stdin.close()
+                srv.audio.proc.wait(timeout=5)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

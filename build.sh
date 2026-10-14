@@ -27,6 +27,10 @@ for robot in go2 g1; do
       "${INCS[@]}" "${LIBS[@]}"
   echo "built ./${robot}_command_sender ($ARCH)"
 done
+# The Go2's own speaker and volume (the "audiohub" service), for POST /audio/*. Cannot move the
+# robot; the relay starts it the first time something is said. See src/go2_audio_sender.cpp.
+g++ -O2 -std=c++17 src/go2_audio_sender.cpp -o go2_audio_sender "${INCS[@]}" "${LIBS[@]}"
+echo "built ./go2_audio_sender ($ARCH)"
 # The G1's joint state for the app's Joints page. Read-only today (it has no publisher); the
 # relay runs it only while someone is watching. See src/g1_joint_bridge.cpp.
 g++ -O2 -std=c++17 src/g1_joint_bridge.cpp -o g1_joint_bridge "${INCS[@]}" "${LIBS[@]}"
