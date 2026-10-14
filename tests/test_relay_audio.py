@@ -144,10 +144,10 @@ def test_say_plays_the_wav_and_cleans_up_its_temp_file(relay):
 
 def test_volume_round_trip(relay):
     url, _srv, _calls = relay
-    assert call(url, "/audio/volume", method="GET") == (200, {"ok": True, "volume": 10})
+    assert call(url, "/audio/volume", method="GET") == (200, {"ok": True, "volume": 10, "max": 10})
     assert call(url, "/audio/volume", json.dumps({"level": 4}).encode()) == \
-        (200, {"ok": True, "volume": 4})
-    assert call(url, "/audio/volume", method="GET") == (200, {"ok": True, "volume": 4})
+        (200, {"ok": True, "volume": 4, "max": 10})
+    assert call(url, "/audio/volume", method="GET")[1]["volume"] == 4
 
 
 def test_a_bad_wav_never_reaches_the_robot(relay):
@@ -172,11 +172,11 @@ def test_every_audio_route_needs_the_token(relay, path, method, body):
 
 
 def test_a_relay_without_a_speaker_says_so(relay):
-    """The G1's relay (and a Go2 relay not rebuilt yet) answers 404 with a reason."""
+    """A relay pulled but not rebuilt has no audio sender: 404 with the fix in the message."""
     url, srv, _calls = relay
     srv.audio = None
     code, body = call(url, "/audio/volume", method="GET")
-    assert code == 404 and "no speaker" in body["error"]
+    assert code == 404 and "build.sh" in body["error"]
 
 
 def test_the_wav_parser_matches_the_cpp_duration_rule():
@@ -186,3 +186,15 @@ def test_the_wav_parser_matches_the_cpp_duration_rule():
     data_at = wav.find(b"data")
     size = struct.unpack("<I", wav[data_at + 4:data_at + 8])[0]
     assert size / (44100 * 2 * 2) == relay_server.parse_wav(wav)["seconds"]
+
+
+def test_each_robot_has_its_own_volume_scale():
+    """4 is quiet on a G1 (0-100) and loud on a Go2 (0-10): the relay must know which it is,
+    and say so with every reading."""
+    import subprocess
+    for model, top in (("go2", 10), ("g1", 100)):
+        out = subprocess.run(
+            [sys.executable, "-c", "import relay_server; print(relay_server.VOLUME_MAX)"],
+            cwd=REPO, env={**os.environ, "ROBOT_MODEL": model},
+            capture_output=True, text=True, check=True)
+        assert int(out.stdout) == top

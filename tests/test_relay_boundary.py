@@ -328,8 +328,10 @@ def test_the_cameras_agree_with_camera_source_on_the_same_machine():
               / "camera_source.py")
     if not source.exists():
         pytest.skip("the video-pipeline repo is not checked out next to this one")
-    m = re.search(r"^CAMERAS = (\(.*?\))$", source.read_text(encoding="utf-8"), re.M)
-    assert m, "CAMERAS is missing from camera_source.py (or changed shape)"
+    # ALL_CAMERAS: every name camera_source knows. Each robot offers a subset of it (CAMERAS,
+    # from its env), and the relay's allowlist must cover them all.
+    m = re.search(r"^ALL_CAMERAS = (\(.*?\))$", source.read_text(encoding="utf-8"), re.M)
+    assert m, "ALL_CAMERAS is missing from camera_source.py (or changed shape)"
     assert eval(m.group(1)) == relay_server.CAMERAS  # noqa: S307 — a literal tuple from our own repo
 
 

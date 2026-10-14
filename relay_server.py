@@ -54,15 +54,18 @@ AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/tmp/robot-relay-audit.log")
 MAX_PER_SEC = float(os.environ.get("MAX_PER_SEC", "20"))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", "3"))
 
-# The Go2's own speaker (POST /audio/*), through go2_audio_sender. Go2 only: the G1's audio is
-# a different SDK client and is not wired here. The limits bound what one request can make the
-# robot say: a phrase, not a playlist. The upload is ~100 ms per 60 KB block (measured
-# 2026-10-14), so the reply timeout covers the largest WAV allowed with room to spare.
-AUDIO_SENDER = os.environ.get("AUDIO_SENDER_BIN", "./go2_audio_sender")
+# The robot's own speaker (POST /audio/*), through <model>_audio_sender. The two robots reach
+# it differently — the Go2 through its undocumented audiohub, the G1 through the SDK's
+# AudioClient — but the relay drives both with the same one-line protocol. The limits bound
+# what one request can make the robot say: a phrase, not a playlist. The Go2's upload is
+# ~100 ms per 60 KB block (measured 2026-10-14), so the reply timeout has room to spare.
+AUDIO_SENDER = os.environ.get("AUDIO_SENDER_BIN", f"./{ROBOT_MODEL}_audio_sender")
 AUDIO_MAX_BYTES = int(os.environ.get("AUDIO_MAX_BYTES", str(4 * 1024 * 1024)))
 AUDIO_MAX_S = float(os.environ.get("AUDIO_MAX_S", "30"))
 AUDIO_REPLY_TIMEOUT = float(os.environ.get("AUDIO_REPLY_TIMEOUT", "15"))
-VOLUME_MAX = 10      # the Go2's VUI scale, 0-10 (the robot read back 10 at full volume)
+# Each robot's own volume scale: the Go2's VUI is 0-10 (it read back 10 at full volume), the
+# G1's AudioClient is 0-100 (Unitree's example sets 100).
+VOLUME_MAX = {"go2": 10, "g1": 100}[ROBOT_MODEL]
 
 # UDP port for continuous teleop (`move` and `stop_move` only). 0 = off, the default: the
 # HTTP path below is then the only way in, exactly as before. See the UDP block further down.
@@ -338,7 +341,8 @@ def camera_live():
     try:
         with urllib.request.urlopen(f"{CAMERA_LOCAL}/camera", timeout=2) as r:
             d = json.loads(r.read())
-        return {"camera": d.get("camera"), "camera_error": d.get("error")}
+        return {"camera": d.get("camera"), "camera_error": d.get("error"),
+                "cameras": d.get("choices")}
     except Exception:
         return {}
 
@@ -1033,9 +1037,13 @@ class Handler(BaseHTTPRequestHandler):
             # editing video.env without restarting is exactly how this report started
             # lying before, which is why /health reads /proc instead of the file.
             saved = read_env_file(VIDEO_ENV)
+            camera = camera_live()
+            # The cameras THIS robot offers come from camera_source (the G1 has no rs_color);
+            # CAMERAS here is the allowlist of every name, which is not the same thing.
+            offered = camera.pop("cameras", None) or list(CAMERAS)
             return self._json(200, {
                 "ok": True,
-                "running": {**mjpeg_live(), **camera_live()},
+                "running": {**mjpeg_live(), **camera},
                 "saved": {**{k: saved.get(name) for k, (name, *_) in VIDEO_PARAMS.items()},
                           "camera": saved.get("CAMERA")},
                 # `live` tells the UI which knobs apply instantly and which cost a restart
@@ -1044,7 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
                 "limits": {k: {"min": lo, "max": hi, "live": live}
                            for k, (_n, _c, lo, hi, live) in VIDEO_PARAMS.items()},
                 # Not a range, so not in `limits`: a client iterating those expects min/max.
-                "cameras": list(CAMERAS),
+                "cameras": offered,
             })
         if self.path.split("?")[0] != "/health":
             return self._json(404, {"error": "not found"})
@@ -1080,7 +1088,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "unauthorised"})
         if self.server.audio is None:
             return self._json(404, {"ok": False,
-                                    "error": f"no speaker API on a {ROBOT_MODEL} relay"})
+                                    "error": f"no speaker on this {ROBOT_MODEL} relay: "
+                                             f"{AUDIO_SENDER} is not built (./build.sh)"})
         n = int(self.headers.get("Content-Length", "0") or 0)
         if n > AUDIO_MAX_BYTES:
             return self._json(413, {"ok": False, "error": f"over {AUDIO_MAX_BYTES} bytes"})
@@ -1124,7 +1133,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(502, {"ok": False, "error": reply})
         out = {"ok": True}
         if reply.startswith("ok volume "):
-            out["volume"] = int(reply.split()[-1])
+            # The scale travels with the value: 4 is quiet on a G1 and loud on a Go2.
+            out.update(volume=int(reply.split()[-1]), max=VOLUME_MAX)
         return self._json(200, out)
 
     def do_POST(self):
@@ -1225,13 +1235,13 @@ def main():
     srv.order = CommandOrder()
     # Started lazily by the first viewer, so a relay nobody watches costs nothing extra.
     srv.joints = JointStream([JOINT_BRIDGE]) if ROBOT_MODEL == "g1" else None
-    # The speaker: Go2 only, and only if the binary was built (a relay pulled but not rebuilt
-    # keeps working, it just has no /audio).
+    # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
+    # it just has no /audio).
     srv.audio = None
-    if ROBOT_MODEL == "go2" and os.access(AUDIO_SENDER, os.X_OK):
+    if os.access(AUDIO_SENDER, os.X_OK):
         srv.audio = Sender([AUDIO_SENDER, os.environ.get("DDS_IFACE", "eth0")],
                            label="audio_sender", timeout=AUDIO_REPLY_TIMEOUT, lazy=True)
-    elif ROBOT_MODEL == "go2":
+    else:
         log(f"no {AUDIO_SENDER}: /audio is off until ./build.sh is run")
     srv.udp = None
     if RELAY_UDP_PORT:
