@@ -27,6 +27,10 @@ for robot in go2 g1; do
       "${INCS[@]}" "${LIBS[@]}"
   echo "built ./${robot}_command_sender ($ARCH)"
 done
+# The G1's joint state for the app's Joints page. Read-only today (it has no publisher); the
+# relay runs it only while someone is watching. See src/g1_joint_bridge.cpp.
+g++ -O2 -std=c++17 src/g1_joint_bridge.cpp -o g1_joint_bridge "${INCS[@]}" "${LIBS[@]}"
+echo "built ./g1_joint_bridge ($ARCH)"
 # Flush before returning: the robots are powered off by their switch, and on 2026-10-01 a
 # power-off right after a build left binaries at 0 bytes (robot-telemetry-agent, same recipe).
 sync

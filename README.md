@@ -122,6 +122,11 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `RELAY_UDP_PORT` | `0` (off) | UDP port for continuous teleop: `move` and `stop_move` only, HMAC-authenticated with the relay token. See the UDP block in `relay_server.py` |
 | `MAX_PER_SEC` | `20` | Rate limit |
 | `AUDIT_LOG` | `/var/tmp/robot-relay-audit.log` | One line per command |
+| `JOINT_BRIDGE_BIN` | `./g1_joint_bridge` | G1 only: the joint-state reader `GET /joints/stream` runs |
+| `JOINT_MAX_CLIENTS` | `4` | G1 only: joint viewers at once; one more gets 503 |
+| `JOINT_IDLE_S` | `10` | G1 only: the bridge keeps running this long after the last viewer leaves |
+| `JOINT_RATE_HZ` | `30` | Read by `g1_joint_bridge`: lines per second (clamped 1-60) |
+| `JOINT_STATE_TOPIC` | `rt/lowstate` | Read by `g1_joint_bridge`: `rt/lf/lowstate` (20 Hz) is the cheap alternative |
 
 ## Endpoints
 
@@ -130,6 +135,16 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `GET /health` | Sender liveness, allowed verbs, and what the robot reports about its own video, telemetry and safety limits |
 | `POST /cmd` | `{verb, vx?, vy?, vyaw?, ts?}` — moves the robot. `ts` (the caller's clock) orders it against the UDP path: a `move` older than the last accepted command or stop is refused with 409 |
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
+| `GET /joints/stream` | **G1 only, read-only.** The joint state for the app's Joints page: one JSON line per tick (`src/g1_joint_bridge.cpp` documents the fields) until the caller hangs up, `{"stale": true}` when nothing new arrives within 1 s. Same token |
+
+### The joint stream (G1)
+
+`g1_joint_bridge` reads `rt/lowstate` and both `rt/dex3/*/state` and prints them; it has no
+publisher, so it cannot move the robot. The relay starts it with the first viewer and stops it
+`JOINT_IDLE_S` after the last one, keeps only its newest line (a slow viewer skips lines, never
+delays another), and caps viewers at `JOINT_MAX_CLIENTS`. It runs inside the relay's unit, so
+under the same `CPUQuota=25%`. Test: `pytest tests/test_joint_stream.py`. Plan and next steps
+(moving joints, step J2): `.claude/roadmap/G1-CONTROL-ARTICULAR.md` on the workstation.
 
 Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
 `recovery_stand`, `sit`, `rise_sit`, `hello`, `stretch`, `scrape`, `heart`, `pose_on`,

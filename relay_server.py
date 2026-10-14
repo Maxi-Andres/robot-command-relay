@@ -111,6 +111,17 @@ VERBS = verbs_for(ROBOT_MODEL, G1_WAIST_LOCK)
 JOY_MODELS = {"go2"}
 ARG_VERBS = {"move"} | ({"joy"} if ROBOT_MODEL in JOY_MODELS else set())
 
+# The joint state stream (GET /joints/stream, G1 only): see JointStream below.
+JOINT_BRIDGE = os.environ.get("JOINT_BRIDGE_BIN", "./g1_joint_bridge")
+# Viewers at once. Each one costs a thread here and ~30 lines/s over the robot's uplink.
+JOINT_MAX_CLIENTS = int(os.environ.get("JOINT_MAX_CLIENTS", "4"))
+# How long the bridge keeps running after the last viewer leaves: long enough that reloading
+# the page does not cost a new DDS participant, short enough not to sit on PC2 for nothing.
+JOINT_IDLE_S = float(os.environ.get("JOINT_IDLE_S", "10"))
+# A viewer that gets no new line for this long receives {"stale": true}: the page must be able
+# to tell "the robot is still" from "nothing is arriving".
+JOINT_HEARTBEAT_S = 1.0
+
 
 def log(msg):
     print(f"[relay] {msg}", file=sys.stderr, flush=True)
@@ -656,6 +667,116 @@ class RateLimiter:
             return True
 
 
+class JointStream:
+    """One g1_joint_bridge child shared by every viewer of the Joints page. READ-ONLY.
+
+    The child prints one JSON line per tick (src/g1_joint_bridge.cpp). A reader thread keeps
+    ONLY THE NEWEST line — deliberately not a queue: a slow viewer skips lines and never
+    delays the bridge or another viewer (engineering standard §3, "drop, never queue").
+
+    The child runs only while someone watches: the first viewer starts it, and it is stopped
+    JOINT_IDLE_S after the last one leaves. If it dies, the next viewer that subscribes starts
+    a new one. Its stdin is ours, so closing it is how it is told to exit.
+    """
+
+    def __init__(self, argv, max_clients=JOINT_MAX_CLIENTS, idle_s=JOINT_IDLE_S):
+        self.argv = argv
+        self.max_clients = max_clients
+        self.idle_s = idle_s
+        self.cond = threading.Condition()
+        self.proc = None
+        self.latest = None
+        self.seq = 0
+        self.clients = 0
+        self._idle_timer = None
+
+    def _ensure_running(self):
+        """Start the child if it is not running. Caller holds self.cond."""
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     text=True, bufsize=1)
+        self.latest = None
+        log(f"joint bridge started (pid {self.proc.pid})")
+        threading.Thread(target=self._read, args=(self.proc,), name="joint-bridge",
+                         daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            line = line.strip()
+            # Only whole JSON objects go out: a torn or garbled line must not reach a viewer.
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            with self.cond:
+                self.latest = line
+                self.seq += 1
+                self.cond.notify_all()
+        with self.cond:
+            if self.proc is proc:
+                self.proc = None
+                self.latest = None
+            self.cond.notify_all()
+        log(f"joint bridge exited (code {proc.wait()})")
+
+    def subscribe(self):
+        """Register a viewer. False when the viewer cap is reached."""
+        with self.cond:
+            if self.clients >= self.max_clients:
+                return False
+            self.clients += 1
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+            self._ensure_running()
+            return True
+
+    def unsubscribe(self):
+        with self.cond:
+            self.clients = max(0, self.clients - 1)
+            if self.clients == 0 and self._idle_timer is None:
+                self._idle_timer = threading.Timer(self.idle_s, self._stop_if_idle)
+                self._idle_timer.daemon = True
+                self._idle_timer.start()
+
+    def _stop_if_idle(self):
+        with self.cond:
+            self._idle_timer = None
+            if self.clients:
+                return
+            proc, self.proc, self.latest = self.proc, None, None
+        if proc is not None:
+            self._terminate(proc)
+
+    def next_line(self, seen, timeout):
+        """(seq, line) once a line newer than `seen` exists, or (seen, None) after `timeout`."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq != seen and self.latest is not None, timeout)
+            if self.seq != seen and self.latest is not None:
+                return self.seq, self.latest
+            return seen, None
+
+    @staticmethod
+    def _terminate(proc):
+        try:
+            proc.stdin.close()          # the bridge exits on EOF
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+
+    def stop(self):
+        with self.cond:
+            proc, self.proc = self.proc, None
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+        if proc is not None:
+            self._terminate(proc)
+
+    def status(self):
+        with self.cond:
+            return {"running": self.proc is not None and self.proc.poll() is None,
+                    "clients": self.clients, "max_clients": self.max_clients}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "robot-relay"
@@ -736,7 +857,46 @@ class Handler(BaseHTTPRequestHandler):
             "pending_restart": sorted(deferred),
         })
 
+    def _joint_stream(self):
+        """GET /joints/stream — the G1's joint state, one JSON line per tick, until the
+        caller hangs up. Read-only: nothing on this path can move the robot.
+
+        A line is the bridge's own (src/g1_joint_bridge.cpp), passed through untouched; when
+        no new one arrives within JOINT_HEARTBEAT_S the caller gets {"stale": true} instead,
+        which is also how a dead caller is noticed (the write fails).
+        """
+        src = self.client_address[0]
+        if not self._authorised():
+            audit(src, "joints-stream", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        joints = self.server.joints
+        if joints is None:
+            return self._json(404, {"error": f"no joint stream on a {ROBOT_MODEL}"})
+        if not joints.subscribe():
+            return self._json(503, {"error": "too many joint viewers",
+                                    "max_clients": joints.max_clients})
+        audit(src, "joints-stream", "-", "opened")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            seen = 0
+            while True:
+                seen, line = joints.next_line(seen, JOINT_HEARTBEAT_S)
+                self.wfile.write(((line or '{"stale":true}') + "\n").encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                        # the caller hung up: the normal way this ends
+        finally:
+            joints.unsubscribe()
+            audit(src, "joints-stream", "-", "closed")
+
     def do_GET(self):
+        if self.path.split("?")[0].rstrip("/") == "/joints/stream":
+            return self._joint_stream()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             if not self._authorised():
                 return self._json(401, {"error": "unauthorised"})
@@ -768,7 +928,9 @@ class Handler(BaseHTTPRequestHandler):
                          "telemetry": telemetry_status(),
                          "limits": limits_status(),
                          "udp": ({"port": RELAY_UDP_PORT, **self.server.udp.stats}
-                                 if self.server.udp else {"port": 0})})
+                                 if self.server.udp else {"port": 0}),
+                         "joints": (self.server.joints.status() if self.server.joints
+                                    else {"running": False, "available": False})})
 
     def do_POST(self):
         if self.path.split("?")[0].rstrip("/") == "/video-config":
@@ -864,6 +1026,8 @@ def main():
     srv.sender = Sender([SENDER])
     srv.limiter = RateLimiter(MAX_PER_SEC)
     srv.order = CommandOrder()
+    # Started lazily by the first viewer, so a relay nobody watches costs nothing extra.
+    srv.joints = JointStream([JOINT_BRIDGE]) if ROBOT_MODEL == "g1" else None
     srv.udp = None
     if RELAY_UDP_PORT:
         srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order)
@@ -885,6 +1049,8 @@ def main():
             srv.sender.proc.wait(timeout=5)
         except Exception:
             pass
+        if srv.joints is not None:
+            srv.joints.stop()
 
 
 if __name__ == "__main__":
