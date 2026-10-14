@@ -29,6 +29,9 @@ import hmac
 import json
 import math
 import os
+import queue
+import re
+import secrets
 import socket
 import struct
 import subprocess
@@ -135,6 +138,19 @@ JOINT_IDLE_S = float(os.environ.get("JOINT_IDLE_S", "10"))
 # A viewer that gets no new line for this long receives {"stale": true}: the page must be able
 # to tell "the robot is still" from "nothing is arriving".
 JOINT_HEARTBEAT_S = 1.0
+
+# Moving single arm joints from the Joints page (POST /joints/control, G1 only): see JointControl.
+JOINT_SENDER = os.environ.get("JOINT_SENDER_BIN", "./g1_joint_sender")
+# Its own budget, apart from /cmd's: a dragged slider sends ~10 targets a second plus keepalives,
+# and that must neither starve the drive pad nor be starved by it.
+JOINT_CTL_MAX_PER_SEC = float(os.environ.get("JOINT_CTL_MAX_PER_SEC", "30"))
+# Which joints the page may move. The sender reads the same variable and is the one that
+# enforces it; the relay only reports it, so the page can offer exactly those.
+JOINT_CTL_ALLOW = [j for j in os.environ.get("JOINT_CTL_ALLOW", "left_elbow,right_elbow")
+                   .split(",") if j]
+# What the sender's replies look like: "<ok|err> ... state=<s> w=<weight>".
+_JOINT_REPLY = re.compile(r"^(ok|err)\b(.*?)\s+state=(\w+)\s+w=([0-9.]+)$")
+_JOINT_NAME = re.compile(r"^[a-z_]{1,40}$")
 
 
 def log(msg):
@@ -663,13 +679,14 @@ class CommandOrder:
 class UdpControl:
     """Datagram in, at most one command to command_sender, at most one ack out."""
 
-    def __init__(self, key, sender, limiter, order):
+    def __init__(self, key, sender, limiter, order, joint_control=None):
         self.key = key
         self.sender = sender
         self.limiter = limiter
         self.order = order
+        self.joint_control = joint_control
         self.stats = {"accepted": 0, "size": 0, "mac": 0, "format": 0, "clock": 0,
-                      "stale": 0, "limited": 0}
+                      "stale": 0, "limited": 0, "arms_held": 0}
 
     def process(self, datagram, src, robot_now):
         """Return the ack to send back, or None to stay silent."""
@@ -681,8 +698,13 @@ class UdpControl:
         if kind == UDP_KIND_STOP:
             # Not rate limited: repeating a stop is harmless, refusing one is not.
             self.order.stop(ts, robot_now)
+            if self.joint_control is not None:
+                self.joint_control.release_all("udp stop")
             line, verb, detail = "stop_move", "stop_move", "-"
         else:
+            if self.joint_control is not None and self.joint_control.busy():
+                self.stats["arms_held"] += 1     # no walking while the page holds an arm
+                return None
             if not self.order.admit_move(ts):
                 self.stats["stale"] += 1
                 return None
@@ -893,6 +915,175 @@ class JointStream:
                     "clients": self.clients, "max_clients": self.max_clients}
 
 
+class JointControl:
+    """One g1_joint_sender child per control SESSION: moving single arm joints from the page.
+
+    The rules (allowlist, limits, speed, weight ramps, dead-man, FSM gate) are in the sender —
+    src/joint_ctl_core.hpp. This class only owns the session:
+
+      * ONE CONTROLLER AT A TIME. `take` returns a random session id; every later op must carry
+        it, so a second browser cannot steer an arm someone else is holding.
+      * ONE PROCESS PER SESSION. `take` spawns the sender; after the release ramp it exits by
+        itself, and the session is over. Nothing carries over into the next one.
+      * WHILE A SESSION IS OPEN THE ROBOT DOES NOT WALK: `take` stops any movement first, and
+        the /cmd and UDP paths refuse `move` and the arm actions until it ends (busy()). A
+        stop_move from anywhere releases the arm (release_all).
+    """
+
+    def __init__(self, argv, cmd_sender=None, order=None, reply_timeout=None):
+        self.argv = argv
+        self.cmd_sender = cmd_sender
+        self.order = order
+        self.reply_timeout = reply_timeout or REPLY_TIMEOUT
+        self.lock = threading.Lock()        # one op at a time: the protocol is one-in-one-out
+        self.proc = None
+        self.session = None
+        self.replies = queue.Queue()
+        self.state = {"state": "off", "w": 0.0}
+        self.last_event = None
+
+    def busy(self):
+        """True while a session holds (or is handing back) the arms."""
+        proc = self.proc
+        return proc is not None and proc.poll() is None
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("ev "):
+                self.last_event = line[3:]
+                log(f"joint control: {line}")
+                audit("-", "joints-control", "event", line[3:])
+                if line.startswith("ev released"):
+                    # The sender exits by itself right after this. If it does not, the session
+                    # would look open forever and every later `take` be refused: end it.
+                    threading.Timer(3.0, self._reap, args=(proc,)).start()
+                continue
+            self.replies.put(line)
+        code = proc.wait()
+        with self.lock:
+            if self.proc is proc:
+                self.proc = None
+                self.session = None
+                self.state = {"state": "off", "w": 0.0}
+        log(f"joint sender exited (code {code})")
+
+    @staticmethod
+    def _reap(proc):
+        if proc.poll() is None:
+            log("joint sender still running 3 s after its release: killing it")
+            proc.kill()
+
+    def _send(self, line, timeout=None):
+        """One line in, its reply out. Caller holds self.lock."""
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError) as exc:
+            return f"err sender-write {exc}"
+        try:
+            reply = self.replies.get(timeout=timeout or self.reply_timeout)
+        except queue.Empty:
+            return "err sender-timeout"
+        m = _JOINT_REPLY.match(reply)
+        if m:
+            self.state = {"state": m.group(3), "w": float(m.group(4))}
+        return reply
+
+    def _answer(self, reply, code_err=409):
+        ok = reply.startswith("ok")
+        m = _JOINT_REPLY.match(reply)
+        out = {"ok": ok, "reply": m.group(2).strip() if m else reply, **self.state,
+               "event": self.last_event}
+        return (200 if ok else code_err), out
+
+    def take(self):
+        with self.lock:
+            if self.busy():
+                return 409, {"ok": False, "error": "the arms are already being controlled",
+                             **self.state}
+            # Nothing may be walking or playing an arm action when the arms are taken; and
+            # nothing already in flight may start a walk after this point.
+            if self.order is not None:
+                self.order.stop(None, time.time())
+            if self.cmd_sender is not None:
+                self.cmd_sender.send("stop_move")
+            while not self.replies.empty():
+                self.replies.get_nowait()
+            try:
+                self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, text=True, bufsize=1)
+            except OSError as exc:
+                self.proc = None
+                return 503, {"ok": False, "error": f"joint sender cannot start: {exc}"}
+            log(f"joint sender started (pid {self.proc.pid})")
+            self.last_event = None
+            threading.Thread(target=self._read, args=(self.proc,), name="joint-sender",
+                             daemon=True).start()
+            # Longer than an op: the sender first joins DDS and reads the robot once (~1.5 s).
+            reply = self._send("take", self.reply_timeout + 3)
+            if not reply.startswith("ok"):
+                # Refused (robot not standing, no state): end the process, nothing was published.
+                self._close_locked()
+                return self._answer(reply)
+            self.session = secrets.token_hex(8)
+            code, out = self._answer(reply)
+            out.update(session=self.session, allowed=JOINT_CTL_ALLOW)
+            return code, out
+
+    def op(self, session, op, joint=None, q=None):
+        """keepalive | status | target | release, inside a session."""
+        with self.lock:
+            if not self.busy() or self.session is None:
+                return 409, {"ok": False, "error": "no control session", **self.state,
+                             "event": self.last_event}
+            if not isinstance(session, str) or not hmac.compare_digest(session, self.session):
+                return 409, {"ok": False, "error": "another page holds the arms"}
+            if op == "target":
+                if not isinstance(joint, str) or not _JOINT_NAME.match(joint):
+                    return 400, {"ok": False, "error": "joint must be a joint name"}
+                try:
+                    q = float(q)
+                except (TypeError, ValueError):
+                    return 400, {"ok": False, "error": "q must be a number"}
+                if not math.isfinite(q):
+                    return 400, {"ok": False, "error": "q must be finite"}
+                line = f"target {joint} {q:.4f}"
+            elif op in ("keepalive", "status", "release"):
+                line = op
+            else:
+                return 400, {"ok": False, "error": f"unknown op {op!r}"}
+            return self._answer(self._send(line))
+
+    def release_all(self, why):
+        """Hand the arms back whoever holds them (a stop pressed anywhere, shutdown)."""
+        with self.lock:
+            if not self.busy():
+                return False
+            reply = self._send("release")
+        log(f"joint control released ({why}): {reply}")
+        return True
+
+    def _close_locked(self):
+        proc, self.proc, self.session = self.proc, None, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()          # EOF: the sender releases (ramps down) and exits
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+    def stop(self):
+        """Relay shutdown: EOF makes the sender ramp the weight down before it exits."""
+        with self.lock:
+            self._close_locked()
+
+    def status(self):
+        return {"active": self.busy(), **self.state, "event": self.last_event,
+                "allowed": JOINT_CTL_ALLOW}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "robot-relay"
@@ -1025,6 +1216,45 @@ class Handler(BaseHTTPRequestHandler):
             joints.unsubscribe()
             audit(src, "joints-stream", "-", "closed")
 
+    def _joint_control(self):
+        """POST /joints/control — move single arm joints of the G1 from the Joints page.
+
+          {"op": "take"}                                   -> {ok, session, allowed, state, w}
+          {"op": "target", "session", "joint", "q": rad}   -> {ok, reply, state, w}
+          {"op": "keepalive" | "status" | "release", "session"}
+
+        The limits are the sender's (src/joint_ctl_core.hpp); this checks the token, the
+        session and the shape of the numbers, and keeps an audit line per op that moves
+        something (keepalives and status are not logged: ten a second would bury the rest).
+        """
+        src = self.client_address[0]
+        if not self._authorised():
+            audit(src, "joints-control", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        ctl = self.server.joint_control
+        if ctl is None:
+            return self._json(404, {"error": f"no joint control on a {ROBOT_MODEL}"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "bad json"})
+        op = body.get("op")
+        # A release is never rate limited, like a stop: refusing one is the dangerous answer.
+        if op != "release" and not self.server.joint_limiter.allow():
+            return self._json(429, {"error": "rate limited"})
+        if op == "take":
+            code, out = ctl.take()
+            audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
+        else:
+            code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"))
+            if op in ("target", "release"):
+                detail = f"{body.get('joint')}={body.get('q')}" if op == "target" else "release"
+                audit(src, "joints-control", detail, out.get("reply") or out.get("error", "-"))
+        return self._json(code, out)
+
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
             return self._audio("GET")
@@ -1071,6 +1301,9 @@ class Handler(BaseHTTPRequestHandler):
                                  if self.server.udp else {"port": 0}),
                          "joints": (self.server.joints.status() if self.server.joints
                                     else {"running": False, "available": False}),
+                         "joint_control": (self.server.joint_control.status()
+                                           if self.server.joint_control
+                                           else {"active": False, "available": False}),
                          "audio": {"available": self.server.audio is not None}})
 
     def _audio(self, method):
@@ -1142,6 +1375,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._audio("POST")
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             return self._video_config()
+        if self.path.split("?")[0].rstrip("/") == "/joints/control":
+            return self._joint_control()
         if self.path.split("?")[0] != "/cmd":
             return self._json(404, {"error": "not found"})
         if not self._authorised():
@@ -1170,6 +1405,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "ts must be finite"})
         if verb == "stop_move":
             self.server.order.stop(ts, time.time())
+            # A stop pressed anywhere also hands back an arm held from the Joints page.
+            if self.server.joint_control is not None:
+                self.server.joint_control.release_all(f"stop_move from {src}")
+        # While the page holds an arm, the robot stands: no walking, no arm action fighting it.
+        elif (self.server.joint_control is not None and self.server.joint_control.busy()
+              and (verb in ARG_VERBS or verb in G1_ACTIONS)):
+            audit(src, verb, "-", "rejected-arms-held")
+            return self._json(409, {"ok": False, "reply": "err the Joints page holds the arms: "
+                                    "release them first"})
 
         if verb == "move":
             try:
@@ -1235,6 +1479,10 @@ def main():
     srv.order = CommandOrder()
     # Started lazily by the first viewer, so a relay nobody watches costs nothing extra.
     srv.joints = JointStream([JOINT_BRIDGE]) if ROBOT_MODEL == "g1" else None
+    # Started by "take control" and gone after the release; G1 only.
+    srv.joint_control = (JointControl([JOINT_SENDER], srv.sender, srv.order)
+                         if ROBOT_MODEL == "g1" else None)
+    srv.joint_limiter = RateLimiter(JOINT_CTL_MAX_PER_SEC)
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
     # it just has no /audio).
     srv.audio = None
@@ -1245,7 +1493,8 @@ def main():
         log(f"no {AUDIO_SENDER}: /audio is off until ./build.sh is run")
     srv.udp = None
     if RELAY_UDP_PORT:
-        srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order)
+        srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order,
+                             srv.joint_control)
         usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         usock.bind((BIND, RELAY_UDP_PORT))
         threading.Thread(target=srv.udp.serve, args=(usock,), name="udp-control",
@@ -1257,6 +1506,10 @@ def main():
     except KeyboardInterrupt:
         log("interrupted")
     finally:
+        # The arms first: EOF makes the joint sender ramp its weight down to 0 before exiting,
+        # so PC1 has the arms back before anything else goes away.
+        if srv.joint_control is not None:
+            srv.joint_control.stop()
         # Closing the child's stdin makes command_sender StopMove before it exits, so
         # shutting the relay down can never leave the robot walking.
         try:

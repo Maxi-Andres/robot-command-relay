@@ -8,3 +8,4 @@ relay.env
 g1_joint_bridge
 go2_audio_sender
 g1_audio_sender
+g1_joint_sender

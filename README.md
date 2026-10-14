@@ -127,6 +127,12 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_IDLE_S` | `10` | G1 only: the bridge keeps running this long after the last viewer leaves |
 | `JOINT_RATE_HZ` | `30` | Read by `g1_joint_bridge`: lines per second (clamped 1-60) |
 | `JOINT_STATE_TOPIC` | `rt/lowstate` | Read by `g1_joint_bridge`: `rt/lf/lowstate` (20 Hz) is the cheap alternative |
+| `JOINT_SENDER_BIN` | `./g1_joint_sender` | G1 only: what `POST /joints/control` spawns on "take" |
+| `JOINT_CTL_MAX_PER_SEC` | `30` | G1 only: rate limit of `/joints/control`, apart from `/cmd`'s (a release is never limited) |
+| `JOINT_CTL_ALLOW` | `left_elbow,right_elbow` | Joints the page may move. Read by the relay (to report it) and by `g1_joint_sender` (to enforce it) |
+| `JOINT_CTL_FSM_OK` | `500,501` | Read by `g1_joint_sender`: FSM ids control may start and stay in (Walk) |
+| `JOINT_CTL_MAX_VEL` / `JOINT_CTL_EXCURSION` | `0.5` / `0.6` | Read by `g1_joint_sender`: rad/s, and rad from where the joint was taken. Both capped at 1.0 in the binary |
+| `JOINT_CTL_DEADMAN_MS` / `JOINT_CTL_RELEASE_MS` | `1000` / `5000` | Read by `g1_joint_sender`: silence before the arm is frozen / handed back |
 
 ## Endpoints
 
@@ -136,15 +142,33 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `POST /cmd` | `{verb, vx?, vy?, vyaw?, ts?}` — moves the robot. `ts` (the caller's clock) orders it against the UDP path: a `move` older than the last accepted command or stop is refused with 409 |
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 | `GET /joints/stream` | **G1 only, read-only.** The joint state for the app's Joints page: one JSON line per tick (`src/g1_joint_bridge.cpp` documents the fields) until the caller hangs up, `{"stale": true}` when nothing new arrives within 1 s. Same token |
+| `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| keepalive \| status \| release, session, joint?, q?}`. One session at a time. Same token |
 
 ### The joint stream (G1)
 
-`g1_joint_bridge` reads `rt/lowstate` and both `rt/dex3/*/state` and prints them; it has no
-publisher, so it cannot move the robot. The relay starts it with the first viewer and stops it
+`g1_joint_bridge` reads `rt/lowstate` and prints it; it has no publisher, so it cannot move the
+robot. It does not read the hands: this G1 has Inspire hands, driven by their own service (not
+wired yet), and the `rt/dex3/*` topics the robot lists belong to the other hand. The relay starts it with the first viewer and stops it
 `JOINT_IDLE_S` after the last one, keeps only its newest line (a slow viewer skips lines, never
 delays another), and caps viewers at `JOINT_MAX_CLIENTS`. It runs inside the relay's unit, so
-under the same `CPUQuota=25%`. Test: `pytest tests/test_joint_stream.py`. Plan and next steps
-(moving joints, step J2): `.claude/roadmap/G1-CONTROL-ARTICULAR.md` on the workstation.
+under the same `CPUQuota=25%`. Test: `pytest tests/test_joint_stream.py`. Plan and next steps:
+`.claude/roadmap/G1-CONTROL-ARTICULAR.md` on the workstation.
+
+### Moving arm joints (G1)
+
+`POST /joints/control` is how the Joints page moves an elbow. `take` spawns `g1_joint_sender`,
+which publishes `rt/arm_sdk` while the robot's own controller (PC1) keeps balancing; after the
+release ramp the sender exits, and the session is over. **Every limit lives in
+`src/joint_ctl_core.hpp`** — read its header: FSM gate (Walk only), no jump at the start (targets
+begin where the joints are, weight ramps 0 → 1 in 2 s), allowlist, URDF range and a maximum
+excursion, a speed cap, a dead-man (frozen after 1 s of silence, released after 5 s), and a
+release that ramps too. It is plain C++ with no SDK, so CI tests it:
+`pytest tests/test_joint_ctl_core.py` (builds `tests/joint_ctl_test.cpp` with g++).
+
+While a session is open the relay keeps the robot standing: `take` sends `stop_move` first;
+`move` and the arm actions are refused with 409 on HTTP and dropped on UDP; and a `stop_move`
+from anywhere releases the arm. Only one page holds the arms (the session id), and the AI-VL
+backend releases them when that page's socket closes. Test: `pytest tests/test_joint_control.py`.
 
 Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
 `recovery_stand`, `sit`, `rise_sit`, `hello`, `stretch`, `scrape`, `heart`, `pose_on`,
