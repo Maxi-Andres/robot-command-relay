@@ -144,10 +144,23 @@ JOINT_SENDER = os.environ.get("JOINT_SENDER_BIN", "./g1_joint_sender")
 # Its own budget, apart from /cmd's: a dragged slider sends ~10 targets a second plus keepalives,
 # and that must neither starve the drive pad nor be starved by it.
 JOINT_CTL_MAX_PER_SEC = float(os.environ.get("JOINT_CTL_MAX_PER_SEC", "30"))
-# Which joints the page may move. The sender reads the same variable and is the one that
-# enforces it; the relay only reports it, so the page can offer exactly those.
-JOINT_CTL_ALLOW = [j for j in os.environ.get("JOINT_CTL_ALLOW", "left_elbow,right_elbow")
-                   .split(",") if j]
+# Every joint rt/arm_sdk can move on this G1: the arms and the waist yaw (its roll and pitch have
+# no motor, lock-waist variant). SECOND COPY of src/joint_ctl_core.hpp's table minus LOCKED;
+# tests/test_joint_control.py reads the header and fails if they drift.
+ARM_SDK_JOINTS = ["waist_yaw"] + [f"{side}_{j}" for side in ("left", "right") for j in (
+    "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+    "wrist_roll", "wrist_pitch", "wrist_yaw")]
+# Which joints the page may move (unset = all of the above). The sender reads the same variable
+# and is the one that enforces it; the relay only reports it, so the page offers exactly those.
+JOINT_CTL_ALLOW = [j for j in os.environ.get("JOINT_CTL_ALLOW", "").split(",") if j] \
+    or list(ARM_SDK_JOINTS)
+# Reported to the page for its sliders, enforced by the sender: rad from where a joint was when
+# control was taken (0 = off, the full URDF range), and the margin kept inside that range.
+try:
+    JOINT_CTL_EXCURSION = max(0.0, float(os.environ.get("JOINT_CTL_EXCURSION", "0") or 0))
+except ValueError:
+    JOINT_CTL_EXCURSION = 0.0
+JOINT_CTL_MARGIN = 0.05
 # What the sender's replies look like: "<ok|err> ... state=<s> w=<weight>".
 _JOINT_REPLY = re.compile(r"^(ok|err)\b(.*?)\s+state=(\w+)\s+w=([0-9.]+)$")
 _JOINT_NAME = re.compile(r"^[a-z_]{1,40}$")
@@ -1028,7 +1041,8 @@ class JointControl:
                 return self._answer(reply)
             self.session = secrets.token_hex(8)
             code, out = self._answer(reply)
-            out.update(session=self.session, allowed=JOINT_CTL_ALLOW)
+            out.update(session=self.session, allowed=JOINT_CTL_ALLOW,
+                       excursion=JOINT_CTL_EXCURSION, margin=JOINT_CTL_MARGIN)
             return code, out
 
     def op(self, session, op, joint=None, q=None):

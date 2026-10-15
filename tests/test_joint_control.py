@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import sys
 import textwrap
 import threading
@@ -255,6 +256,24 @@ def test_udp_moves_are_dropped_while_an_arm_is_held(server):
     assert udp.stats["arms_held"] == 1
     assert udp.process(datagram(relay_server.UDP_KIND_STOP, now + 2e-3), "x", now) is not None
     assert _wait(lambda: not server.joint_control.busy()), "a UDP stop releases the arm too"
+
+
+def test_the_relay_joint_list_matches_the_sender():
+    """The relay reports what the sender enforces: same names, same order, minus locked."""
+    header = (REPO / "src" / "joint_ctl_core.hpp").read_text(encoding="utf-8")
+    table = header[header.index("constexpr Joint JOINTS[N]"):]
+    table = table[:table.index("};")]
+    names = re.findall(r'\{"([a-z_]+)"', table)
+    locked = re.findall(r'"([a-z_]+)"', header[header.index("LOCKED[]"):].split(";")[0])
+    assert [n for n in names if n not in locked] == relay_server.ARM_SDK_JOINTS
+    assert "waist_pitch" not in relay_server.JOINT_CTL_ALLOW
+
+
+def test_take_reports_the_limits_the_page_draws(ctl):
+    out = ctl.take()[1]
+    assert out["excursion"] == relay_server.JOINT_CTL_EXCURSION
+    assert out["margin"] == 0.05
+    assert out["allowed"] == relay_server.ARM_SDK_JOINTS, "every arm joint by default"
 
 
 def test_health_reports_the_control(server):

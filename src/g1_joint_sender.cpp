@@ -14,10 +14,10 @@
 // It never writes rt/lowcmd: PC1 keeps balancing the robot the whole time.
 //
 // Configuration, all optional (relay.env):
-//   JOINT_CTL_ALLOW     joints that accept a target, comma-separated  (left_elbow,right_elbow)
+//   JOINT_CTL_ALLOW     joints that accept a target, comma-separated  (every arm joint + waist yaw)
 //   JOINT_CTL_FSM_OK    FSM ids control may start and stay in         (500,501)
 //   JOINT_CTL_MAX_VEL   rad/s (capped at 1.0)                         (0.5)
-//   JOINT_CTL_EXCURSION rad from where control started (capped at 1.0) (0.6)
+//   JOINT_CTL_EXCURSION rad from where control started; 0 = off       (0, the full URDF range)
 //   JOINT_CTL_DEADMAN_MS / JOINT_CTL_RELEASE_MS                        (1000 / 5000)
 // The caps are here and not only in relay.env so that a typo cannot make an arm fast.
 
@@ -94,11 +94,13 @@ struct Shared {
 int main() {
     const std::string iface = env_s("DDS_IFACE", "eth0");
     jointctl::Config cfg;
-    cfg.allowed.clear();
-    split_csv(env_s("JOINT_CTL_ALLOW", "left_elbow,right_elbow"),
-              [](const std::string& s) { return s; }, cfg.allowed);
+    const std::string allow_env = env_s("JOINT_CTL_ALLOW", "");
+    if (!allow_env.empty()) {           // unset = every movable joint (the Config default)
+        cfg.allowed.clear();
+        split_csv(allow_env, [](const std::string& s) { return s; }, cfg.allowed);
+    }
     for (const auto& name : cfg.allowed) {
-        if (jointctl::index_of(name) < 0) {
+        if (jointctl::index_of(name) < 0 || jointctl::is_locked(name)) {
             std::cerr << "[g1-joint-sender] unknown joint in JOINT_CTL_ALLOW: " << name << std::endl;
             return 2;
         }
@@ -107,12 +109,12 @@ int main() {
     split_csv(env_s("JOINT_CTL_FSM_OK", "500,501"),
               [](const std::string& s) { return atoi(s.c_str()); }, cfg.fsm_ok);
     cfg.max_vel = env_f("JOINT_CTL_MAX_VEL", 0.5f, 0.05f, 1.0f);
-    cfg.max_excursion = env_f("JOINT_CTL_EXCURSION", 0.6f, 0.05f, 1.0f);
+    cfg.max_excursion = env_f("JOINT_CTL_EXCURSION", 0.0f, 0.0f, 6.3f);
     cfg.deadman_ms = static_cast<long>(env_f("JOINT_CTL_DEADMAN_MS", 1000, 200, 5000));
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
 
-    std::cerr << "[g1-joint-sender] iface=" << iface << " allow=" << env_s("JOINT_CTL_ALLOW",
-              "left_elbow,right_elbow") << " max_vel=" << cfg.max_vel << " excursion="
+    std::cerr << "[g1-joint-sender] iface=" << iface << " allow="
+              << (allow_env.empty() ? std::string("all") : allow_env) << " max_vel=" << cfg.max_vel << " excursion="
               << cfg.max_excursion << " deadman=" << cfg.deadman_ms << "/" << cfg.release_ms
               << "ms" << std::endl;
 
@@ -163,7 +165,12 @@ int main() {
         const long long t = now_ms();
         in.state_age_ms = sh.low_at < 0 ? -1 : static_cast<long>(t - sh.low_at);
         if (sh.low_at >= 0)
-            for (int i = 0; i < jointctl::NBODY; ++i) in.q[i] = sh.low.motor_state()[i].q();
+            for (int i = 0; i < jointctl::NBODY; ++i) {
+                const auto& m = sh.low.motor_state()[i];
+                in.q[i] = m.q();
+                in.tau[i] = m.tau_est();
+                in.temp[i] = std::max<int>(m.temperature()[0], m.temperature()[1]);
+            }
         in.fsm = sh.fsm;
         in.fsm_age_ms = sh.fsm_at < 0 ? -1 : static_cast<long>(t - sh.fsm_at);
         return in;

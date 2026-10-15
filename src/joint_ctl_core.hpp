@@ -20,17 +20,24 @@
 //      remote), or cannot be read for fsm_lost_ms, control is released.
 //   2. NO JUMP AT THE START. On `take` every joint's target is where it IS; the weight then
 //      rises 0 -> 1 over ramp_s, so the arm is handed over without moving.
-//   3. ALLOWLIST. Only the joints in `allowed` accept a target (J2: the two elbows). The rest
-//      stay held where they were taken.
-//   4. LIMITS. A target is clamped to the URDF range minus `margin`, AND to `max_excursion` from
-//      where the joint was when control was taken: a bad number cannot swing an arm far.
+//   3. ALLOWLIST. Only the joints in `allowed` accept a target (since J3, 2026-10-15: every
+//      arm joint and the waist yaw). The rest stay held where they were taken.
+//   4. LIMITS. A target is clamped to the URDF range minus `margin` — and, when max_excursion
+//      is set (> 0), to that far from where the joint was when control was taken. J2 used 0.6
+//      rad; J3 turned it off at the operator's request, so the full range is reachable.
 //   5. SPEED. The commanded position walks towards the target at most max_vel rad/s; the
 //      browser only names targets, it never sets the pace.
 //   6. DEAD-MAN. No message for deadman_ms: the target is frozen where the arm is. None for
 //      release_ms: control is released.
 //   7. RELEASE IS A RAMP TOO. The weight falls 1 -> 0 over ramp_s while holding position, so
 //      PC1 takes the arm back to its own pose smoothly. `release`, EOF on stdin (the relay died),
-//      the dead-man, a lost state and rule 1 all end this way. Then the process is finished.
+//      the dead-man, a lost state, rules 1 and 9 all end this way. Then the process is finished.
+//   8. NO PUSHING INTO THINGS. The URDF range does not know about the robot's own body: an arm
+//      sent through the full range can hit the torso or the other arm, and then the motor
+//      pushes at full gain, heating up. A joint whose measured torque stays over stall_frac of
+//      its rated effort for stall_ms while it is short of its command gives up: command and
+//      target become where it IS, so the force drops at once ("ev stall <joint>").
+//   9. HOT MOTOR, HANDS OFF. Any held joint at or over temp_release °C releases control.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
 //   take  |  target <joint> <rad>  |  keepalive  |  status  |  release
@@ -55,29 +62,30 @@ constexpr int WEIGHT_INDEX = 29;   // motor_cmd[29].q carries the weight (kNotUs
 struct Joint {
     const char* name;
     float lo, hi;             // the URDF's range, radians
+    float effort;             // the URDF's rated torque, N·m
 };
 
 // Body indices 12..28, ranges from g1_29dof_lock_waist_with_hand_rev_1_0.urdf (Unitree's
 // g1_description). Waist roll and pitch have no motor on this robot (lock-waist variant,
 // mode_machine 6): they are held like every other joint and never accept a target.
 constexpr Joint JOINTS[N] = {
-    {"waist_yaw", -2.618f, 2.618f},
-    {"waist_roll", -0.52f, 0.52f},
-    {"waist_pitch", -0.52f, 0.52f},
-    {"left_shoulder_pitch", -3.0892f, 2.6704f},
-    {"left_shoulder_roll", -1.5882f, 2.2515f},
-    {"left_shoulder_yaw", -2.618f, 2.618f},
-    {"left_elbow", -1.0472f, 2.0944f},
-    {"left_wrist_roll", -1.97222f, 1.97222f},
-    {"left_wrist_pitch", -1.61443f, 1.61443f},
-    {"left_wrist_yaw", -1.61443f, 1.61443f},
-    {"right_shoulder_pitch", -3.0892f, 2.6704f},
-    {"right_shoulder_roll", -2.2515f, 1.5882f},
-    {"right_shoulder_yaw", -2.618f, 2.618f},
-    {"right_elbow", -1.0472f, 2.0944f},
-    {"right_wrist_roll", -1.97222f, 1.97222f},
-    {"right_wrist_pitch", -1.61443f, 1.61443f},
-    {"right_wrist_yaw", -1.61443f, 1.61443f},
+    {"waist_yaw", -2.618f, 2.618f, 88.0f},
+    {"waist_roll", -0.52f, 0.52f, 35.0f},
+    {"waist_pitch", -0.52f, 0.52f, 35.0f},
+    {"left_shoulder_pitch", -3.0892f, 2.6704f, 25.0f},
+    {"left_shoulder_roll", -1.5882f, 2.2515f, 25.0f},
+    {"left_shoulder_yaw", -2.618f, 2.618f, 25.0f},
+    {"left_elbow", -1.0472f, 2.0944f, 25.0f},
+    {"left_wrist_roll", -1.97222f, 1.97222f, 25.0f},
+    {"left_wrist_pitch", -1.61443f, 1.61443f, 5.0f},
+    {"left_wrist_yaw", -1.61443f, 1.61443f, 5.0f},
+    {"right_shoulder_pitch", -3.0892f, 2.6704f, 25.0f},
+    {"right_shoulder_roll", -2.2515f, 1.5882f, 25.0f},
+    {"right_shoulder_yaw", -2.618f, 2.618f, 25.0f},
+    {"right_elbow", -1.0472f, 2.0944f, 25.0f},
+    {"right_wrist_roll", -1.97222f, 1.97222f, 25.0f},
+    {"right_wrist_pitch", -1.61443f, 1.61443f, 5.0f},
+    {"right_wrist_yaw", -1.61443f, 1.61443f, 5.0f},
 };
 constexpr const char* LOCKED[] = {"waist_roll", "waist_pitch"};
 
@@ -87,12 +95,26 @@ inline int index_of(const std::string& name) {
     return -1;
 }
 
+inline bool is_locked(const std::string& name) {
+    for (const char* l : LOCKED)
+        if (name == l) return true;
+    return false;
+}
+
+// Every joint arm_sdk can move on this robot: all of them but the two locked waist joints.
+inline std::set<std::string> all_movable() {
+    std::set<std::string> out;
+    for (const auto& j : JOINTS)
+        if (!is_locked(j.name)) out.insert(j.name);
+    return out;
+}
+
 struct Config {
-    std::set<std::string> allowed{"left_elbow", "right_elbow"};
+    std::set<std::string> allowed = all_movable();
     std::set<int> fsm_ok{500, 501};   // Walk with the waist locked / free (g1_command_sender)
     float max_vel = 0.5f;             // rad/s, Unitree's example
     float ramp_s = 2.0f;              // weight 0 -> 1 and back
-    float max_excursion = 0.6f;       // rad (~34°) from where the joint was taken
+    float max_excursion = 0.0f;       // rad from where the joint was taken; 0 = no such limit
     float margin = 0.05f;             // rad inside the URDF range
     float kp = 60.0f, kd = 1.5f;      // Unitree's example
     long deadman_ms = 1000;
@@ -100,12 +122,18 @@ struct Config {
     long state_max_age_ms = 100;      // lowstate older than this at `take` = refused
     long state_lost_ms = 500;         // ... and this long while in control = released
     long fsm_lost_ms = 2000;
+    float stall_frac = 0.6f;          // rule 8: share of the rated effort that counts as pushing
+    float stall_gap = 0.05f;          // ... while this far (rad) from its command
+    long stall_ms = 250;              // ... for this long
+    int temp_release = 75;            // rule 9: °C; the telemetry alarm is 80
 };
 
 // What the robot reports, as the caller last saw it.
 struct Inputs {
     long state_age_ms = -1;           // -1 = no lowstate yet
     float q[NBODY] = {};
+    float tau[NBODY] = {};            // estimated torque, N·m
+    int temp[NBODY] = {};             // °C, the hotter of the motor's two sensors
     int fsm = -1;                     // -1 = unknown
     long fsm_age_ms = -1;             // since the last successful FSM read; -1 = never
 };
@@ -173,8 +201,11 @@ public:
                 return reply("err not in control");
             touch(now_ms);
             const Joint& j = JOINTS[i];
-            float lo = std::max(j.lo + cfg_.margin, origin_[i] - cfg_.max_excursion);
-            float hi = std::min(j.hi - cfg_.margin, origin_[i] + cfg_.max_excursion);
+            float lo = j.lo + cfg_.margin, hi = j.hi - cfg_.margin;
+            if (cfg_.max_excursion > 0) {
+                lo = std::max(lo, origin_[i] - cfg_.max_excursion);
+                hi = std::min(hi, origin_[i] + cfg_.max_excursion);
+            }
             goal_[i] = std::min(hi, std::max(lo, v));
             std::ostringstream os;
             os << "ok target " << name << ' ' << fmt(goal_[i]);
@@ -217,6 +248,8 @@ public:
                 begin_release("fsm_" + std::to_string(in.fsm));
             } else if (in.fsm_age_ms < 0 || in.fsm_age_ms > cfg_.fsm_lost_ms) {
                 begin_release("fsm_lost");
+            } else if (const char* hot = hot_joint(in)) {
+                begin_release(std::string("hot_") + hot);
             } else if (quiet > cfg_.release_ms) {
                 begin_release("deadman");
             } else if (quiet > cfg_.deadman_ms && !frozen_) {
@@ -227,6 +260,24 @@ public:
         }
         for (auto& e : pending_) ev.push_back(e);
         pending_.clear();
+
+        // Rule 8, on every state that publishes: a joint pushing against something gives up.
+        for (int i = 0; i < N; ++i) {
+            if (is_locked(JOINTS[i].name)) continue;
+            const float q = in.q[FIRST + i];
+            const bool pushing =
+                std::fabs(in.tau[FIRST + i]) > cfg_.stall_frac * JOINTS[i].effort &&
+                std::fabs(cmd_[i] - q) > cfg_.stall_gap;
+            if (!pushing) {
+                stall_since_[i] = -1;
+            } else if (stall_since_[i] < 0) {
+                stall_since_[i] = now_ms;
+            } else if (now_ms - stall_since_[i] >= cfg_.stall_ms && std::isfinite(q)) {
+                cmd_[i] = goal_[i] = q;
+                stall_since_[i] = -1;
+                ev.push_back(std::string("stall ") + JOINTS[i].name);
+            }
+        }
 
         // Rule 5: walk towards the goal at max_vel, whatever the state (holding = goal is cmd).
         const float step = cfg_.max_vel * dt;
@@ -260,15 +311,18 @@ private:
     float weight_ = 0.0f;
     float cmd_[N] = {}, goal_[N] = {}, origin_[N] = {};
     long long last_msg_ms_ = 0;
+    long long stall_since_[N] = {-1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                 -1, -1, -1, -1, -1, -1, -1, -1};
     bool frozen_ = false;
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
 
-    static bool is_locked(const std::string& name) {
-        for (const char* l : LOCKED)
-            if (name == l) return true;
-        return false;
+    const char* hot_joint(const Inputs& in) const {
+        for (int i = 0; i < N; ++i)
+            if (!is_locked(JOINTS[i].name) && in.temp[FIRST + i] >= cfg_.temp_release)
+                return JOINTS[i].name;
+        return nullptr;
     }
 
     static std::string fmt(float v) {

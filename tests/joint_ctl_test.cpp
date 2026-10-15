@@ -97,21 +97,28 @@ int main() {
         check(starts(c.handle("target left_elbow 1.0", t, in), "err not in control"),
               "target refused before take");
         c.handle("take", t, in);
-        check(starts(c.handle("target left_shoulder_pitch 0.5", t, in), "err joint not allowed"),
-              "joint outside the allowlist refused");
         check(starts(c.handle("target waist_pitch 0.1", t, in), "err joint not allowed"),
               "locked waist joint refused");
+        check(starts(c.handle("target left_knee 0.1", t, in), "err joint not allowed"),
+              "a leg is not an arm_sdk joint");
         check(starts(c.handle("target left_elbow nan", t, in), "err target needs"), "NaN refused");
-        check(starts(c.handle("target left_elbow 9", t, in), "ok target left_elbow 1.5000"),
-              "target clamped to 0.6 rad from where it was taken");
-        Config wide;
-        wide.max_excursion = 5.0f;
-        Controller d{wide};
-        d.handle("take", t, in);
-        check(starts(d.handle("target left_elbow 9", t, in), "ok target left_elbow 2.0444"),
+        // Defaults since J3: every arm joint and the waist yaw, over the full URDF range.
+        check(starts(c.handle("target left_shoulder_pitch 0.5", t, in), "ok target"),
+              "every arm joint allowed by default");
+        check(starts(c.handle("target waist_yaw 0.2", t, in), "ok target"), "and the waist yaw");
+        check(starts(c.handle("target left_elbow 9", t, in), "ok target left_elbow 2.0444"),
               "target clamped to the URDF range minus the margin");
-        check(starts(d.handle("target left_elbow -9", t, in), "ok target left_elbow -0.9972"),
+        check(starts(c.handle("target left_elbow -9", t, in), "ok target left_elbow -0.9972"),
               "and on the low side");
+        Config narrow;
+        narrow.allowed = {"left_elbow"};
+        narrow.max_excursion = 0.6f;
+        Controller d{narrow};
+        d.handle("take", t, in);
+        check(starts(d.handle("target left_shoulder_pitch 0.5", t, in), "err joint not allowed"),
+              "joint outside a narrowed allowlist refused");
+        check(starts(d.handle("target left_elbow 9", t, in), "ok target left_elbow 1.5000"),
+              "an excursion limit, when set, clamps to that far from the start");
     }
     // Rule 5: speed.
     {
@@ -208,6 +215,49 @@ int main() {
         idle.on_eof();
         Output o = run(idle, t, 0.1f, in, ev, false);
         check(idle.finished() && !o.publish, "EOF before a take publishes nothing");
+    }
+    // Rule 8: a joint pushing into something gives up, at once and only that joint.
+    {
+        Controller c{Config{}};
+        Inputs in = standing();
+        long long t = 0;
+        c.handle("take", t, in);
+        std::vector<std::string> ev;
+        run(c, t, 2.1f, in, ev);
+        c.handle("target left_elbow 1.4", t, in);
+        run(c, t, 0.4f, in, ev);                      // commanded 1.1, measured still 0.9
+        in.tau[L_ELBOW] = 20.0f;                      // 80% of its 25 N·m: pushing on something
+        Output o = run(c, t, 0.1f, in, ev);
+        check(!has(ev, "stall"), "a short push is tolerated");
+        o = run(c, t, 0.3f, in, ev);
+        check(has(ev, "stall left_elbow"), "a push held for 250 ms is a stall");
+        check(o.q[L_ELBOW_ARM] == 0.9f && c.goal(L_ELBOW_ARM) == 0.9f,
+              "command and target drop to where the joint is");
+        in.tau[L_ELBOW] = 0.0f;
+        o = run(c, t, 1.0f, in, ev);
+        check(o.q[L_ELBOW_ARM] == 0.9f && c.state() == State::Active,
+              "it stays there, still in control");
+        Controller e{Config{}};
+        Inputs held = standing();
+        held.tau[L_ELBOW + 7] = 20.0f;                // holding against gravity, no gap
+        long long u = 0;
+        e.handle("take", u, held);
+        std::vector<std::string> ev2;
+        run(e, u, 1.0f, held, ev2);
+        check(!has(ev2, "stall"), "torque with no gap to the command is not a stall");
+    }
+    // Rule 9: a hot motor releases.
+    {
+        Controller c{Config{}};
+        Inputs in = standing();
+        long long t = 0;
+        c.handle("take", t, in);
+        std::vector<std::string> ev;
+        run(c, t, 0.5f, in, ev);
+        in.temp[L_ELBOW] = 76;
+        run(c, t, 0.1f, in, ev);
+        check(has(ev, "releasing hot_left_elbow") && c.state() == State::Down,
+              "a motor at 76 °C releases control");
     }
     std::printf(failures ? "FAILED: %d\n" : "PASS\n", failures);
     return failures ? 1 : 0;
