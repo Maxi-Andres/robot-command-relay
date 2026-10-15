@@ -127,7 +127,8 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_IDLE_S` | `10` | G1 only: the bridge keeps running this long after the last viewer leaves |
 | `JOINT_RATE_HZ` | `30` | Read by `g1_joint_bridge`: lines per second (clamped 1-60) |
 | `JOINT_STATE_TOPIC` | `rt/lowstate` | Read by `g1_joint_bridge`: `rt/lf/lowstate` (20 Hz) is the cheap alternative |
-| `HANDS` | `1` | Read by `g1_joint_bridge`: `0` = do not look for the BrainCo hands on `/dev/ttyUSB*` |
+| `HANDS` | `1` | Read by `g1_joint_bridge` and `g1_joint_sender`: `0` = leave the BrainCo hands on `/dev/ttyUSB*` alone |
+| `HAND_SPEED` | `300` | Read by `g1_joint_sender`: finger speed, of the hand's 1..1000 (capped at 600) |
 | `JOINT_SENDER_BIN` | `./g1_joint_sender` | G1 only: what `POST /joints/control` spawns on "take" |
 | `JOINT_CTL_MAX_PER_SEC` | `30` | G1 only: rate limit of `/joints/control`, apart from `/cmd`'s (a release is never limited) |
 | `JOINT_CTL_ALLOW` | every arm joint + `waist_yaw` | Joints the page may move. Read by the relay (to report it) and by `g1_joint_sender` (to enforce it) |
@@ -145,7 +146,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `POST /cmd` | `{verb, vx?, vy?, vyaw?, ts?}` — moves the robot. `ts` (the caller's clock) orders it against the UDP path: a `move` older than the last accepted command or stop is refused with 409 |
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 | `GET /joints/stream` | **G1 only, read-only.** The joint state for the app's Joints page: one JSON line per tick (`src/g1_joint_bridge.cpp` documents the fields) until the caller hangs up, `{"stale": true}` when nothing new arrives within 1 s. Same token |
-| `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| keepalive \| status \| release, session, joint?, q?}`. One session at a time. Same token |
+| `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| hand \| keepalive \| status \| release, session, joint?, q?, side?, finger?, pos?}` (`hand`: one finger, 0 open .. 1000 closed). One session at a time. Same token |
 
 ### The joint stream (G1)
 
@@ -161,7 +162,7 @@ under the same limits (`CPUWeight`, not a quota: see the unit file). Test: `pyte
 
 ### Moving arm joints (G1)
 
-`POST /joints/control` is how the Joints page moves the arms and the waist yaw. `take` spawns `g1_joint_sender`,
+`POST /joints/control` is how the Joints page moves the arms, the waist yaw and the fingers. `take` spawns `g1_joint_sender`,
 which publishes `rt/arm_sdk` while the robot's own controller (PC1) keeps balancing; after the
 release ramp the sender exits, and the session is over. **Every limit lives in
 `src/joint_ctl_core.hpp`** — read its header: FSM gate (Walk only), no jump at the start (targets
@@ -176,6 +177,13 @@ While a session is open the relay keeps the robot standing: `take` sends `stop_m
 `move` and the arm actions are refused with 409 on HTTP and dropped on UDP; and a `stop_move`
 from anywhere releases the arm. Only one page holds the arms (the session id), and the AI-VL
 backend releases them when that page's socket closes. Test: `pytest tests/test_joint_control.py`.
+
+The fingers ride the same session (rule 10 of `joint_ctl_core.hpp`): a hand is taken only if it
+answered at `take`, its targets start where its fingers are, writes are clamped and at most one
+per hand every 50 ms, and nothing is written after the release — the fingers then stay put. The
+one write is `src/brainco_command.hpp` (finger positions and speeds, registers 1022-1033 only);
+the read-only bridge does not include it, and `tests/test_brainco_modbus.py` fails if it ever
+does. The hand's own protection current stays as BrainCo set it.
 
 Allowed verbs: `move`, `stop_move`, `stand_up`, `stand_down`, `damp`, `balance_stand`,
 `recovery_stand`, `sit`, `rise_sit`, `hello`, `stretch`, `scrape`, `heart`, `pose_on`,

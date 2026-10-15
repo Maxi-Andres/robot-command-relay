@@ -10,7 +10,10 @@
 // WHAT IT TOUCHES
 //   reads    rt/lowstate          the joints' measured positions (where control starts)
 //            the loco service     the robot's FSM, every FSM_POLL_MS (GetFsmId, an RPC)
+//            the BrainCo hands    finger positions over Modbus (src/brainco_modbus.hpp), 50 Hz
 //   writes   rt/arm_sdk           only between `take` and the end of the release ramp
+//            the BrainCo hands    finger targets (src/brainco_command.hpp: registers 1022-1033
+//                                 only), only when the page moves a finger, inside a session
 // It never writes rt/lowcmd: PC1 keeps balancing the robot the whole time.
 //
 // Configuration, all optional (relay.env):
@@ -22,8 +25,11 @@
 //   JOINT_CTL_STALL_MS    ... held this long                          (150, 50-1000)
 //   JOINT_CTL_EXCURSION rad from where control started; 0 = off       (0, the full URDF range)
 //   JOINT_CTL_DEADMAN_MS / JOINT_CTL_RELEASE_MS                        (1000 / 5000)
+//   HAND_SPEED          finger speed, of the hand's 1..1000 (capped at 600)  (300)
+//   HANDS               0 = leave the hands alone                     (1)
 // The caps are here and not only in relay.env so that a typo cannot make an arm fast.
 
+#include "brainco_command.hpp"
 #include "joint_ctl_core.hpp"
 
 #include <unitree/idl/hg/LowCmd_.hpp>
@@ -92,7 +98,11 @@ struct Shared {
     long long low_at = -1;
     int fsm = -1;
     long long fsm_at = -1;
+    int hand_pos[2][6] = {};
+    long long hand_at[2] = {-1, -1};
 };
+
+constexpr long HAND_FRESH_MS = 200;   // a hand read longer ago than this does not count
 
 }  // namespace
 
@@ -120,6 +130,7 @@ int main() {
     cfg.max_excursion = env_f("JOINT_CTL_EXCURSION", 0.0f, 0.0f, 6.3f);
     cfg.deadman_ms = static_cast<long>(env_f("JOINT_CTL_DEADMAN_MS", 1000, 200, 5000));
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
+    cfg.hand_speed = static_cast<int>(env_f("HAND_SPEED", 300, 1, 600));
 
     std::cerr << "[g1-joint-sender] iface=" << iface << " allow="
               << (allow_env.empty() ? std::string("all") : allow_env)
@@ -183,15 +194,62 @@ int main() {
             }
         in.fsm = sh.fsm;
         in.fsm_age_ms = sh.fsm_at < 0 ? -1 : static_cast<long>(t - sh.fsm_at);
+        for (int h = 0; h < 2; ++h) {
+            in.hand_ok[h] = sh.hand_at[h] >= 0 && t - sh.hand_at[h] < HAND_FRESH_MS;
+            for (int f = 0; f < 6; ++f) in.hand_pos[h][f] = sh.hand_pos[h][f];
+        }
         return in;
     };
+
+    // The hands: found once, then read (and, inside a session, written) by a thread of their own
+    // so a slow or missing hand never delays the arms' 200 Hz loop.
+    std::unique_ptr<brainco::Port> hand_port[2];
+    if (std::string(env_s("HANDS", "1")) != "0") {
+        hand_port[0] = brainco::find_hand(brainco::LEFT_ID);
+        hand_port[1] = brainco::find_hand(brainco::RIGHT_ID,
+                                          hand_port[0] ? hand_port[0]->path() : "");
+        for (int h = 0; h < 2; ++h)
+            std::cerr << "[g1-joint-sender] " << (h ? "right" : "left") << " hand: "
+                      << (hand_port[h] ? hand_port[h]->path() : std::string("not found"))
+                      << std::endl;
+    }
+    const uint8_t hand_id[2] = {brainco::LEFT_ID, brainco::RIGHT_ID};
+    std::thread hands_thread([&] {
+        while (running.load()) {
+            const auto t0 = Clock::now();
+            for (int h = 0; h < 2; ++h) {
+                if (!hand_port[h]) continue;
+                uint16_t regs[brainco::STATUS_COUNT];
+                if (hand_port[h]->read(hand_id[h], brainco::STATUS_ADDR, brainco::STATUS_COUNT,
+                                       regs)) {
+                    const auto st = brainco::decode_status(regs);
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    for (int f = 0; f < 6; ++f) sh.hand_pos[h][f] = st.pos[f];
+                    sh.hand_at[h] = now_ms();
+                }
+                int pos[6], speed[6];
+                bool due;
+                {
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    due = ctl.hand_due(h, now_ms(), pos, speed);
+                }
+                if (due && brainco::write_targets(*hand_port[h], hand_id[h], pos, speed)) {
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    ctl.hand_written(h, now_ms(), pos);
+                }
+            }
+            std::this_thread::sleep_until(t0 + std::chrono::milliseconds(20));
+        }
+    });
 
     // `take` is the first thing the relay sends, right after spawning us: answer it with a
     // real picture of the robot, not "FSM unknown" because the first RPC is still in flight.
     for (int k = 0; k < 75; ++k) {
         {
             std::lock_guard<std::mutex> lk(sh.mu);
-            if (sh.low_at >= 0 && sh.fsm_at >= 0) break;
+            const bool hands_read = (!hand_port[0] || sh.hand_at[0] >= 0) &&
+                                    (!hand_port[1] || sh.hand_at[1] >= 0);
+            if (sh.low_at >= 0 && sh.fsm_at >= 0 && hands_read) break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -245,6 +303,7 @@ int main() {
     }
     running.store(false);
     fsm_poll.join();
+    hands_thread.join();
     std::cerr << "[g1-joint-sender] released, exiting" << std::endl;
     // _Exit, not return: the reader thread is still blocked reading stdin, holding stdin's
     // stdio lock, and a normal exit() flushes every stdio stream — it would wait on that lock

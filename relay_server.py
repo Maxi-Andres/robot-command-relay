@@ -1045,8 +1045,8 @@ class JointControl:
                        excursion=JOINT_CTL_EXCURSION, margin=JOINT_CTL_MARGIN)
             return code, out
 
-    def op(self, session, op, joint=None, q=None):
-        """keepalive | status | target | release, inside a session."""
+    def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None):
+        """keepalive | status | target | hand | release, inside a session."""
         with self.lock:
             if not self.busy() or self.session is None:
                 return 409, {"ok": False, "error": "no control session", **self.state,
@@ -1063,6 +1063,19 @@ class JointControl:
                 if not math.isfinite(q):
                     return 400, {"ok": False, "error": "q must be finite"}
                 line = f"target {joint} {q:.4f}"
+            elif op == "hand":
+                # One finger of a BrainCo hand, 0 open .. 1000 closed (the sender clamps again).
+                if side not in ("left", "right"):
+                    return 400, {"ok": False, "error": "side must be left or right"}
+                if isinstance(finger, bool) or not isinstance(finger, int) or not 0 <= finger <= 5:
+                    return 400, {"ok": False, "error": "finger must be 0-5"}
+                try:
+                    pos = float(pos)
+                except (TypeError, ValueError):
+                    return 400, {"ok": False, "error": "pos must be a number"}
+                if not math.isfinite(pos):
+                    return 400, {"ok": False, "error": "pos must be finite"}
+                line = f"hand {side} {finger} {round(min(1000.0, max(0.0, pos)))}"
             elif op in ("keepalive", "status", "release"):
                 line = op
             else:
@@ -1235,6 +1248,7 @@ class Handler(BaseHTTPRequestHandler):
 
           {"op": "take"}                                   -> {ok, session, allowed, state, w}
           {"op": "target", "session", "joint", "q": rad}   -> {ok, reply, state, w}
+          {"op": "hand", "session", "side", "finger": 0-5, "pos": 0-1000}
           {"op": "keepalive" | "status" | "release", "session"}
 
         The limits are the sender's (src/joint_ctl_core.hpp); this checks the token, the
@@ -1263,9 +1277,12 @@ class Handler(BaseHTTPRequestHandler):
             code, out = ctl.take()
             audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
         else:
-            code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"))
-            if op in ("target", "release"):
-                detail = f"{body.get('joint')}={body.get('q')}" if op == "target" else "release"
+            code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"),
+                               body.get("side"), body.get("finger"), body.get("pos"))
+            if op in ("target", "hand", "release"):
+                detail = (f"{body.get('joint')}={body.get('q')}" if op == "target" else
+                          f"{body.get('side')}[{body.get('finger')}]={body.get('pos')}"
+                          if op == "hand" else "release")
                 audit(src, "joints-control", detail, out.get("reply") or out.get("error", "-"))
         return self._json(code, out)
 

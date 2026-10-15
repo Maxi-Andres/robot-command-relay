@@ -127,26 +127,22 @@ std::mutex hands_mu;
 Hand hands[2] = {{"left", brainco::LEFT_ID, nullptr, {}, {}, false, 0},
                  {"right", brainco::RIGHT_ID, nullptr, {}, {}, false, 0}};
 
-// Every /dev/ttyUSB0-7 that exists, probed with a one-register read per missing hand.
+// Each missing hand is looked for on every candidate port (brainco::find_hand: /dev/ttyUSB0-7,
+// or HAND_PORTS), skipping the port the other hand already holds.
 void find_hands() {
-    for (int n = 0; n < 8; ++n) {
-        const std::string path = "/dev/ttyUSB" + std::to_string(n);
-        if (access(path.c_str(), F_OK) != 0) continue;
-        auto port = std::make_unique<brainco::Port>(path);
-        if (!port->ok()) continue;
-        for (Hand& h : hands) {
-            uint16_t r;
-            bool missing;
-            {
-                std::lock_guard<std::mutex> lk(hands_mu);
-                missing = !h.port;
-            }
-            if (!missing || !port->read(h.id, brainco::STATUS_ADDR, 1, &r)) continue;
-            fprintf(stderr, "[g1-joints] %s hand (id %d) on %s\n", h.key, h.id, path.c_str());
+    for (int i = 0; i < 2; ++i) {
+        std::string other;
+        {
             std::lock_guard<std::mutex> lk(hands_mu);
-            h.port = std::move(port);
-            break;                   // one hand per port
+            if (hands[i].port) continue;
+            if (hands[1 - i].port) other = hands[1 - i].port->path();
         }
+        auto port = brainco::find_hand(hands[i].id, other);
+        if (!port) continue;
+        fprintf(stderr, "[g1-joints] %s hand (id %d) on %s\n", hands[i].key, hands[i].id,
+                port->path().c_str());
+        std::lock_guard<std::mutex> lk(hands_mu);
+        hands[i].port = std::move(port);
     }
 }
 

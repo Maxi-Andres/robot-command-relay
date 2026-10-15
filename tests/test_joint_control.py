@@ -54,6 +54,9 @@ FAKE_SENDER = textwrap.dedent("""
         elif verb == "target":
             _, j, q = line.split()
             print("ok target %s %s state=%s w=%.2f" % (j, q, state, w), flush=True)
+        elif verb == "hand":
+            _, side, finger, pos = line.split()
+            print("ok hand %s %s %s state=%s w=%.2f" % (side, finger, pos, state, w), flush=True)
         elif verb == "release":
             print("ok release state=down w=1.00", flush=True)
             print("ev released requested", flush=True)
@@ -147,6 +150,20 @@ def test_targets_are_checked_and_forwarded(ctl, fake):
     code, out = ctl.op(s, "target", "left_elbow", 1.23456)
     assert code == 200 and out["reply"] == "target left_elbow 1.2346"
     assert "target left_elbow 1.2346" in log.read_text()
+
+
+def test_finger_targets_are_checked_and_forwarded(ctl, fake):
+    _, log = fake
+    s = ctl.take()[1]["session"]
+    assert ctl.op(s, "hand", side="middle", finger=1, pos=500)[0] == 400
+    assert ctl.op(s, "hand", side="left", finger=6, pos=500)[0] == 400
+    assert ctl.op(s, "hand", side="left", finger="2", pos=500)[0] == 400
+    assert ctl.op(s, "hand", side="left", finger=True, pos=500)[0] == 400
+    assert ctl.op(s, "hand", side="left", finger=2, pos=float("inf"))[0] == 400
+    code, out = ctl.op(s, "hand", side="left", finger=2, pos=1200.4)
+    assert code == 200 and out["reply"] == "hand left 2 1000"
+    assert "hand left 2 1000" in log.read_text()
+    assert ctl.op("someone-else", "hand", side="left", finger=2, pos=10)[0] == 409
 
 
 def test_release_ends_the_session_and_the_process(ctl):

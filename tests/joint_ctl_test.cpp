@@ -275,6 +275,36 @@ int main() {
         check(has(ev, "releasing hot_left_elbow") && c.state() == State::Down,
               "a motor at 76 °C releases control");
     }
+    // Rule 10: fingers.
+    {
+        Controller c{Config{}};
+        Inputs in = standing();
+        in.hand_ok[0] = true;                         // left answers, right does not
+        for (int f = 0; f < 6; ++f) in.hand_pos[0][f] = f == 0 ? 399 : 50;
+        long long t = 0;
+        check(starts(c.handle("hand left 2 500", t, in), "err not in control"),
+              "a finger is refused before take");
+        c.handle("take", t, in);
+        int pos[6], spd[6];
+        check(!c.hand_due(0, t, pos, spd), "taking control writes nothing to the hand");
+        check(c.hand_goal(0, 0) == 399 && c.hand_goal(0, 2) == 50,
+              "finger targets start where the fingers are");
+        check(starts(c.handle("hand right 2 500", t, in), "err right hand not available"),
+              "a hand that did not answer at take is refused");
+        check(starts(c.handle("hand left 6 500", t, in), "err no such finger"), "finger 6 refused");
+        check(starts(c.handle("hand left 2 nan", t, in), "err hand needs"), "NaN refused");
+        check(starts(c.handle("hand left 2 1500", t, in), "ok hand left 2 1000"),
+              "position clamped to 1000");
+        check(c.hand_due(0, t, pos, spd) && pos[2] == 1000 && pos[0] == 399 && spd[2] == 300,
+              "due: all six targets, the others unchanged, at the slow default speed");
+        c.hand_written(0, t, pos);
+        check(!c.hand_due(0, t + 100, pos, spd), "nothing more once written");
+        c.handle("hand left 3 -20", t + 10, in);
+        check(!c.hand_due(0, t + 20, pos, spd), "at most one write per 50 ms");
+        check(c.hand_due(0, t + 60, pos, spd) && pos[3] == 0, "then the newest, clamped to 0");
+        c.handle("release", t + 70, in);
+        check(!c.hand_due(0, t + 200, pos, spd), "nothing is written after release");
+    }
     std::printf(failures ? "FAILED: %d\n" : "PASS\n", failures);
     return failures ? 1 : 0;
 }

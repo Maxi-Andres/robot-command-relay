@@ -43,9 +43,16 @@
 //      since 2026-10-15: at 60% / 250 ms a person holding the arm felt it keep pushing (at kp
 //      60, 60% of an arm joint's 25 N·m is only reached ~14° behind the command; 30% is ~7°).
 //   9. HOT MOTOR, HANDS OFF. Any held joint at or over temp_release °C releases control.
+//  10. FINGERS (since 2026-10-15). The BrainCo hands take a target per finger, 0 open .. 1000
+//      closed, only inside a session (up/active) and only for a hand that answered when control
+//      was taken. They start at where each finger IS. The hand moves itself at hand_speed (of
+//      1000) and limits its own current, so this only clamps, rate-limits the writes to one
+//      per hand_min_ms, and stops writing once the session is released — the fingers then stay
+//      where they are (a hand holding something must not drop it because the arms were freed).
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
-//   take  |  target <joint> <rad>  |  keepalive  |  status  |  release
+//   take  |  target <joint> <rad>  |  hand <left|right> <finger 0-5> <pos 0-1000>
+//   keepalive  |  status  |  release
 // Every reply is one line, "ok ..." or "err ...", ending in " state=<s> w=<weight>".
 // Asynchronous events come as "ev <what>" lines.
 #pragma once
@@ -132,6 +139,8 @@ struct Config {
     float stall_gap = 0.05f;          // ... while this far (rad) from its command
     long stall_ms = 150;              // ... for this long
     int temp_release = 75;            // rule 9: °C; the telemetry alarm is 80
+    int hand_speed = 300;             // rule 10: of the hand's 1..1000
+    long hand_min_ms = 50;            // ... at most one write per hand this often
 };
 
 // What the robot reports, as the caller last saw it.
@@ -142,7 +151,12 @@ struct Inputs {
     int temp[NBODY] = {};             // °C, the hotter of the motor's two sensors
     int fsm = -1;                     // -1 = unknown
     long fsm_age_ms = -1;             // since the last successful FSM read; -1 = never
+    bool hand_ok[2] = {false, false}; // left, right: answering right now
+    int hand_pos[2][6] = {};          // their fingers, 0 open .. 1000 closed
 };
+
+constexpr int HAND_FINGERS = 6;
+inline int hand_side(const std::string& s) { return s == "left" ? 0 : s == "right" ? 1 : -1; }
 
 // What to publish this tick. publish=false: send nothing at all.
 struct Output {
@@ -196,6 +210,24 @@ public:
             begin_release("requested");
             return reply("ok release");
         }
+        if (verb == "hand") {
+            std::string side;
+            int finger = -1;
+            float pos = 0;
+            if (!(is >> side >> finger >> pos) || !std::isfinite(pos))
+                return reply("err hand needs side finger pos");
+            const int h = hand_side(side);
+            if (h < 0 || finger < 0 || finger >= HAND_FINGERS)
+                return reply("err no such finger");
+            if (state_ != State::Up && state_ != State::Active)
+                return reply("err not in control");
+            if (!hand_taken_[h]) return reply("err " + side + " hand not available");
+            touch(now_ms);
+            hand_goal_[h][finger] = std::min(1000, std::max(0, static_cast<int>(std::lround(pos))));
+            hand_dirty_[h] = true;
+            return reply("ok hand " + side + " " + std::to_string(finger) + " " +
+                         std::to_string(hand_goal_[h][finger]));
+        }
         if (verb == "target") {
             std::string name;
             float v = 0;
@@ -231,6 +263,27 @@ public:
     }
 
     // One control tick of `dt` seconds. Events (rule changes) are appended to `ev`.
+    // Rule 10: the six targets to write to hand `h` now, if any are due. The caller writes them
+    // and calls hand_written() only once the hand acknowledged, so a lost write is retried.
+    bool hand_due(int h, long long now_ms, int* pos, int* speed) const {
+        if (h < 0 || h > 1 || !hand_taken_[h] || !hand_dirty_[h]) return false;
+        if (state_ != State::Up && state_ != State::Active) return false;
+        if (now_ms - hand_sent_ms_[h] < cfg_.hand_min_ms) return false;
+        for (int i = 0; i < HAND_FINGERS; ++i) {
+            pos[i] = hand_goal_[h][i];
+            speed[i] = cfg_.hand_speed;
+        }
+        return true;
+    }
+    void hand_written(int h, long long now_ms, const int* pos) {
+        hand_sent_ms_[h] = now_ms;
+        bool same = true;
+        for (int i = 0; i < HAND_FINGERS; ++i) same = same && pos[i] == hand_goal_[h][i];
+        if (same) hand_dirty_[h] = false;            // a newer goal arrived meanwhile: keep it
+    }
+    bool hand_taken(int h) const { return h >= 0 && h < 2 && hand_taken_[h]; }
+    int hand_goal(int h, int f) const { return hand_goal_[h][f]; }
+
     Output tick(long long now_ms, float dt, const Inputs& in, std::vector<std::string>& ev) {
         for (auto& e : pending_) ev.push_back(e);
         pending_.clear();
@@ -318,6 +371,10 @@ private:
     long long stall_since_[N] = {-1, -1, -1, -1, -1, -1, -1, -1, -1,
                                  -1, -1, -1, -1, -1, -1, -1, -1};
     bool frozen_ = false;
+    bool hand_taken_[2] = {false, false};
+    bool hand_dirty_[2] = {false, false};
+    int hand_goal_[2][HAND_FINGERS] = {};
+    long long hand_sent_ms_[2] = {-1000000, -1000000};
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
@@ -391,6 +448,14 @@ private:
             if (!std::isfinite(q)) return reply("err bad joint reading");
             origin_[i] = cmd_[i] = goal_[i] = q;
             vel_[i] = 0.0f;
+        }
+        // Rule 10: a hand is taken only if it answered just now, and its targets start at
+        // where its fingers are — taking control never moves a finger.
+        for (int h = 0; h < 2; ++h) {
+            hand_taken_[h] = in.hand_ok[h];
+            hand_dirty_[h] = false;
+            for (int f = 0; f < HAND_FINGERS; ++f)
+                hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f]));
         }
         weight_ = 0.0f;
         state_ = State::Up;

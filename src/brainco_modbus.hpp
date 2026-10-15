@@ -13,10 +13,11 @@
 //   2018-2023  motor state 0 idle, 1 running, 2 stalled, 3 turbo
 // Finger order in every block: thumb flex, thumb aux (rotation), index, middle, ring, pinky.
 //
-// READ-ONLY BY CONSTRUCTION: the only request this file can build is function 04. Writing
-// (function 06/10h) is a later step with its own safety envelope, and BrainCo lists registers
-// that must never be written casually (903 factory reset, 900 OTA, 1000 id, 1001 baud, 1009
-// restart) — none of which can be reached from here.
+// READ-ONLY BY CONSTRUCTION: the only request this file can build is function 04. The one
+// write anybody may send — finger positions and speeds, registers 1022-1033 — lives in
+// brainco_command.hpp, which g1_joint_bridge does not include. BrainCo lists registers that must
+// never be written casually (903 factory reset, 900 OTA, 1000 id, 1001 baud, 1009 restart):
+// neither file can reach them.
 //
 // SHARING THE BUS: every transaction takes an exclusive flock() on the port, so a future writer
 // in another process can share it without two requests colliding on the wire.
@@ -33,6 +34,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -118,25 +121,33 @@ public:
 
     // Reads `count` input registers from slave `id`. False on timeout or a bad answer.
     bool read(uint8_t id, uint16_t addr, uint16_t count, uint16_t* regs, int timeout_ms = 30) {
+        std::vector<uint8_t> buf;
+        return transact(read_request(id, addr, count), response_size(count), buf, timeout_ms) &&
+               parse_response(buf.data(), buf.size(), id, count, regs);
+    }
+
+    // One request out, up to `want` bytes back, under the port's flock. The frame is built by
+    // the caller — read_request here, or brainco_command.hpp's one write.
+    bool transact(const std::vector<uint8_t>& req, size_t want, std::vector<uint8_t>& resp,
+                  int timeout_ms = 30) {
+        resp.assign(want, 0);
         if (fd_ < 0) return false;
-        const auto req = read_request(id, addr, count);
-        const size_t want = response_size(count);
-        std::vector<uint8_t> buf(want);
         size_t got = 0;
         flock(fd_, LOCK_EX);
         tcflush(fd_, TCIFLUSH);
-        bool sent = ::write(fd_, req.data(), req.size()) == static_cast<ssize_t>(req.size());
+        const bool sent = ::write(fd_, req.data(), req.size()) == static_cast<ssize_t>(req.size());
         if (sent) {
             tcdrain(fd_);
             const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
             while (got < want && std::chrono::steady_clock::now() < end) {
-                const ssize_t r = ::read(fd_, buf.data() + got, want - got);
+                const ssize_t r = ::read(fd_, resp.data() + got, want - got);
                 if (r > 0) got += static_cast<size_t>(r);
                 else usleep(300);
             }
         }
         flock(fd_, LOCK_UN);
-        return sent && parse_response(buf.data(), got, id, count, regs);
+        resp.resize(got);
+        return sent && got == want;
     }
 
 private:
@@ -147,5 +158,34 @@ private:
     std::string path_;
     int fd_ = -1;
 };
+
+// The serial ports to look for the hands on: HAND_PORTS (comma-separated, for tests) or
+// /dev/ttyUSB0-7.
+inline std::vector<std::string> candidate_ports() {
+    std::vector<std::string> out;
+    const char* env = getenv("HAND_PORTS");
+    if (env && *env) {
+        std::string item, all(env);
+        for (size_t a = 0, b; a <= all.size(); a = b + 1) {
+            b = all.find(',', a);
+            if (b == std::string::npos) b = all.size();
+            if (b > a) out.push_back(all.substr(a, b - a));
+        }
+        return out;
+    }
+    for (int n = 0; n < 8; ++n) out.push_back("/dev/ttyUSB" + std::to_string(n));
+    return out;
+}
+
+// The port slave `id` answers on, opened, or nullptr. `skip` is a port already taken.
+inline std::unique_ptr<Port> find_hand(uint8_t id, const std::string& skip = "") {
+    for (const auto& path : candidate_ports()) {
+        if (path == skip || access(path.c_str(), F_OK) != 0) continue;
+        auto port = std::make_unique<Port>(path);
+        uint16_t r;
+        if (port->ok() && port->read(id, STATUS_ADDR, 1, &r)) return port;
+    }
+    return nullptr;
+}
 
 }  // namespace brainco
