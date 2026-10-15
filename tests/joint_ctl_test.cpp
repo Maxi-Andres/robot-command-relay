@@ -287,6 +287,10 @@ int main() {
         c.handle("take", t, in);
         int pos[6], spd[6];
         check(!c.hand_due(0, t, pos, spd), "taking control writes nothing to the hand");
+        Controller still{Config{}};
+        still.handle("take", t, in);
+        still.handle("release", t + 10, in);
+        check(!still.hand_due(0, t + 100, pos, spd), "a hand never moved is not written on release");
         check(c.hand_goal(0, 0) == 399 && c.hand_goal(0, 2) == 50,
               "finger targets start where the fingers are");
         check(starts(c.handle("hand right 2 500", t, in), "err right hand not available"),
@@ -303,7 +307,12 @@ int main() {
         check(!c.hand_due(0, t + 20, pos, spd), "at most one write per 50 ms");
         check(c.hand_due(0, t + 60, pos, spd) && pos[3] == 0, "then the newest, clamped to 0");
         c.handle("release", t + 70, in);
-        check(!c.hand_due(0, t + 200, pos, spd), "nothing is written after release");
+        check(c.hand_due(0, t + 200, pos, spd) && pos[0] == 399 && pos[2] == 50 && pos[3] == 50,
+              "release sends the hand back to where it was when control was taken");
+        c.hand_written(0, t + 200, pos);
+        check(!c.hand_due(0, t + 300, pos, spd), "once, then nothing more");
+        check(starts(c.handle("hand left 2 500", t + 300, in), "err not in control"),
+              "no finger target is taken while releasing");
     }
     std::printf(failures ? "FAILED: %d\n" : "PASS\n", failures);
     return failures ? 1 : 0;

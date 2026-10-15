@@ -180,7 +180,7 @@ backend releases them when that page's socket closes. Test: `pytest tests/test_j
 
 The fingers ride the same session (rule 10 of `joint_ctl_core.hpp`): a hand is taken only if it
 answered at `take`, its targets start where its fingers are, writes are clamped and at most one
-per hand every 50 ms, and nothing is written after the release — the fingers then stay put. The
+per hand every 50 ms, and on release each hand is sent back to where it was at `take`. The
 one write is `src/brainco_command.hpp` (finger positions and speeds, registers 1022-1033 only);
 the read-only bridge does not include it, and `tests/test_brainco_modbus.py` fails if it ever
 does. The hand's own protection current stays as BrainCo set it.

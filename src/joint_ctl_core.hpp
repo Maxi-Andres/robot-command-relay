@@ -46,9 +46,10 @@
 //  10. FINGERS (since 2026-10-15). The BrainCo hands take a target per finger, 0 open .. 1000
 //      closed, only inside a session (up/active) and only for a hand that answered when control
 //      was taken. They start at where each finger IS. The hand moves itself at hand_speed (of
-//      1000) and limits its own current, so this only clamps, rate-limits the writes to one
-//      per hand_min_ms, and stops writing once the session is released — the fingers then stay
-//      where they are (a hand holding something must not drop it because the arms were freed).
+//      1000) and limits its own current, so this only clamps and rate-limits the writes to one
+//      per hand_min_ms. ON RELEASE each hand goes back to where it was when control was taken,
+//      during the arms' hand-back ramp — the operator's call, 2026-10-15: "give the arms back"
+//      means the whole upper body, and a hand left closed after the page let go surprised them.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
 //   take  |  target <joint> <rad>  |  hand <left|right> <finger 0-5> <pos 0-1000>
@@ -267,7 +268,8 @@ public:
     // and calls hand_written() only once the hand acknowledged, so a lost write is retried.
     bool hand_due(int h, long long now_ms, int* pos, int* speed) const {
         if (h < 0 || h > 1 || !hand_taken_[h] || !hand_dirty_[h]) return false;
-        if (state_ != State::Up && state_ != State::Active) return false;
+        // Down too: that is when a released hand is sent back to where it started.
+        if (state_ != State::Up && state_ != State::Active && state_ != State::Down) return false;
         if (now_ms - hand_sent_ms_[h] < cfg_.hand_min_ms) return false;
         for (int i = 0; i < HAND_FINGERS; ++i) {
             pos[i] = hand_goal_[h][i];
@@ -374,6 +376,7 @@ private:
     bool hand_taken_[2] = {false, false};
     bool hand_dirty_[2] = {false, false};
     int hand_goal_[2][HAND_FINGERS] = {};
+    int hand_origin_[2][HAND_FINGERS] = {};
     long long hand_sent_ms_[2] = {-1000000, -1000000};
     bool final_sent_ = false;
     std::string release_reason_;
@@ -455,7 +458,8 @@ private:
             hand_taken_[h] = in.hand_ok[h];
             hand_dirty_[h] = false;
             for (int f = 0; f < HAND_FINGERS; ++f)
-                hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f]));
+                hand_origin_[h][f] = hand_goal_[h][f] =
+                    std::min(1000, std::max(0, in.hand_pos[h][f]));
         }
         weight_ = 0.0f;
         state_ = State::Up;
@@ -466,6 +470,16 @@ private:
     void begin_release(const std::string& why) {
         if (state_ == State::Down || state_ == State::Done) return;
         for (int i = 0; i < N; ++i) goal_[i] = stopping_point(i);   // hold: brake, do not finish
+        // Rule 10: each hand back to where it was when control was taken.
+        for (int h = 0; h < 2; ++h) {
+            if (!hand_taken_[h]) continue;
+            bool moved = false;
+            for (int f = 0; f < HAND_FINGERS; ++f) {
+                moved = moved || hand_goal_[h][f] != hand_origin_[h][f];
+                hand_goal_[h][f] = hand_origin_[h][f];
+            }
+            hand_dirty_[h] = hand_dirty_[h] || moved;
+        }
         release_reason_ = why;
         state_ = State::Down;
         pending_.push_back("releasing " + why);
