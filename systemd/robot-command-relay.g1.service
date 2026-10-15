@@ -42,7 +42,15 @@ KillSignal=SIGTERM
 TimeoutStopSec=10
 # It must never compete with the robot's own control stack.
 MemoryMax=256M
-CPUQuota=25%
+# CPUWeight, not CPUQuota=25% (2026-10-15) — the same trap robot-video.service fell into
+# (robot-splunk-docs/PLAN-VIDEO.md). A quota is an ABSOLUTE ceiling: once the cgroup spends its
+# share of a 100 ms period, CFS freezes every task in it until the next one. On the G1 this
+# unit also runs the Joints page's processes, and both read rt/lowstate at ~1 kHz: 19% of a core
+# with only the viewer open, and with the arm sender on top the group was throttled in 180 of
+# 593 periods (33.8 s). The arm trembled and the sender's FSM reads timed out ("Released: the
+# robot's mode could not be read"). A weight only bites under real contention; 100 is the
+# default, so the command path never ranks below the video (50). Balance runs on PC1 anyway.
+CPUWeight=100
 Nice=5
 
 [Install]

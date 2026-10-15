@@ -153,7 +153,7 @@ robot. It does not read the hands: this G1 has Inspire hands, driven by their ow
 wired yet), and the `rt/dex3/*` topics the robot lists belong to the other hand. The relay starts it with the first viewer and stops it
 `JOINT_IDLE_S` after the last one, keeps only its newest line (a slow viewer skips lines, never
 delays another), and caps viewers at `JOINT_MAX_CLIENTS`. It runs inside the relay's unit, so
-under the same `CPUQuota=25%`. Test: `pytest tests/test_joint_stream.py`. Plan and next steps:
+under the same limits (`CPUWeight`, not a quota: see the unit file). Test: `pytest tests/test_joint_stream.py`. Plan and next steps:
 `.claude/roadmap/G1-CONTROL-ARTICULAR.md` on the workstation.
 
 ### Moving arm joints (G1)
