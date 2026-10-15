@@ -127,6 +127,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_IDLE_S` | `10` | G1 only: the bridge keeps running this long after the last viewer leaves |
 | `JOINT_RATE_HZ` | `30` | Read by `g1_joint_bridge`: lines per second (clamped 1-60) |
 | `JOINT_STATE_TOPIC` | `rt/lowstate` | Read by `g1_joint_bridge`: `rt/lf/lowstate` (20 Hz) is the cheap alternative |
+| `HANDS` | `1` | Read by `g1_joint_bridge`: `0` = do not look for the BrainCo hands on `/dev/ttyUSB*` |
 | `JOINT_SENDER_BIN` | `./g1_joint_sender` | G1 only: what `POST /joints/control` spawns on "take" |
 | `JOINT_CTL_MAX_PER_SEC` | `30` | G1 only: rate limit of `/joints/control`, apart from `/cmd`'s (a release is never limited) |
 | `JOINT_CTL_ALLOW` | every arm joint + `waist_yaw` | Joints the page may move. Read by the relay (to report it) and by `g1_joint_sender` (to enforce it) |
@@ -148,9 +149,11 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 
 ### The joint stream (G1)
 
-`g1_joint_bridge` reads `rt/lowstate` and prints it; it has no publisher, so it cannot move the
-robot. It does not read the hands: this G1 has Inspire hands, driven by their own service (not
-wired yet), and the `rt/dex3/*` topics the robot lists belong to the other hand. The relay starts it with the first viewer and stops it
+`g1_joint_bridge` reads `rt/lowstate` and the two hands, and prints them; it cannot move
+anything (no DDS publisher, and its Modbus code only builds read requests). The hands are
+BrainCo Revo 2 on the FTDI board PC2 sees as `/dev/ttyUSB*` — left id 126, right id 127, 460800
+baud; `src/brainco_modbus.hpp` has the registers and why (tested in CI:
+`pytest tests/test_brainco_modbus.py`). The relay's user must be in `dialout` to open them. The relay starts it with the first viewer and stops it
 `JOINT_IDLE_S` after the last one, keeps only its newest line (a slow viewer skips lines, never
 delays another), and caps viewers at `JOINT_MAX_CLIENTS`. It runs inside the relay's unit, so
 under the same limits (`CPUWeight`, not a quota: see the unit file). Test: `pytest tests/test_joint_stream.py`. Plan and next steps:

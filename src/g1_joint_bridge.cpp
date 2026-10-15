@@ -1,4 +1,4 @@
-// g1_joint_bridge — the G1's joint state, for the app's Joints page. READ-ONLY for now.
+// g1_joint_bridge — the G1's joint state, for the app's Joints page. READ-ONLY.
 //
 // Runs on PC2 next to the robot's DDS, spawned by relay_server.py while at least one viewer
 // is watching (GET /joints/stream), and stopped again once nobody is. It prints one JSON line
@@ -10,26 +10,30 @@
 //                        print at JOINT_RATE_HZ. JOINT_STATE_TOPIC=rt/lf/lowstate (20 Hz) is the
 //                        cheap alternative if PC2 is ever short of CPU.
 //
-// NOT THE HANDS. This robot has five-finger Inspire hands (seen on it, 2026-10-14). They are
-// driven by their own service, not by the robot's firmware, and none was seen running — wiring
-// them is step J4 of .claude/roadmap/G1-CONTROL-ARTICULAR.md. The robot does list
-// rt/dex3/*/state (the THREE-finger Dex3-1's topics, 7 motors), with a publisher; what
-// publishes them, and what they carry, is not checked yet. They are not read: drawing a
-// seven-motor hand's numbers onto five fingers would be wrong in a way nobody could see.
+//   the two hands        BrainCo Revo 2, over Modbus RTU on the FTDI board that PC2 sees as
+//                        /dev/ttyUSB* (src/brainco_modbus.hpp: registers, ids, why). Each port
+//                        is probed once for the left (126) and right (127) hand; then both are
+//                        read at JOINT_RATE_HZ. HANDS=0 turns this off. Before 2026-10-15 this
+//                        file read rt/dex3/*/state instead — the wrong hand (Dex3-1) entirely.
 //
-// WHAT IT DOES NOT DO: publish anything. There is no publisher header in this file, so this
-// binary cannot move the robot. Step J2 of .claude/roadmap/G1-CONTROL-ARTICULAR.md adds the
-// arm_sdk writer, and with it the safety envelope (limits, speed cap, weight ramp, dead-man) —
-// that is when this file stops being read-only, and the header above changes with it.
+// WHAT IT DOES NOT DO: move anything. There is no DDS publisher in this file, and the hands'
+// Modbus code can only build read requests (function 04). Moving the arms is g1_joint_sender's
+// job (step J2-J3); moving the fingers will be a separate writer with its own limits (J4).
 //
 // OUTPUT, one line per tick (numbers only, so no JSON string escaping is ever needed):
 //   {"t":<unix s>,"age_ms":<ms since the last lowstate, -1 = never>,"mode_machine":6,
-//    "imu":[roll,pitch,yaw],"q":[29],"dq":[29],"tau":[29],"temp":[29]}
+//    "imu":[roll,pitch,yaw],"q":[29],"dq":[29],"tau":[29],"temp":[29],
+//    "left":{"age_ms":..,"pos":[6],"speed":[6],"current":[6],"state":[6],"errors":n}|null,
+//    "right":{...}|null}
 // Radians, rad/s, N·m, °C. `temp` is the hotter of a motor's two sensors (the telemetry
-// reader's rule).
+// reader's rule). Hands in the hand's own units: pos 0 open .. 1000 closed, speed ±1000,
+// current signed, state 0 idle / 1 running / 2 stalled / 3 turbo; finger order thumb flex,
+// thumb aux, index, middle, ring, pinky. A hand that was never found is null.
 //
 // EOF ON STDIN EXITS: the relay holds our stdin, so if it dies we die with it instead of
 // leaving an orphan DDS participant on the robot.
+
+#include "brainco_modbus.hpp"
 
 #include <unitree/idl/hg/LowState_.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
@@ -42,7 +46,9 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <memory>
 #include <thread>
+#include <vector>
 
 using namespace unitree::robot;
 using LowState = unitree_hg::msg::dds_::LowState_;
@@ -106,6 +112,104 @@ void arr(std::string& s, const char* key, const Motors& motors, int n, Get get, 
     s += ']';
 }
 
+// ---- the hands ----------------------------------------------------------------------------
+
+struct Hand {
+    const char* key;                 // "left" / "right" in the JSON
+    uint8_t id;
+    std::unique_ptr<brainco::Port> port;
+    brainco::Status st{};
+    Clock::time_point at{};
+    bool have = false;
+    long errors = 0;                 // failed reads since the last good one
+};
+std::mutex hands_mu;
+Hand hands[2] = {{"left", brainco::LEFT_ID, nullptr, {}, {}, false, 0},
+                 {"right", brainco::RIGHT_ID, nullptr, {}, {}, false, 0}};
+
+// Every /dev/ttyUSB0-7 that exists, probed with a one-register read per missing hand.
+void find_hands() {
+    for (int n = 0; n < 8; ++n) {
+        const std::string path = "/dev/ttyUSB" + std::to_string(n);
+        if (access(path.c_str(), F_OK) != 0) continue;
+        auto port = std::make_unique<brainco::Port>(path);
+        if (!port->ok()) continue;
+        for (Hand& h : hands) {
+            uint16_t r;
+            bool missing;
+            {
+                std::lock_guard<std::mutex> lk(hands_mu);
+                missing = !h.port;
+            }
+            if (!missing || !port->read(h.id, brainco::STATUS_ADDR, 1, &r)) continue;
+            fprintf(stderr, "[g1-joints] %s hand (id %d) on %s\n", h.key, h.id, path.c_str());
+            std::lock_guard<std::mutex> lk(hands_mu);
+            h.port = std::move(port);
+            break;                   // one hand per port
+        }
+    }
+}
+
+void hands_loop(const std::atomic<bool>& running, double rate) {
+    const auto period = std::chrono::duration<double>(1.0 / rate);
+    auto last_scan = Clock::now() - std::chrono::seconds(10);
+    while (running) {
+        const auto t0 = Clock::now();
+        bool missing = false;
+        for (Hand& h : hands) {
+            brainco::Port* port;
+            {
+                std::lock_guard<std::mutex> lk(hands_mu);
+                port = h.port.get();
+            }
+            if (!port) { missing = true; continue; }
+            uint16_t regs[brainco::STATUS_COUNT];
+            const bool ok = port->read(h.id, brainco::STATUS_ADDR, brainco::STATUS_COUNT, regs);
+            std::lock_guard<std::mutex> lk(hands_mu);
+            if (ok) {
+                h.st = brainco::decode_status(regs);
+                h.at = Clock::now();
+                h.have = true;
+                h.errors = 0;
+            } else if (++h.errors >= 60) {
+                // ~2 s of silence: unplugged or re-enumerated. Look for it again.
+                fprintf(stderr, "[g1-joints] %s hand stopped answering on %s\n", h.key,
+                        h.port->path().c_str());
+                h.port.reset();
+                h.errors = 0;
+            }
+        }
+        // A missing hand is looked for again every 5 s (the USB cable was found unplugged once).
+        if (missing && Clock::now() - last_scan > std::chrono::seconds(5)) {
+            find_hands();
+            last_scan = Clock::now();
+        }
+        std::this_thread::sleep_until(t0 + std::chrono::duration_cast<Clock::duration>(period));
+    }
+}
+
+void hand_json(std::string& s, const Hand& h, Clock::time_point now) {
+    s += '"'; s += h.key; s += "\":";
+    if (!h.have) {
+        s += "null";
+        return;
+    }
+    s += "{\"age_ms\":" + std::to_string(age_ms(h.at, now));
+    auto arr = [&s](const char* key, const int* v) {
+        s += ",\""; s += key; s += "\":[";
+        for (int i = 0; i < brainco::FINGERS; ++i) {
+            if (i) s += ',';
+            s += std::to_string(v[i]);
+        }
+        s += ']';
+    };
+    arr("pos", h.st.pos);
+    arr("speed", h.st.speed);
+    arr("current", h.st.current);
+    arr("state", h.st.state);
+    s += ",\"errors\":" + std::to_string(h.errors) + '}';
+}
+
 std::string build_line() {
     LowState low;
     Clock::time_point at_low;
@@ -135,6 +239,13 @@ std::string build_line() {
         s += ',';
         arr(s, "temp", m, NBODY, [](const MotorState& x) { return motor_temp(x); }, 0);
     }
+    {
+        std::lock_guard<std::mutex> lk(hands_mu);
+        for (const Hand& h : hands) {
+            s += ',';
+            hand_json(s, h, now);
+        }
+    }
     s += '}';
     return s;
 }
@@ -162,6 +273,14 @@ int main() {
         g.have_low = true;
     }, 1);
 
+    // The hands: a thread of their own, so a slow or missing hand never delays the body.
+    std::atomic<bool> hands_on{env_s("HANDS", "1") != std::string("0")};
+    std::thread hands_thread;
+    if (hands_on) {
+        find_hands();
+        hands_thread = std::thread(hands_loop, std::cref(hands_on), rate);
+    }
+
     std::atomic<bool> stdin_open{true};
     std::thread([&stdin_open] {
         std::string line;
@@ -185,5 +304,7 @@ int main() {
         if (Clock::now() - next > std::chrono::seconds(1)) next = Clock::now();
     }
     fprintf(stderr, "[g1-joints] stdin closed, exiting\n");
+    hands_on = false;
+    if (hands_thread.joinable()) hands_thread.join();
     return 0;
 }
