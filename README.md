@@ -133,6 +133,8 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_CTL_FSM_OK` | `500,501` | Read by `g1_joint_sender`: FSM ids control may start and stay in (Walk) |
 | `JOINT_CTL_MAX_VEL` / `JOINT_CTL_EXCURSION` | `0.5` / `0` | Read by `g1_joint_sender` (and the excursion also by the relay, to report it): rad/s, capped at 1.0; and rad from where the joint was taken, `0` = off, the full URDF range |
 | `JOINT_CTL_DEADMAN_MS` / `JOINT_CTL_RELEASE_MS` | `1000` / `5000` | Read by `g1_joint_sender`: silence before the arm is frozen / handed back |
+| `JOINT_CTL_MAX_ACC` | `2.0` | Read by `g1_joint_sender`: rad/s² — how fast a joint's speed may change (smooth starts and stops), capped at 10 |
+| `JOINT_CTL_STALL_FRAC` / `JOINT_CTL_STALL_MS` | `0.3` / `150` | Read by `g1_joint_sender`: a joint pushing over this share of its rated torque for this long, short of its command, stops where it is |
 
 ## Endpoints
 
@@ -161,9 +163,9 @@ which publishes `rt/arm_sdk` while the robot's own controller (PC1) keeps balanc
 release ramp the sender exits, and the session is over. **Every limit lives in
 `src/joint_ctl_core.hpp`** — read its header: FSM gate (Walk only), no jump at the start (targets
 begin where the joints are, weight ramps 0 → 1 in 2 s), allowlist, the URDF range (and an
-optional maximum excursion), a speed cap, a dead-man (frozen after 1 s of silence, released
-after 5 s), a release that ramps too, a stall guard (a joint that keeps pushing over 60% of its
-rated torque while short of its command gives up where it is — the full range lets an arm reach
+optional maximum excursion), a speed cap with smooth acceleration (200 Hz), a dead-man (frozen after 1 s of silence, released
+after 5 s), a release that ramps too, a stall guard (a joint that keeps pushing over 30% of its
+rated torque for 150 ms while short of its command gives up where it is — the full range lets an arm reach
 the body) and a temperature release (75 °C). It is plain C++ with no SDK, so CI tests it:
 `pytest tests/test_joint_ctl_core.py` (builds `tests/joint_ctl_test.cpp` with g++).
 

@@ -120,7 +120,7 @@ int main() {
         check(starts(d.handle("target left_elbow 9", t, in), "ok target left_elbow 1.5000"),
               "an excursion limit, when set, clamps to that far from the start");
     }
-    // Rule 5: speed.
+    // Rule 5: speed and smoothness — capped speed, capped acceleration, no overshoot.
     {
         Controller c{Config{}};
         Inputs in = standing();
@@ -129,12 +129,27 @@ int main() {
         std::vector<std::string> ev;
         run(c, t, 2.1f, in, ev);
         c.handle("target left_elbow 1.3", t, in);
-        Output o = run(c, t, 0.4f, in, ev);
-        const float moved = o.q[L_ELBOW_ARM] - 0.9f;
-        check(moved > 0.19f && moved < 0.21f, "0.5 rad/s: 0.2 rad in 0.4 s");
-        o = run(c, t, 1.0f, in, ev);
-        check(o.q[L_ELBOW_ARM] > 1.299f && o.q[L_ELBOW_ARM] < 1.301f, "and stops at the target");
-        check(o.q[L_ELBOW_ARM + 7] == in.q[L_ELBOW + 7], "the other elbow did not move");
+        float prev = c.commanded(L_ELBOW_ARM), prev_v = 0.0f, max_v = 0.0f, max_a = 0.0f;
+        float peak = prev;
+        float at_04 = 0.0f;
+        for (int k = 1; k <= 200; ++k) {              // 4 s at 50 Hz
+            t += 20;
+            if (k % 10 == 0) c.handle("keepalive", t, in);
+            c.tick(t, 0.02f, in, ev);
+            const float q = c.commanded(L_ELBOW_ARM), v = (q - prev) / 0.02f;
+            max_v = std::max(max_v, std::fabs(v));
+            max_a = std::max(max_a, std::fabs(v - prev_v) / 0.02f);
+            peak = std::max(peak, q);
+            if (k == 20) at_04 = q - 0.9f;
+            prev = q;
+            prev_v = v;
+        }
+        check(max_v <= 0.5f + 1e-3f, "never faster than 0.5 rad/s");
+        check(max_a <= 2.0f + 0.3f, "speed never changes faster than ~2 rad/s², arrival included");
+        check(at_04 > 0.12f && at_04 < 0.15f, "speeds up gently: ~0.14 rad in the first 0.4 s");
+        check(peak <= 1.3f + 1e-4f, "never passes the target");
+        check(std::fabs(c.commanded(L_ELBOW_ARM) - 1.3f) < 1e-5f, "and stops exactly on it");
+        check(c.commanded(L_ELBOW_ARM + 7) == in.q[L_ELBOW + 7], "the other elbow did not move");
     }
     // Rule 6: dead-man — freeze, then release.
     {
@@ -144,13 +159,14 @@ int main() {
         c.handle("take", t, in);
         std::vector<std::string> ev;
         run(c, t, 2.1f, in, ev);
-        c.handle("target left_elbow 1.4", t, in);
+        c.handle("target left_elbow 1.6", t, in);
         Output o = run(c, t, 1.2f, in, ev, false);    // no keepalive from here on
         check(has(ev, "deadman_freeze"), "frozen after 1 s of silence");
-        const float frozen = o.q[L_ELBOW_ARM];
-        check(frozen < 1.4f, "frozen short of the target");
+        const float stop_at = c.goal(L_ELBOW_ARM);
+        check(stop_at < 1.6f && stop_at > o.q[L_ELBOW_ARM] - 1e-4f,
+              "frozen short of the target, braking instead of stopping dead");
         o = run(c, t, 1.0f, in, ev, false);
-        check(o.q[L_ELBOW_ARM] == frozen, "and stays there");
+        check(std::fabs(o.q[L_ELBOW_ARM] - stop_at) < 1e-5f, "and stays where it braked to");
         run(c, t, 3.0f, in, ev, false);
         check(has(ev, "releasing deadman"), "released after 5 s of silence");
     }
@@ -225,12 +241,12 @@ int main() {
         std::vector<std::string> ev;
         run(c, t, 2.1f, in, ev);
         c.handle("target left_elbow 1.4", t, in);
-        run(c, t, 0.4f, in, ev);                      // commanded 1.1, measured still 0.9
-        in.tau[L_ELBOW] = 20.0f;                      // 80% of its 25 N·m: pushing on something
+        run(c, t, 0.4f, in, ev);                      // commanded ~1.04, measured still 0.9
+        in.tau[L_ELBOW] = 8.0f;                       // 32% of its 25 N·m: pushing on something
         Output o = run(c, t, 0.1f, in, ev);
         check(!has(ev, "stall"), "a short push is tolerated");
-        o = run(c, t, 0.3f, in, ev);
-        check(has(ev, "stall left_elbow"), "a push held for 250 ms is a stall");
+        o = run(c, t, 0.1f, in, ev);
+        check(has(ev, "stall left_elbow"), "a push held for 150 ms is a stall");
         check(o.q[L_ELBOW_ARM] == 0.9f && c.goal(L_ELBOW_ARM) == 0.9f,
               "command and target drop to where the joint is");
         in.tau[L_ELBOW] = 0.0f;
@@ -239,7 +255,7 @@ int main() {
               "it stays there, still in control");
         Controller e{Config{}};
         Inputs held = standing();
-        held.tau[L_ELBOW + 7] = 20.0f;                // holding against gravity, no gap
+        held.tau[L_ELBOW + 7] = 8.0f;                 // holding against gravity, no gap
         long long u = 0;
         e.handle("take", u, held);
         std::vector<std::string> ev2;

@@ -25,8 +25,11 @@
 //   4. LIMITS. A target is clamped to the URDF range minus `margin` — and, when max_excursion
 //      is set (> 0), to that far from where the joint was when control was taken. J2 used 0.6
 //      rad; J3 turned it off at the operator's request, so the full range is reachable.
-//   5. SPEED. The commanded position walks towards the target at most max_vel rad/s; the
-//      browser only names targets, it never sets the pace.
+//   5. SPEED AND SMOOTHNESS. The commanded position moves towards the target at most max_vel
+//      rad/s, and its speed changes by at most max_acc rad/s² — it speeds up and slows down
+//      instead of jumping (2026-10-15: at constant speed, a dragged slider's ~10 targets a
+//      second became start-stop-start, felt as jerks). It brakes in time to stop ON the target.
+//      The browser only names targets, it never sets the pace.
 //   6. DEAD-MAN. No message for deadman_ms: the target is frozen where the arm is. None for
 //      release_ms: control is released.
 //   7. RELEASE IS A RAMP TOO. The weight falls 1 -> 0 over ramp_s while holding position, so
@@ -36,7 +39,9 @@
 //      sent through the full range can hit the torso or the other arm, and then the motor
 //      pushes at full gain, heating up. A joint whose measured torque stays over stall_frac of
 //      its rated effort for stall_ms while it is short of its command gives up: command and
-//      target become where it IS, so the force drops at once ("ev stall <joint>").
+//      target become where it IS, so the force drops at once ("ev stall <joint>"). 30% / 150 ms
+//      since 2026-10-15: at 60% / 250 ms a person holding the arm felt it keep pushing (at kp
+//      60, 60% of an arm joint's 25 N·m is only reached ~14° behind the command; 30% is ~7°).
 //   9. HOT MOTOR, HANDS OFF. Any held joint at or over temp_release °C releases control.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
@@ -113,6 +118,7 @@ struct Config {
     std::set<std::string> allowed = all_movable();
     std::set<int> fsm_ok{500, 501};   // Walk with the waist locked / free (g1_command_sender)
     float max_vel = 0.5f;             // rad/s, Unitree's example
+    float max_acc = 2.0f;             // rad/s²: 0 -> max_vel in 0.25 s
     float ramp_s = 2.0f;              // weight 0 -> 1 and back
     float max_excursion = 0.0f;       // rad from where the joint was taken; 0 = no such limit
     float margin = 0.05f;             // rad inside the URDF range
@@ -122,9 +128,9 @@ struct Config {
     long state_max_age_ms = 100;      // lowstate older than this at `take` = refused
     long state_lost_ms = 500;         // ... and this long while in control = released
     long fsm_lost_ms = 2000;
-    float stall_frac = 0.6f;          // rule 8: share of the rated effort that counts as pushing
+    float stall_frac = 0.3f;          // rule 8: share of the rated effort that counts as pushing
     float stall_gap = 0.05f;          // ... while this far (rad) from its command
-    long stall_ms = 250;              // ... for this long
+    long stall_ms = 150;              // ... for this long
     int temp_release = 75;            // rule 9: °C; the telemetry alarm is 80
 };
 
@@ -253,7 +259,7 @@ public:
             } else if (quiet > cfg_.release_ms) {
                 begin_release("deadman");
             } else if (quiet > cfg_.deadman_ms && !frozen_) {
-                for (int i = 0; i < N; ++i) goal_[i] = cmd_[i];
+                for (int i = 0; i < N; ++i) goal_[i] = stopping_point(i);
                 frozen_ = true;
                 ev.push_back("deadman_freeze");
             }
@@ -274,17 +280,15 @@ public:
                 stall_since_[i] = now_ms;
             } else if (now_ms - stall_since_[i] >= cfg_.stall_ms && std::isfinite(q)) {
                 cmd_[i] = goal_[i] = q;
+                vel_[i] = 0.0f;
                 stall_since_[i] = -1;
                 ev.push_back(std::string("stall ") + JOINTS[i].name);
             }
         }
 
-        // Rule 5: walk towards the goal at max_vel, whatever the state (holding = goal is cmd).
-        const float step = cfg_.max_vel * dt;
-        for (int i = 0; i < N; ++i) {
-            const float d = goal_[i] - cmd_[i];
-            cmd_[i] += std::max(-step, std::min(step, d));
-        }
+        // Rule 5: towards the goal at most max_vel, speed changing at most max_acc, braking so
+        // as to stop on the goal (v = sqrt(2·a·d) is the fastest speed that still can).
+        for (int i = 0; i < N; ++i) step_joint(i, dt);
 
         const float dw = cfg_.ramp_s > 0 ? dt / cfg_.ramp_s : 1.0f;
         if (state_ == State::Up) {
@@ -309,7 +313,7 @@ private:
     Config cfg_;
     State state_ = State::Idle;
     float weight_ = 0.0f;
-    float cmd_[N] = {}, goal_[N] = {}, origin_[N] = {};
+    float cmd_[N] = {}, goal_[N] = {}, origin_[N] = {}, vel_[N] = {};
     long long last_msg_ms_ = 0;
     long long stall_since_[N] = {-1, -1, -1, -1, -1, -1, -1, -1, -1,
                                  -1, -1, -1, -1, -1, -1, -1, -1};
@@ -317,6 +321,33 @@ private:
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
+
+    // Where joint i comes to rest if it brakes now at max_acc.
+    float stopping_point(int i) const {
+        const float a = cfg_.max_acc > 0 ? cfg_.max_acc : 1e6f;
+        return cmd_[i] + vel_[i] * std::fabs(vel_[i]) / (2.0f * a);
+    }
+
+    void step_joint(int i, float dt) {
+        const float d = goal_[i] - cmd_[i];
+        const float a = cfg_.max_acc > 0 ? cfg_.max_acc : 1e6f;
+        // The fastest speed that still stops on the goal when braking at `a` in steps of dt:
+        // v²/2a + v·dt/2 = |d|. (The continuous v = sqrt(2a·d) arrives with speed left over,
+        // and dropping it in one tick is exactly the jolt this rule is here to avoid.)
+        const float h = a * dt / 2.0f;
+        const float brake = -h + std::sqrt(h * h + 2.0f * a * std::fabs(d));
+        const float want = (d >= 0 ? 1.0f : -1.0f) * std::min(cfg_.max_vel, brake);
+        const float dv = std::max(-a * dt, std::min(a * dt, want - vel_[i]));
+        vel_[i] += dv;
+        const float step = vel_[i] * dt;
+        // Arrived (or would pass it this tick): sit exactly on the goal, at rest.
+        if (std::fabs(d) < 1e-5f || (step * d > 0 && std::fabs(step) >= std::fabs(d))) {
+            cmd_[i] = goal_[i];
+            vel_[i] = 0.0f;
+        } else {
+            cmd_[i] += step;
+        }
+    }
 
     const char* hot_joint(const Inputs& in) const {
         for (int i = 0; i < N; ++i)
@@ -359,6 +390,7 @@ private:
             const float q = in.q[FIRST + i];
             if (!std::isfinite(q)) return reply("err bad joint reading");
             origin_[i] = cmd_[i] = goal_[i] = q;
+            vel_[i] = 0.0f;
         }
         weight_ = 0.0f;
         state_ = State::Up;
@@ -368,7 +400,7 @@ private:
 
     void begin_release(const std::string& why) {
         if (state_ == State::Down || state_ == State::Done) return;
-        for (int i = 0; i < N; ++i) goal_[i] = cmd_[i];   // hold, do not finish a move
+        for (int i = 0; i < N; ++i) goal_[i] = stopping_point(i);   // hold: brake, do not finish
         release_reason_ = why;
         state_ = State::Down;
         pending_.push_back("releasing " + why);

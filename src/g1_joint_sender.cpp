@@ -17,6 +17,9 @@
 //   JOINT_CTL_ALLOW     joints that accept a target, comma-separated  (every arm joint + waist yaw)
 //   JOINT_CTL_FSM_OK    FSM ids control may start and stay in         (500,501)
 //   JOINT_CTL_MAX_VEL   rad/s (capped at 1.0)                         (0.5)
+//   JOINT_CTL_MAX_ACC   rad/s² (capped at 10)                         (2.0)
+//   JOINT_CTL_STALL_FRAC  share of the rated torque that counts as pushing (0.3, 0.1-0.8)
+//   JOINT_CTL_STALL_MS    ... held this long                          (150, 50-1000)
 //   JOINT_CTL_EXCURSION rad from where control started; 0 = off       (0, the full URDF range)
 //   JOINT_CTL_DEADMAN_MS / JOINT_CTL_RELEASE_MS                        (1000 / 5000)
 // The caps are here and not only in relay.env so that a typo cannot make an arm fast.
@@ -46,7 +49,9 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-constexpr float CONTROL_DT = 0.02f;   // 50 Hz, Unitree's example
+// 200 Hz. Unitree's example runs at 50 Hz, and at 50 Hz each command is a visible step of the
+// arm (felt as jerks, 2026-10-15); arm_sdk takes any rate, the robot's own loop is far faster.
+constexpr float CONTROL_DT = 0.005f;
 constexpr long FSM_POLL_MS = 250;
 
 const char* env_s(const char* k, const char* d) {
@@ -109,12 +114,17 @@ int main() {
     split_csv(env_s("JOINT_CTL_FSM_OK", "500,501"),
               [](const std::string& s) { return atoi(s.c_str()); }, cfg.fsm_ok);
     cfg.max_vel = env_f("JOINT_CTL_MAX_VEL", 0.5f, 0.05f, 1.0f);
+    cfg.max_acc = env_f("JOINT_CTL_MAX_ACC", 2.0f, 0.2f, 10.0f);
+    cfg.stall_frac = env_f("JOINT_CTL_STALL_FRAC", 0.3f, 0.1f, 0.8f);
+    cfg.stall_ms = static_cast<long>(env_f("JOINT_CTL_STALL_MS", 150, 50, 1000));
     cfg.max_excursion = env_f("JOINT_CTL_EXCURSION", 0.0f, 0.0f, 6.3f);
     cfg.deadman_ms = static_cast<long>(env_f("JOINT_CTL_DEADMAN_MS", 1000, 200, 5000));
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
 
     std::cerr << "[g1-joint-sender] iface=" << iface << " allow="
-              << (allow_env.empty() ? std::string("all") : allow_env) << " max_vel=" << cfg.max_vel << " excursion="
+              << (allow_env.empty() ? std::string("all") : allow_env)
+              << " max_vel=" << cfg.max_vel << " max_acc=" << cfg.max_acc
+              << " stall=" << cfg.stall_frac << "/" << cfg.stall_ms << "ms excursion="
               << cfg.max_excursion << " deadman=" << cfg.deadman_ms << "/" << cfg.release_ms
               << "ms" << std::endl;
 
