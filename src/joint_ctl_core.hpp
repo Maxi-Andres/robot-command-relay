@@ -42,6 +42,10 @@
 //      target become where it IS, so the force drops at once ("ev stall <joint>"). 30% / 150 ms
 //      since 2026-10-15: at 60% / 250 ms a person holding the arm felt it keep pushing (at kp
 //      60, 60% of an arm joint's 25 N·m is only reached ~14° behind the command; 30% is ~7°).
+//      The torque compared is what is LEFT after holding the arm's own weight
+//      (arm_gravity.hpp), since 2026-10-16: lifting the left arm forward with the elbow bent
+//      costs ~8.5 N·m of gravity alone, over the 7.5 of 30%, and the guard stopped an arm that
+//      was only being raised. With gravity taken out, a push still trips it at the same force.
 //   9. HOT MOTOR, HANDS OFF. Any held joint at or over temp_release °C releases control.
 //  10. FINGERS (since 2026-10-15). The BrainCo hands take a target per finger, 0 open .. 1000
 //      closed, only inside a session (up/active) and only for a hand that answered when control
@@ -60,6 +64,8 @@
 
 #include <algorithm>
 #include <cmath>
+
+#include "arm_gravity.hpp"
 #include <set>
 #include <sstream>
 #include <string>
@@ -150,6 +156,7 @@ struct Inputs {
     float q[NBODY] = {};
     float tau[NBODY] = {};            // estimated torque, N·m
     int temp[NBODY] = {};             // °C, the hotter of the motor's two sensors
+    float rpy[3] = {};                // pelvis IMU roll, pitch, yaw (rad): which way is down
     int fsm = -1;                     // -1 = unknown
     long fsm_age_ms = -1;             // since the last successful FSM read; -1 = never
     bool hand_ok[2] = {false, false}; // left, right: answering right now
@@ -323,11 +330,15 @@ public:
         pending_.clear();
 
         // Rule 8, on every state that publishes: a joint pushing against something gives up.
+        // What counts is the torque beyond holding the arm up (the waist yaw holds no weight).
+        float holding[NBODY] = {};
+        arm_gravity(in.q, in.rpy[0], in.rpy[1], holding);
         for (int i = 0; i < N; ++i) {
             if (is_locked(JOINTS[i].name)) continue;
             const float q = in.q[FIRST + i];
             const bool pushing =
-                std::fabs(in.tau[FIRST + i]) > cfg_.stall_frac * JOINTS[i].effort &&
+                std::fabs(in.tau[FIRST + i] - holding[FIRST + i]) >
+                    cfg_.stall_frac * JOINTS[i].effort &&
                 std::fabs(cmd_[i] - q) > cfg_.stall_gap;
             if (!pushing) {
                 stall_since_[i] = -1;

@@ -136,7 +136,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_CTL_MAX_VEL` / `JOINT_CTL_EXCURSION` | `0.5` / `0` | Read by `g1_joint_sender` (and the excursion also by the relay, to report it): rad/s, capped at 1.0; and rad from where the joint was taken, `0` = off, the full URDF range |
 | `JOINT_CTL_DEADMAN_MS` / `JOINT_CTL_RELEASE_MS` | `1000` / `5000` | Read by `g1_joint_sender`: silence before the arm is frozen / handed back |
 | `JOINT_CTL_MAX_ACC` | `2.0` | Read by `g1_joint_sender`: rad/s² — how fast a joint's speed may change (smooth starts and stops), capped at 10 |
-| `JOINT_CTL_STALL_FRAC` / `JOINT_CTL_STALL_MS` | `0.3` / `150` | Read by `g1_joint_sender`: a joint pushing over this share of its rated torque for this long, short of its command, stops where it is |
+| `JOINT_CTL_STALL_FRAC` / `JOINT_CTL_STALL_MS` | `0.3` / `150` | Read by `g1_joint_sender`: a joint pushing over this share of its rated torque (beyond what holding the arm up costs) for this long, short of its command, stops where it is |
 
 ## Endpoints
 
@@ -170,7 +170,9 @@ begin where the joints are, weight ramps 0 → 1 in 2 s), allowlist, the URDF ra
 optional maximum excursion), a speed cap with smooth acceleration (200 Hz), a dead-man (frozen after 1 s of silence, released
 after 5 s), a release that ramps too, a stall guard (a joint that keeps pushing over 30% of its
 rated torque for 150 ms while short of its command gives up where it is — the full range lets an arm reach
-the body) and a temperature release (75 °C). It is plain C++ with no SDK, so CI tests it:
+the body; the torque spent holding the arm's own weight is taken out first, `src/arm_gravity.hpp`,
+or merely lifting the arm forward tripped it) and a temperature release (75 °C). The arm model is
+generated from the URDF by `tools/gen_g1_arm_model.py` into `src/g1_arm_model.hpp`. It is plain C++ with no SDK, so CI tests it:
 `pytest tests/test_joint_ctl_core.py` (builds `tests/joint_ctl_test.cpp` with g++).
 
 While a session is open the relay keeps the robot standing: `take` sends `stop_move` first;

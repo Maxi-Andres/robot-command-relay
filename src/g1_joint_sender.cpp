@@ -192,6 +192,8 @@ int main() {
                 in.tau[i] = m.tau_est();
                 in.temp[i] = std::max<int>(m.temperature()[0], m.temperature()[1]);
             }
+        if (sh.low_at >= 0)
+            for (int k = 0; k < 3; ++k) in.rpy[k] = sh.low.imu_state().rpy()[k];
         in.fsm = sh.fsm;
         in.fsm_age_ms = sh.fsm_at < 0 ? -1 : static_cast<long>(t - sh.fsm_at);
         for (int h = 0; h < 2; ++h) {

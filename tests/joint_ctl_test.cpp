@@ -262,6 +262,45 @@ int main() {
         run(e, u, 1.0f, held, ev2);
         check(!has(ev2, "stall"), "torque with no gap to the command is not a stall");
     }
+    // Rule 8 counts only the torque beyond holding the arm up (arm_gravity.hpp, 2026-10-16).
+    {
+        // The model, pinned to the Python one that matched the robot's measured torques: the
+        // pose captured from the G1 on 2026-10-16 (left arm raised, measured -6.7 / -3.0 N·m).
+        const float captured[NBODY] = {-0.3058f, 0.0005f, 0.0121f, 0.4902f, -0.1889f, 0.0022f,
+            -0.2968f, 0.0074f, 0.0005f, 0.4655f, -0.1795f, -0.0322f, 0.0028f, 0.0f, 0.0f,
+            -0.6985f, 0.1907f, -0.0437f, 0.161f, 0.1274f, 0.0809f, -0.0272f,
+            0.2796f, -0.1918f, 0.0445f, 0.9953f, -0.1253f, 0.0469f, 0.0192f};
+        float g[NBODY] = {};
+        arm_gravity(captured, 0.004f, 0.0479f, g);
+        check(std::fabs(g[15] + 5.5359f) < 0.01f && std::fabs(g[18] + 2.3525f) < 0.01f,
+              "gravity model: left shoulder pitch -5.54, left elbow -2.35 N·m at the captured pose");
+        float tilted[NBODY] = {};
+        arm_gravity(captured, 0.004f, 0.3479f, tilted);
+        check(std::fabs(tilted[15] - g[15]) > 0.5f, "the robot's tilt changes what holding costs");
+
+        // Lifting the left arm forward, elbow bent: gravity alone is ~7 N·m here, and the arm
+        // trails its command by 0.15 rad. Before 2026-10-16 this tripped the guard.
+        Controller c{Config{}};
+        Inputs in = standing();
+        in.q[15] = -1.3f;
+        in.q[18] = 1.2f;
+        long long t = 0;
+        c.handle("take", t, in);
+        std::vector<std::string> ev;
+        run(c, t, 2.1f, in, ev);
+        c.handle("target left_shoulder_pitch -1.6", t, in);
+        run(c, t, 1.5f, in, ev);                      // commanded -1.6, measured still -1.3
+        float hold[NBODY] = {};
+        arm_gravity(in.q, 0.0f, 0.0f, hold);
+        check(std::fabs(hold[15]) > 0.3f * 25.0f * 0.85f,
+              "the pose really costs close to 30% of the shoulder's 25 N·m just to hold");
+        in.tau[15] = hold[15] * 1.2f;                 // the real left arm is ~20% heavier
+        run(c, t, 0.5f, in, ev);
+        check(!has(ev, "stall"), "holding the arm's own weight is not pushing into something");
+        in.tau[15] = hold[15] - 9.0f;                 // and now something stops it
+        run(c, t, 0.3f, in, ev);
+        check(has(ev, "stall left_shoulder_pitch"), "the same pose with a real push still stalls");
+    }
     // Rule 9: a hot motor releases.
     {
         Controller c{Config{}};
