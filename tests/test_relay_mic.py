@@ -186,3 +186,77 @@ def test_a_relay_without_a_mic_says_so(relay):
     srv.mic = None
     code, _ctype, body = get(url, "/audio/listen?seconds=1")
     assert code == 404 and b"no microphone" in body
+
+
+# --------------------------------------------------------------------------- #
+# The continuous stream (the app's "robot mic" switch)
+# --------------------------------------------------------------------------- #
+class EndlessSocket(FakeSocket):
+    """A multicast that keeps sending 160 ms packets, slowly, until closed."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def recvfrom(self, _n):
+        if self.closed:
+            raise OSError("closed")
+        time.sleep(0.01)
+        return b"\x03\x00" * (PACKET // 2), ("192.168.123.161", 58106)
+
+
+def test_streams_keep_the_mic_on_and_the_last_one_turns_it_off_at_once():
+    """Catches: switching the robot's mic off in the app leaving it on for another minute."""
+    audio = FakeAudio()
+    mic = relay_server.Mic(audio, record=lambda s: b"", idle_off_s=60)
+    mic.open_stream()
+    mic.open_stream()
+    mic.close_stream()
+    assert audio.lines == ["mic on"], "one stream still open"
+    mic.close_stream()
+    assert audio.lines == ["mic on", "mic off"] and not mic.on and mic.timer is None
+
+
+def test_a_listen_during_a_stream_does_not_schedule_the_mic_off():
+    audio = FakeAudio()
+    mic = relay_server.Mic(audio, record=lambda s: b"", idle_off_s=0.1)
+    mic.open_stream()
+    mic.listen(1.0)
+    time.sleep(0.3)
+    assert audio.lines == ["mic on"] and mic.on
+    mic.close_stream()
+    assert audio.lines == ["mic on", "mic off"]
+
+
+def test_too_many_streams_are_refused():
+    mic = relay_server.Mic(FakeAudio(), record=lambda s: b"", max_streams=1)
+    mic.open_stream()
+    with pytest.raises(RuntimeError, match="busy"):
+        mic.open_stream()
+
+
+def test_the_stream_passes_packets_until_the_caller_hangs_up(relay, monkeypatch):
+    url, srv = relay
+    sockets = []
+    monkeypatch.setattr(relay_server, "mic_socket",
+                        lambda: sockets.append(EndlessSocket()) or sockets[-1])
+    req = urllib.request.Request(url + "/audio/mic/stream",
+                                 headers={"Authorization": f"Bearer {TOKEN}"})
+    r = urllib.request.urlopen(req, timeout=10)
+    assert r.headers.get("Content-Type") == "audio/L16;rate=16000;channels=1"
+    got = r.read(3 * PACKET)
+    assert got == b"\x03\x00" * (3 * PACKET // 2)
+    r.close()
+    deadline = time.time() + 5
+    while srv.mic.on and time.time() < deadline:
+        time.sleep(0.05)
+    assert srv.audio.lines == ["mic on", "mic off"], "hanging up switched the mic off"
+    assert sockets[0].closed
+
+
+def test_the_stream_needs_the_token_and_a_mic(relay):
+    url, srv = relay
+    code, _ctype, _body = get(url, "/audio/mic/stream", token="wrong")  # noqa: S106
+    assert code == 401
+    srv.mic = None
+    code, _ctype, body = get(url, "/audio/mic/stream")
+    assert code == 404 and b"no microphone" in body

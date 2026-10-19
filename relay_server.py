@@ -496,20 +496,23 @@ def pcm_to_wav(pcm, rate=MIC_RATE):
             + b"data" + struct.pack("<I", len(data)) + data)
 
 
+def mic_socket():
+    """A UDP socket joined to the mic multicast. Several may be open at once (a listen and a
+    stream): SO_REUSEADDR lets each get every packet."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    sock.bind(("", MIC_PORT))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(MIC_GROUP) + socket.inet_aton(mic_local_ip()))
+    return sock
+
+
 def record_mic(seconds, open_socket=None, clock=time.monotonic):
     """`seconds` of the mic multicast as PCM bytes. TimeoutError when no packet comes within
     MIC_FIRST_PACKET_S (mic mode off, or PC1 not streaming). `open_socket` is for tests."""
     want = int(seconds * MIC_RATE) * 2
-    if open_socket is None:
-        def open_socket():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-            sock.bind(("", MIC_PORT))
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                            socket.inet_aton(MIC_GROUP) + socket.inet_aton(mic_local_ip()))
-            return sock
-    sock = open_socket()
+    sock = (open_socket or mic_socket)()
     pcm = bytearray()
     try:
         sock.settimeout(MIC_FIRST_PACKET_S)
@@ -530,17 +533,37 @@ def record_mic(seconds, open_socket=None, clock=time.monotonic):
 
 
 class Mic:
-    """Mic mode on demand: on for a listen, off after MIC_IDLE_OFF_S without one. One listen
-    at a time — a second one while recording is refused, not queued."""
+    """Mic mode on demand. A listen turns it on and leaves it on MIC_IDLE_OFF_S, so the next
+    phrase does not wait for the stream to start; an open stream (the app's "robot mic" switch)
+    keeps it on, and closing the last stream turns it off AT ONCE — switching the robot's mic
+    off in the app must mean off. One listen at a time; a second is refused, not queued."""
 
-    def __init__(self, audio, record=record_mic, idle_off_s=None):
+    def __init__(self, audio, record=record_mic, idle_off_s=None, max_streams=2):
         self.audio = audio
         self.record = record
         self.idle_off_s = MIC_IDLE_OFF_S if idle_off_s is None else idle_off_s
+        self.max_streams = max_streams
         self.busy = threading.Lock()
         self.state = threading.Lock()
         self.on = False
+        self.streams = 0
         self.timer = None
+
+    def _ensure_on(self):              # caller holds self.state
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+        if not self.on:
+            reply = self.audio.send("mic on")
+            if not reply.startswith("ok"):
+                raise RuntimeError(f"the robot did not turn its mic on: {reply}")
+            self.on = True
+
+    def _off_now(self):                # caller holds self.state
+        if self.on and self.streams == 0:
+            reply = self.audio.send("mic off")
+            self.on = not reply.startswith("ok")
+            log(f"mic off: {reply}")
 
     def listen(self, seconds):
         """PCM bytes, or raises RuntimeError (busy, or the sender refused) / TimeoutError."""
@@ -548,29 +571,34 @@ class Mic:
             raise RuntimeError("busy: another listen is recording")
         try:
             with self.state:
-                if self.timer:
-                    self.timer.cancel()
-                    self.timer = None
-                if not self.on:
-                    reply = self.audio.send("mic on")
-                    if not reply.startswith("ok"):
-                        raise RuntimeError(f"the robot did not turn its mic on: {reply}")
-                    self.on = True
+                self._ensure_on()
             return self.record(seconds)
         finally:
             with self.state:
-                if self.on:
+                if self.on and self.streams == 0:
                     self.timer = threading.Timer(self.idle_off_s, self.off)
                     self.timer.daemon = True
                     self.timer.start()
             self.busy.release()
 
+    def open_stream(self):
+        """Count one more stream and make sure the mic is on. RuntimeError when there are
+        already max_streams, or the robot refused."""
+        with self.state:
+            if self.streams >= self.max_streams:
+                raise RuntimeError(f"busy: {self.streams} mic streams already open")
+            self._ensure_on()
+            self.streams += 1
+
+    def close_stream(self):
+        with self.state:
+            self.streams = max(0, self.streams - 1)
+            if self.streams == 0 and not self.busy.locked():
+                self._off_now()
+
     def off(self):
         with self.state:
-            if self.on:
-                reply = self.audio.send("mic off")
-                self.on = not reply.startswith("ok")
-                log(f"mic off after {self.idle_off_s:g} s idle: {reply}")
+            self._off_now()
 
 
 def validate_volume(value):
@@ -1469,6 +1497,7 @@ class Handler(BaseHTTPRequestHandler):
           GET  /audio/volume                     -> {ok, volume}
           POST /audio/volume  {"level": 0-10}    -> {ok, volume}
           GET  /audio/listen?seconds=N           -> a 16 kHz mono WAV of the robot's mic (G1)
+          GET  /audio/mic/stream                 -> the mic as raw 16 kHz s16le, until hung up
         """
         src = self.client_address[0]
         path = self.path.split("?")[0].rstrip("/")
@@ -1486,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "GET" and path == "/audio/listen":
             return self._listen(src)
+        if method == "GET" and path == "/audio/mic/stream":
+            return self._mic_stream(src)
         if method == "GET" and path == "/audio/volume":
             line = "volume"
         elif method == "POST" and path == "/audio/volume":
@@ -1555,6 +1586,49 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(wav)))
         self.end_headers()
         self.wfile.write(wav)
+        return None
+
+    def _mic_stream(self, src, open_socket=None):
+        """GET /audio/mic/stream: the robot's mic as raw 16 kHz mono s16le, packet by packet,
+        until the caller hangs up — then, if it was the last stream, the mic goes off. Nothing
+        is sent while the robot sends nothing; the caller decides how long that may last."""
+        mic = getattr(self.server, "mic", None)
+        if mic is None:
+            return self._json(404, {"ok": False, "error": f"no microphone on this {ROBOT_MODEL} "
+                                                          "relay (the G1's only)"})
+        try:
+            mic.open_stream()
+        except RuntimeError as exc:
+            audit(src, "audio-mic-stream", "-", f"refused {exc}")
+            return self._json(409 if str(exc).startswith("busy") else 502,
+                              {"ok": False, "error": str(exc)})
+        audit(src, "audio-mic-stream", "-", "opened")
+        sock = None
+        sent = 0
+        try:
+            sock = (open_socket or mic_socket)()
+            sock.settimeout(1.0)
+            self.send_response(200)
+            self.send_header("Content-Type", f"audio/L16;rate={MIC_RATE};channels=1")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            while True:
+                try:
+                    data, _src = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                self.wfile.write(data)
+                self.wfile.flush()
+                sent += len(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                        # the caller hung up: the normal way this ends
+        finally:
+            if sock is not None:
+                sock.close()
+            mic.close_stream()
+            audit(src, "audio-mic-stream", "-", f"closed {sent / 2 / MIC_RATE:.1f}s")
         return None
 
     def do_POST(self):
