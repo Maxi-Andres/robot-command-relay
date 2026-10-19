@@ -6,6 +6,17 @@
 //   stop            cut whatever is playing: "ok stop"
 //   volume          "ok volume <0-100>"
 //   volume <0-100>  set it: "ok volume <n>"
+//   mic on | mic off  turn the robot's microphone stream on or off: "ok mic on" / "ok mic off"
+//   mic             what the voice service reports about its mode: "ok mic <json>"
+//
+// THE MICROPHONE. PC1 streams the mic array to multicast 239.168.123.161:5555 (16 kHz mono
+// s16le, 5120-byte packets of 160 ms; the relay's /audio/listen reads it) ONLY while the
+// voice service is in mode 1. That mode is voice API 1008, which the SDK's AudioClient does
+// not register: {"mode": 1} on, {"mode": 2} off (the default), 1007 reads it back. Found
+// 2026-10-19: nothing arrived until "Voice Assistant" was switched on in Unitree's app, and
+// community drivers (ja-avos/g1-audio-driver) make this same call instead of the app. Mode 1
+// also turns on the robot's own speech recognition (results on rt/audio_msg). When the relay
+// goes away the mic is turned off before exiting.
 //
 // Unlike the Go2, the G1's SDK HAS an audio client (g1::AudioClient, the "voice" service), and
 // PlayStream is Unitree's documented way to play our own sound (example/g1/audio). Its input is
@@ -53,6 +64,25 @@ uint32_t le32(const unsigned char* p) { return p[0] | p[1] << 8 | p[2] << 16 | (
 uint16_t le16(const unsigned char* p) { return p[0] | p[1] << 8; }
 
 // 16-bit PCM WAV -> 16 kHz mono samples. Empty on anything else (the relay already refused it).
+// g1::AudioClient plus the two voice-mode APIs it does not register.
+constexpr int32_t API_GET_MODE = 1007;
+constexpr int32_t API_SET_MODE = 1008;
+constexpr int MIC_ON = 1, MIC_OFF = 2;
+
+class VoiceClient : public g1::AudioClient {
+public:
+    void Init() {
+        g1::AudioClient::Init();
+        UT_ROBOT_CLIENT_REG_API_NO_PROI(API_GET_MODE);
+        UT_ROBOT_CLIENT_REG_API_NO_PROI(API_SET_MODE);
+    }
+    int32_t SetMode(int mode) {
+        std::string data;
+        return Call(API_SET_MODE, "{\"mode\":" + std::to_string(mode) + "}", data);
+    }
+    int32_t GetMode(std::string& data) { return Call(API_GET_MODE, "{}", data); }
+};
+
 std::vector<int16_t> to_16k_mono(const std::vector<unsigned char>& w) {
     unsigned channels = 0, rate = 0, bits = 0;
     const unsigned char* data = nullptr;
@@ -99,7 +129,8 @@ std::vector<int16_t> to_16k_mono(const std::vector<unsigned char>& w) {
 }
 
 struct Speaker {
-    g1::AudioClient client;
+    VoiceClient client;
+    bool mic_on = false;                         // set by `mic on`, so EOF knows to turn it off
     std::deque<std::vector<uint8_t>> pending;    // blocks not yet sent
     std::string stream_id;
     double next_at = 0;
@@ -168,6 +199,7 @@ int main(int argc, char** argv) {
         ssize_t got = read(0, buf, sizeof buf);
         if (got <= 0) {                            // the relay is gone: stop talking, then go
             speaker.stop();
+            if (speaker.mic_on) speaker.client.SetMode(MIC_OFF);
             return 0;
         }
         line_buf.append(buf, got);
@@ -191,6 +223,16 @@ int main(int argc, char** argv) {
                 int32_t rc = speaker.client.SetVolume((uint8_t)level);
                 reply = rc == 0 ? "ok volume " + std::to_string(level)
                                 : "err volume: set rc=" + std::to_string(rc);
+            } else if (line == "mic on" || line == "mic off") {
+                const bool on = line == "mic on";
+                int32_t rc = speaker.client.SetMode(on ? MIC_ON : MIC_OFF);
+                if (rc == 0) speaker.mic_on = on;
+                reply = rc == 0 ? std::string("ok ") + line
+                                : "err mic: set mode rc=" + std::to_string(rc);
+            } else if (line == "mic") {
+                std::string data;
+                int32_t rc = speaker.client.GetMode(data);
+                reply = rc == 0 ? "ok mic " + data : "err mic: get mode rc=" + std::to_string(rc);
             } else {
                 reply = "err unknown: " + line;
             }

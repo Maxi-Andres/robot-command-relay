@@ -449,6 +449,130 @@ def parse_wav(data):
     raise ValueError("WAV has no data chunk")
 
 
+# The G1's microphone (GET /audio/listen). PC1 streams it to multicast on the robot's internal
+# network only while the voice service is in mic mode, which the audio sender switches
+# (`mic on` / `mic off`, voice API 1008 — see g1_audio_sender.cpp). Measured 2026-10-19 on the
+# G1: 16 kHz mono s16le in 5120-byte packets, 6.3 a second, from 192.168.123.161. That
+# multicast never crosses the robot's Wi-Fi, so this relay is what carries it out, a few
+# seconds per request and only when asked: the stream is ~32 KB/s.
+MIC_GROUP = os.environ.get("MIC_GROUP", "239.168.123.161")
+MIC_PORT = int(os.environ.get("MIC_PORT", "5555"))
+MIC_RATE = 16000
+MIC_MAX_S = float(os.environ.get("MIC_MAX_S", "15"))
+MIC_FIRST_PACKET_S = float(os.environ.get("MIC_FIRST_PACKET_S", "3"))
+# Mic mode stays on this long after the last listen, so a conversation does not pay the
+# stream's start-up on every phrase; then it is switched off (it also runs the robot's ASR).
+MIC_IDLE_OFF_S = float(os.environ.get("MIC_IDLE_OFF_S", "60"))
+
+
+def mic_local_ip():
+    """This machine's address on the robot's internal network, which the group is joined on.
+    A UDP socket 'connected' towards PC1 makes the OS pick the route; nothing is sent."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.168.123.161", 1))
+            ip = s.getsockname()[0]
+        except OSError:
+            return "0.0.0.0"  # noqa: S104 - let the OS pick the interface
+    return ip if ip.startswith("192.168.123.") else "0.0.0.0"  # noqa: S104
+
+
+def validate_listen_seconds(value):
+    """How long one /audio/listen records, as a float in (0, MIC_MAX_S], or ValueError."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'seconds' must be a number, got {value!r}") from None
+    if not 0 < seconds <= MIC_MAX_S or math.isnan(seconds):
+        raise ValueError(f"'seconds' must be more than 0 and at most {MIC_MAX_S:g}")
+    return seconds
+
+
+def pcm_to_wav(pcm, rate=MIC_RATE):
+    """16-bit mono PCM bytes as a WAV file."""
+    data = bytes(pcm[: len(pcm) // 2 * 2])
+    return (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(data)) + data)
+
+
+def record_mic(seconds, open_socket=None, clock=time.monotonic):
+    """`seconds` of the mic multicast as PCM bytes. TimeoutError when no packet comes within
+    MIC_FIRST_PACKET_S (mic mode off, or PC1 not streaming). `open_socket` is for tests."""
+    want = int(seconds * MIC_RATE) * 2
+    if open_socket is None:
+        def open_socket():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            sock.bind(("", MIC_PORT))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            socket.inet_aton(MIC_GROUP) + socket.inet_aton(mic_local_ip()))
+            return sock
+    sock = open_socket()
+    pcm = bytearray()
+    try:
+        sock.settimeout(MIC_FIRST_PACKET_S)
+        # Bounded by wall time too: a stream that stops half-way must not hang the request.
+        end = clock() + MIC_FIRST_PACKET_S + seconds + 2.0
+        while len(pcm) < want and clock() < end:
+            try:
+                data, _src = sock.recvfrom(65535)
+            except socket.timeout:
+                if not pcm:
+                    raise TimeoutError(
+                        f"no microphone audio within {MIC_FIRST_PACKET_S:g} s") from None
+                break
+            pcm += data
+    finally:
+        sock.close()
+    return bytes(pcm[:want])
+
+
+class Mic:
+    """Mic mode on demand: on for a listen, off after MIC_IDLE_OFF_S without one. One listen
+    at a time — a second one while recording is refused, not queued."""
+
+    def __init__(self, audio, record=record_mic, idle_off_s=None):
+        self.audio = audio
+        self.record = record
+        self.idle_off_s = MIC_IDLE_OFF_S if idle_off_s is None else idle_off_s
+        self.busy = threading.Lock()
+        self.state = threading.Lock()
+        self.on = False
+        self.timer = None
+
+    def listen(self, seconds):
+        """PCM bytes, or raises RuntimeError (busy, or the sender refused) / TimeoutError."""
+        if not self.busy.acquire(blocking=False):
+            raise RuntimeError("busy: another listen is recording")
+        try:
+            with self.state:
+                if self.timer:
+                    self.timer.cancel()
+                    self.timer = None
+                if not self.on:
+                    reply = self.audio.send("mic on")
+                    if not reply.startswith("ok"):
+                        raise RuntimeError(f"the robot did not turn its mic on: {reply}")
+                    self.on = True
+            return self.record(seconds)
+        finally:
+            with self.state:
+                if self.on:
+                    self.timer = threading.Timer(self.idle_off_s, self.off)
+                    self.timer.daemon = True
+                    self.timer.start()
+            self.busy.release()
+
+    def off(self):
+        with self.state:
+            if self.on:
+                reply = self.audio.send("mic off")
+                self.on = not reply.startswith("ok")
+                log(f"mic off after {self.idle_off_s:g} s idle: {reply}")
+
+
 def validate_volume(value):
     """The volume level as an int 0-10, or ValueError."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
@@ -1344,6 +1468,7 @@ class Handler(BaseHTTPRequestHandler):
           POST /audio/stop                       -> {ok}
           GET  /audio/volume                     -> {ok, volume}
           POST /audio/volume  {"level": 0-10}    -> {ok, volume}
+          GET  /audio/listen?seconds=N           -> a 16 kHz mono WAV of the robot's mic (G1)
         """
         src = self.client_address[0]
         path = self.path.split("?")[0].rstrip("/")
@@ -1359,6 +1484,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(413, {"ok": False, "error": f"over {AUDIO_MAX_BYTES} bytes"})
         body = self.rfile.read(n) if n else b""
 
+        if method == "GET" and path == "/audio/listen":
+            return self._listen(src)
         if method == "GET" and path == "/audio/volume":
             line = "volume"
         elif method == "POST" and path == "/audio/volume":
@@ -1400,6 +1527,35 @@ class Handler(BaseHTTPRequestHandler):
             # The scale travels with the value: 4 is quiet on a G1 and loud on a Go2.
             out.update(volume=int(reply.split()[-1]), max=VOLUME_MAX)
         return self._json(200, out)
+
+    def _listen(self, src):
+        """GET /audio/listen?seconds=N: N seconds of the robot's microphone, as a WAV."""
+        mic = getattr(self.server, "mic", None)
+        if mic is None:
+            return self._json(404, {"ok": False, "error": f"no microphone on this {ROBOT_MODEL} "
+                                                          "relay (the G1's only)"})
+        query = dict(p.split("=", 1) for p in self.path.partition("?")[2].split("&") if "=" in p)
+        try:
+            seconds = validate_listen_seconds(query.get("seconds", "5"))
+        except ValueError as exc:
+            return self._json(400, {"ok": False, "error": str(exc)})
+        try:
+            pcm = mic.listen(seconds)
+        except RuntimeError as exc:
+            audit(src, "audio-listen", f"seconds={seconds:g}", f"refused {exc}")
+            return self._json(409 if str(exc).startswith("busy") else 502,
+                              {"ok": False, "error": str(exc)})
+        except (TimeoutError, OSError) as exc:
+            audit(src, "audio-listen", f"seconds={seconds:g}", f"failed {exc}")
+            return self._json(504, {"ok": False, "error": str(exc)})
+        audit(src, "audio-listen", f"seconds={seconds:g}", f"ok {len(pcm) / 2 / MIC_RATE:.2f}s")
+        wav = pcm_to_wav(pcm)
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        self.end_headers()
+        self.wfile.write(wav)
+        return None
 
     def do_POST(self):
         if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
@@ -1517,9 +1673,12 @@ def main():
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
     # it just has no /audio).
     srv.audio = None
+    srv.mic = None
     if os.access(AUDIO_SENDER, os.X_OK):
         srv.audio = Sender([AUDIO_SENDER, os.environ.get("DDS_IFACE", "eth0")],
                            label="audio_sender", timeout=AUDIO_REPLY_TIMEOUT, lazy=True)
+        if ROBOT_MODEL == "g1":
+            srv.mic = Mic(srv.audio)
     else:
         log(f"no {AUDIO_SENDER}: /audio is off until ./build.sh is run")
     srv.udp = None

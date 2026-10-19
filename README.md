@@ -146,6 +146,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `POST /cmd` | `{verb, vx?, vy?, vyaw?, ts?}` — moves the robot. `ts` (the caller's clock) orders it against the UDP path: a `move` older than the last accepted command or stop is refused with 409 |
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 | `GET /joints/stream` | **G1 only, read-only.** The joint state for the app's Joints page: one JSON line per tick (`src/g1_joint_bridge.cpp` documents the fields) until the caller hangs up, `{"stale": true}` when nothing new arrives within 1 s. Same token |
+| `GET /audio/listen?seconds=N` | **G1 only.** N seconds (at most `MIC_MAX_S`, 15) of the robot's own microphone as a 16 kHz mono WAV. The relay switches the voice service's mic mode on (voice API 1008, through `g1_audio_sender`), reads PC1's multicast `239.168.123.161:5555` — which never leaves the robot's internal network — and switches the mode off after `MIC_IDLE_OFF_S` (60) without a listen. 504 when no audio arrives within 3 s, 409 while another listen records. Same token |
 | `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| hand \| keepalive \| status \| release, session, joint?, q?, side?, finger?, pos?}` (`hand`: one finger, 0 open .. 1000 closed). One session at a time. Same token |
 
 ### The joint stream (G1)
