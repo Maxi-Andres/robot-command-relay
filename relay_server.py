@@ -1106,6 +1106,10 @@ class JointControl:
         self.replies = queue.Queue()
         self.state = {"state": "off", "w": 0.0}
         self.last_event = None
+        # Counts the sender's events in this session. Every reply repeats the LAST event, so two
+        # stalls of the same joint in a row would read the same; the count tells the page there
+        # was a second one.
+        self.event_seq = 0
 
     def busy(self):
         """True while a session holds (or is handing back) the arms."""
@@ -1117,6 +1121,7 @@ class JointControl:
             line = line.strip()
             if line.startswith("ev "):
                 self.last_event = line[3:]
+                self.event_seq += 1
                 log(f"joint control: {line}")
                 audit("-", "joints-control", "event", line[3:])
                 if line.startswith("ev released"):
@@ -1159,7 +1164,7 @@ class JointControl:
         ok = reply.startswith("ok")
         m = _JOINT_REPLY.match(reply)
         out = {"ok": ok, "reply": m.group(2).strip() if m else reply, **self.state,
-               "event": self.last_event}
+               "event": self.last_event, "event_seq": self.event_seq}
         return (200 if ok else code_err), out
 
     def take(self):
@@ -1183,6 +1188,7 @@ class JointControl:
                 return 503, {"ok": False, "error": f"joint sender cannot start: {exc}"}
             log(f"joint sender started (pid {self.proc.pid})")
             self.last_event = None
+            self.event_seq = 0
             threading.Thread(target=self._read, args=(self.proc,), name="joint-sender",
                              daemon=True).start()
             # Longer than an op: the sender first joins DDS and reads the robot once (~1.5 s).
@@ -1202,7 +1208,7 @@ class JointControl:
         with self.lock:
             if not self.busy() or self.session is None:
                 return 409, {"ok": False, "error": "no control session", **self.state,
-                             "event": self.last_event}
+                             "event": self.last_event, "event_seq": self.event_seq}
             if not isinstance(session, str) or not hmac.compare_digest(session, self.session):
                 return 409, {"ok": False, "error": "another page holds the arms"}
             if op == "target":
@@ -1260,7 +1266,7 @@ class JointControl:
 
     def status(self):
         return {"active": self.busy(), **self.state, "event": self.last_event,
-                "allowed": JOINT_CTL_ALLOW}
+                "event_seq": self.event_seq, "allowed": JOINT_CTL_ALLOW}
 
 
 class Handler(BaseHTTPRequestHandler):

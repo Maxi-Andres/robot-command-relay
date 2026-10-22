@@ -53,6 +53,8 @@ FAKE_SENDER = textwrap.dedent("""
             state, w = "active", 1.0
         elif verb == "target":
             _, j, q = line.split()
+            if float(q) > 9:                     # a target the arm cannot reach: it stalls
+                print("ev stall %s" % j, flush=True)
             print("ok target %s %s state=%s w=%.2f" % (j, q, state, w), flush=True)
         elif verb == "hand":
             _, side, finger, pos = line.split()
@@ -164,6 +166,24 @@ def test_finger_targets_are_checked_and_forwarded(ctl, fake):
     assert code == 200 and out["reply"] == "hand left 2 1000"
     assert "hand left 2 1000" in log.read_text()
     assert ctl.op("someone-else", "hand", side="left", finger=2, pos=10)[0] == 409
+
+
+def test_every_event_is_counted_so_a_repeated_stall_is_not_lost(ctl):
+    """Every reply carries the LAST event, so two stalls of the same joint read the same text;
+    only the count tells the page there were two (2026-10-22: the Joints page lists them)."""
+    s = ctl.take()[1]["session"]
+    _, out = ctl.op(s, "keepalive")
+    assert out["event"] == "state active" and out["event_seq"] == 1
+    _, first = ctl.op(s, "target", joint="left_elbow", q=9.9)
+    _, second = ctl.op(s, "target", joint="left_elbow", q=9.9)
+    assert first["event"] == second["event"] == "stall left_elbow"
+    assert (first["event_seq"], second["event_seq"]) == (2, 3)
+    _, out = ctl.op(s, "keepalive")
+    assert out["event_seq"] == 3, "a keepalive repeats the last event without counting it again"
+    assert ctl.status()["event_seq"] == 3
+    ctl.op(s, "release")
+    assert _wait(lambda: not ctl.busy())
+    assert ctl.take()[1]["event_seq"] == 1, "a new session counts from the start"
 
 
 def test_release_ends_the_session_and_the_process(ctl):
