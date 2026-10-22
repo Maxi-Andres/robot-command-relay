@@ -137,6 +137,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_CTL_DEADMAN_MS` / `JOINT_CTL_RELEASE_MS` | `1000` / `5000` | Read by `g1_joint_sender`: silence before the arm is frozen / handed back |
 | `JOINT_CTL_MAX_ACC` | `2.0` | Read by `g1_joint_sender`: rad/s² — how fast a joint's speed may change (smooth starts and stops), capped at 10 |
 | `JOINT_CTL_STALL_FRAC` / `JOINT_CTL_STALL_MS` | `0.3` / `150` | Read by `g1_joint_sender`: a joint pushing over this share of its rated torque (beyond what holding the arm up costs) for this long, short of its command, stops where it is |
+| `JOINT_CTL_FEEDFORWARD` | `1` | Read by `g1_joint_sender`: share (0-1) of the arm's modelled weight sent as torque so the arm does not sag under the kp spring (rule 11 of `joint_ctl_core.hpp`); `0` turns it off |
 
 ## Endpoints
 

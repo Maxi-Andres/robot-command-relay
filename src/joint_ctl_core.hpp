@@ -54,6 +54,19 @@
 //      per hand_min_ms. ON RELEASE each hand goes back to where it was when control was taken,
 //      during the arms' hand-back ramp — the operator's call, 2026-10-15: "give the arms back"
 //      means the whole upper body, and a hand left closed after the page let go surprised them.
+//  11. HOLD THE ARM'S OWN WEIGHT (gravity feedforward, 2026-10-22). With only the kp spring, an
+//      arm sags until the spring pays for its weight: 8.5 N·m on a raised left shoulder at kp 60
+//      is ~8° below the target, centimetres at the hand — no grasp works like that. Each joint's
+//      message now also carries the torque that holds the arm up at the COMMANDED pose
+//      (arm_gravity.hpp, the model rule 8 already trusts), so the spring only corrects the rest.
+//      The commanded pose, not the measured one: what the arm should weigh where it is going,
+//      with no feedback from its own sag or sensor noise. Scaled by the hand-over weight (rises
+//      with `take`, falls with the release, 0 in the last message), capped at ff_max_frac of
+//      each joint's rated effort, and zero for a tick whose pose or tilt is not finite.
+//      ff_gain 0 turns it off (JOINT_CTL_FEEDFORWARD=0). The first try, 2026-10-16, felt worse —
+//      but that night the relay's CPUQuota=25% was freezing the whole process in bursts: the
+//      unit with CPUWeight was written but not yet installed on the robot. It is now (checked
+//      2026-10-22), so this has never really been measured.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
 //   take  |  target <joint> <rad>  |  hand <left|right> <finger 0-5> <pos 0-1000>
@@ -148,6 +161,8 @@ struct Config {
     int temp_release = 75;            // rule 9: °C; the telemetry alarm is 80
     int hand_speed = 300;             // rule 10: of the hand's 1..1000
     long hand_min_ms = 50;            // ... at most one write per hand this often
+    float ff_gain = 1.0f;             // rule 11: share of the modelled holding torque sent; 0 = off
+    float ff_max_frac = 0.5f;         // ... never more than this share of a joint's rated effort
 };
 
 // What the robot reports, as the caller last saw it.
@@ -171,6 +186,7 @@ struct Output {
     bool publish = false;
     float weight = 0.0f;
     float q[N] = {};
+    float tau[N] = {};                // rule 11: feedforward torque, N·m, already weight-scaled
     float kp = 0.0f, kd = 0.0f;
 };
 
@@ -356,6 +372,9 @@ public:
         // as to stop on the goal (v = sqrt(2·a·d) is the fastest speed that still can).
         for (int i = 0; i < N; ++i) step_joint(i, dt);
 
+        // Rule 11: the torque that holds the arm up where it is commanded to be.
+        feedforward(in);
+
         const float dw = cfg_.ramp_s > 0 ? dt / cfg_.ramp_s : 1.0f;
         if (state_ == State::Up) {
             weight_ = std::min(1.0f, weight_ + dw);
@@ -380,6 +399,7 @@ private:
     State state_ = State::Idle;
     float weight_ = 0.0f;
     float cmd_[N] = {}, goal_[N] = {}, origin_[N] = {}, vel_[N] = {};
+    float ff_[N] = {};                // rule 11, before the weight
     long long last_msg_ms_ = 0;
     long long stall_since_[N] = {-1, -1, -1, -1, -1, -1, -1, -1, -1,
                                  -1, -1, -1, -1, -1, -1, -1, -1};
@@ -417,6 +437,24 @@ private:
             vel_[i] = 0.0f;
         } else {
             cmd_[i] += step;
+        }
+    }
+
+    void feedforward(const Inputs& in) {
+        for (int i = 0; i < N; ++i) ff_[i] = 0.0f;
+        if (!(cfg_.ff_gain > 0.0f)) return;
+        if (!std::isfinite(in.rpy[0]) || !std::isfinite(in.rpy[1])) return;
+        float pose[NBODY];
+        for (int i = 0; i < NBODY; ++i) pose[i] = in.q[i];
+        for (int i = 0; i < N; ++i) pose[FIRST + i] = cmd_[i];
+        for (float v : pose)
+            if (!std::isfinite(v)) return;
+        float hold[NBODY] = {};
+        arm_gravity(pose, in.rpy[0], in.rpy[1], hold);    // writes the arms only, not the waist
+        for (int i = 0; i < N; ++i) {
+            if (is_locked(JOINTS[i].name)) continue;
+            const float cap = cfg_.ff_max_frac * JOINTS[i].effort;
+            ff_[i] = std::min(cap, std::max(-cap, cfg_.ff_gain * hold[FIRST + i]));
         }
     }
 
@@ -501,7 +539,10 @@ private:
         out.weight = w;
         out.kp = cfg_.kp;
         out.kd = cfg_.kd;
-        for (int i = 0; i < N; ++i) out.q[i] = cmd_[i];
+        for (int i = 0; i < N; ++i) {
+            out.q[i] = cmd_[i];
+            out.tau[i] = ff_[i] * w;
+        }
     }
 };
 

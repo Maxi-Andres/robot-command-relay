@@ -24,6 +24,7 @@
 //   JOINT_CTL_STALL_FRAC  share of the rated torque that counts as pushing (0.3, 0.1-0.8)
 //   JOINT_CTL_STALL_MS    ... held this long                          (150, 50-1000)
 //   JOINT_CTL_EXCURSION rad from where control started; 0 = off       (0, the full URDF range)
+//   JOINT_CTL_FEEDFORWARD  share of the arm's modelled weight sent as torque; 0 = off (1, capped at 1)
 //   JOINT_CTL_DEADMAN_MS / JOINT_CTL_RELEASE_MS                        (1000 / 5000)
 //   HAND_SPEED          finger speed, of the hand's 1..1000 (capped at 600)  (300)
 //   HANDS               0 = leave the hands alone                     (1)
@@ -131,13 +132,14 @@ int main() {
     cfg.deadman_ms = static_cast<long>(env_f("JOINT_CTL_DEADMAN_MS", 1000, 200, 5000));
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
     cfg.hand_speed = static_cast<int>(env_f("HAND_SPEED", 300, 1, 600));
+    cfg.ff_gain = env_f("JOINT_CTL_FEEDFORWARD", 1.0f, 0.0f, 1.0f);
 
     std::cerr << "[g1-joint-sender] iface=" << iface << " allow="
               << (allow_env.empty() ? std::string("all") : allow_env)
               << " max_vel=" << cfg.max_vel << " max_acc=" << cfg.max_acc
               << " stall=" << cfg.stall_frac << "/" << cfg.stall_ms << "ms excursion="
               << cfg.max_excursion << " deadman=" << cfg.deadman_ms << "/" << cfg.release_ms
-              << "ms" << std::endl;
+              << "ms feedforward=" << cfg.ff_gain << std::endl;
 
     Shared sh;
     jointctl::Controller ctl(cfg);
@@ -293,7 +295,7 @@ int main() {
                 m.dq(0.0f);
                 m.kp(out.kp);
                 m.kd(out.kd);
-                m.tau(0.0f);
+                m.tau(out.tau[i]);
             }
             msg.motor_cmd()[jointctl::WEIGHT_INDEX].q(out.weight);
             pub->Write(msg);

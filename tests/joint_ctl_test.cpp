@@ -353,6 +353,73 @@ int main() {
         check(starts(c.handle("hand left 2 500", t + 300, in), "err not in control"),
               "no finger target is taken while releasing");
     }
+    // Rule 11: the arm's own weight goes out as torque, so the kp spring does not sag under it.
+    {
+        Inputs in = standing();
+        in.q[15] = -1.3f;                             // left arm raised forward, elbow bent:
+        in.q[18] = 1.2f;                              // ~7 N·m on the shoulder just to hold it
+        float hold[NBODY] = {};
+        arm_gravity(in.q, 0.0f, 0.0f, hold);
+
+        Controller c{Config{}};
+        long long t = 0;
+        c.handle("take", t, in);
+        std::vector<std::string> ev;
+        Output o = run(c, t, 1.0f, in, ev);
+        check(std::fabs(o.tau[15 - FIRST] - hold[15] * o.weight) < 1e-3f,
+              "halfway up the hand-over, half the holding torque");
+        o = run(c, t, 1.1f, in, ev);
+        check(std::fabs(o.tau[15 - FIRST] - hold[15]) < 1e-3f &&
+                  std::fabs(o.tau[18 - FIRST] - hold[18]) < 1e-3f,
+              "in control: the shoulder and elbow carry what holding the arm costs");
+        check(o.tau[15 - FIRST] * hold[15] > 0.0f && std::fabs(hold[15]) > 5.0f,
+              "same sign as the measured holding torque, and a real amount");
+        check(o.tau[0] == 0.0f && o.tau[1] == 0.0f && o.tau[2] == 0.0f,
+              "nothing on the waist: it holds no arm weight, two of it have no motor");
+
+        Inputs sag = in;
+        sag.q[15] = -1.15f;                           // the measured arm sags 0.15 rad
+        o = run(c, t, 0.2f, sag, ev);
+        check(std::fabs(o.tau[15 - FIRST] - hold[15]) < 1e-3f,
+              "computed at the commanded pose, not the measured one: no feedback from the sag");
+
+        Inputs bad = in;
+        bad.rpy[1] = std::nanf("");
+        o = run(c, t, 0.1f, bad, ev);
+        check(o.tau[15 - FIRST] == 0.0f && c.state() == State::Active,
+              "no tilt reading: no feedforward for that tick, control kept");
+
+        c.handle("release", t, in);
+        o = run(c, t, 1.0f, in, ev);
+        check(std::fabs(o.tau[15 - FIRST] - hold[15] * o.weight) < 1e-3f && o.weight < 0.55f,
+              "the release ramps it down with the weight");
+        for (int k = 0; k < 100 && !c.finished(); ++k) {
+            t += 20;
+            o = c.tick(t, 0.02f, in, ev);
+        }
+        bool zero = true;
+        for (float v : o.tau) zero = zero && v == 0.0f;
+        check(o.weight == 0.0f && zero, "the last message carries no torque at all");
+
+        Config off;
+        off.ff_gain = 0.0f;
+        Controller d{off};
+        long long u = 0;
+        d.handle("take", u, in);
+        o = run(d, u, 2.1f, in, ev);
+        zero = true;
+        for (float v : o.tau) zero = zero && v == 0.0f;
+        check(zero, "JOINT_CTL_FEEDFORWARD=0: no torque, as before");
+
+        Config capped;
+        capped.ff_max_frac = 0.1f;                    // 2.5 N·m on a 25 N·m joint
+        Controller e{capped};
+        long long w = 0;
+        e.handle("take", w, in);
+        o = run(e, w, 2.1f, in, ev);
+        check(std::fabs(o.tau[15 - FIRST]) <= 2.5f + 1e-4f && std::fabs(o.tau[15 - FIRST]) > 2.4f,
+              "never more than ff_max_frac of the rated effort");
+    }
     std::printf(failures ? "FAILED: %d\n" : "PASS\n", failures);
     return failures ? 1 : 0;
 }
