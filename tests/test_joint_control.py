@@ -56,6 +56,12 @@ FAKE_SENDER = textwrap.dedent("""
             if float(q) > 9:                     # a target the arm cannot reach: it stalls
                 print("ev stall %s" % j, flush=True)
             print("ok target %s %s state=%s w=%.2f" % (j, q, state, w), flush=True)
+        elif verb == "targets":
+            pairs = line.split()[1:]
+            for j, q in zip(pairs[::2], pairs[1::2]):
+                if float(q) > 9:                 # unreachable: it stalls
+                    print("ev stall %s" % j, flush=True)
+            print("ok targets %d state=%s w=%.2f" % (len(pairs) // 2, state, w), flush=True)
         elif verb == "hand":
             _, side, finger, pos = line.split()
             print("ok hand %s %s %s state=%s w=%.2f" % (side, finger, pos, state, w), flush=True)
@@ -352,3 +358,147 @@ def test_a_sender_that_does_not_exit_after_its_release_is_killed(tmp_path):
         assert jc.take()[0] == 200
     finally:
         jc.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Trajectories: the planner's arm motion (G1.md §6.8-6.9)
+# --------------------------------------------------------------------------- #
+class FakeStream:
+    """The joint stream: the measured pose, as rt/lowstate's 29 angles in a JSON line."""
+
+    def __init__(self, pose=None):
+        self.latest = None
+        self.subs = 0
+        if pose:
+            self.set(pose)
+
+    def set(self, pose):
+        q = [0.0] * 29
+        for name, v in pose.items():
+            q[relay_server.BODY_INDEX[name]] = v
+        self.latest = json.dumps({"q": q})
+
+    def subscribe(self):
+        self.subs += 1
+        return True
+
+    def unsubscribe(self):
+        self.subs -= 1
+
+
+ALLOWED = set(relay_server.ARM_SDK_JOINTS)
+
+
+def test_a_good_trajectory_is_accepted():
+    plan = relay_server.validate_trajectory(
+        [{"t": 1, "q": {"right_elbow": 0.4, "right_shoulder_pitch": 0.1}},
+         {"t": 2, "q": {"right_elbow": 0.8}, "hands": {"right": [0, 0, 500, 500, 500, 2000]}}],
+        ALLOWED, start={"right_elbow": 0.0, "right_shoulder_pitch": 0.0})
+    assert plan[0] == (1.0, {"right_elbow": 0.4, "right_shoulder_pitch": 0.1}, {})
+    assert plan[1][2] == {"right": [0, 0, 500, 500, 500, 1000]}, "fingers clamped to 0-1000"
+
+
+@pytest.mark.parametrize("points, why", [
+    ([], "non-empty"),
+    ([{"t": 0, "q": {"right_elbow": 0.1}}], "after the previous"),
+    ([{"t": 1, "q": {"right_elbow": 0.1}}, {"t": 1, "q": {"right_elbow": 0.2}}], "after"),
+    ([{"t": 61, "q": {"right_elbow": 0.1}}], "at most 60"),
+    ([{"t": 1, "q": {}}], "first point must name"),
+    ([{"t": 1, "q": {"left_knee": 0.1}}], "not allowed: left_knee"),
+    ([{"t": 1, "q": {"right_elbow": float("nan")}}], "number of radians"),
+    ([{"t": 1, "q": {"right_elbow": 0.1}}, {"t": 2, "q": {"left_elbow": 0.1}}],
+     "not in the first point"),
+    ([{"t": 1, "q": {"right_elbow": 0.1}}, {"t": 2, "q": {"right_elbow": 0.9}}], "faster"),
+    ([{"t": 1, "q": {"right_elbow": 0.1}, "hands": {"right": [1, 2]}}], "6 numbers"),
+])
+def test_a_bad_trajectory_is_refused(points, why):
+    with pytest.raises(ValueError, match=why):
+        relay_server.validate_trajectory(points, ALLOWED)
+
+
+def test_too_fast_from_where_the_arm_is_is_refused():
+    with pytest.raises(ValueError, match="faster"):
+        relay_server.validate_trajectory([{"t": 0.5, "q": {"right_elbow": 1.0}}], ALLOWED,
+                                         start={"right_elbow": 0.0})
+
+
+def _traj_ctl(fake, stream, monkeypatch):
+    monkeypatch.setattr(relay_server, "TRAJ_HZ", 50.0)
+    monkeypatch.setattr(relay_server, "TRAJ_SETTLE_S", 0.3)
+    argv, _log = fake
+    return relay_server.JointControl(argv, FakeCmdSender(), relay_server.CommandOrder(),
+                                     reply_timeout=3, stream=stream)
+
+
+def _traj_state(jc, session):
+    return jc.op(session, "status")[1]["trajectory"]["state"]
+
+
+def test_a_trajectory_runs_and_arrives(fake, monkeypatch):
+    stream = FakeStream({"right_elbow": 0.0})
+    jc = _traj_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take()[1]["session"]
+        code, out = jc.op(session, "trajectory", points=[
+            {"t": 0.2, "q": {"right_elbow": 0.05}},
+            {"t": 0.4, "q": {"right_elbow": 0.1}, "hands": {"right": [0, 0, 900, 900, 900, 900]}}])
+        assert code == 200 and out["trajectory"]["state"] == "running"
+        assert jc.op(session, "target", "left_elbow", 0.3)[0] == 409, "no slider while it runs"
+        stream.set({"right_elbow": 0.1})          # the arm got there
+        assert _wait(lambda: _traj_state(jc, session) == "success")
+        sent = fake[1].read_text().splitlines()
+        moves = [ln for ln in sent if ln.startswith("targets right_elbow")]
+        assert len(moves) >= 5 and moves[-1] == "targets right_elbow 0.1000"
+        assert "hand right 2 900" in sent, "the point's fingers were sent"
+        assert stream.subs == 0, "it stops watching the joint stream when it ends"
+    finally:
+        jc.stop()
+
+
+def test_short_of_the_end_is_uncertain(fake, monkeypatch):
+    jc = _traj_ctl(fake, FakeStream({"right_elbow": 0.0}), monkeypatch)
+    try:
+        session = jc.take()[1]["session"]
+        jc.op(session, "trajectory", points=[{"t": 0.5, "q": {"right_elbow": 0.2}}])
+        assert _wait(lambda: _traj_state(jc, session) == "uncertain")
+        assert "0.200 rad from the end" in jc.op(session, "status")[1]["trajectory"]["reason"]
+    finally:
+        jc.stop()
+
+
+def test_a_stall_fails_the_trajectory(fake, monkeypatch):
+    jc = _traj_ctl(fake, FakeStream(), monkeypatch)
+    try:
+        session = jc.take()[1]["session"]
+        jc.op(session, "trajectory", points=[{"t": 0.3, "q": {"right_elbow": 9.5}}])
+        assert _wait(lambda: _traj_state(jc, session) == "failure")
+        assert jc.op(session, "status")[1]["trajectory"]["reason"].startswith("stall")
+    finally:
+        jc.stop()
+
+
+def test_cancel_freezes_the_arm_where_it_is(fake, monkeypatch):
+    stream = FakeStream({"right_elbow": 0.0})
+    jc = _traj_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take()[1]["session"]
+        jc.op(session, "trajectory", points=[{"t": 2.0, "q": {"right_elbow": 0.5}}])
+        stream.set({"right_elbow": 0.123})
+        time.sleep(0.1)
+        jc.op(session, "cancel")
+        assert _wait(lambda: _traj_state(jc, session) == "cancelled")
+        moves = [ln for ln in fake[1].read_text().splitlines() if ln.startswith("targets")]
+        assert moves[-1] == "targets right_elbow 0.1230"
+    finally:
+        jc.stop()
+
+
+def test_trajectory_over_http(server, monkeypatch):
+    monkeypatch.setattr(relay_server, "TRAJ_SETTLE_S", 0.2)
+    session = _post(server, "/joints/control", {"op": "take"})[1]["session"]
+    code, out = _post(server, "/joints/control", {"op": "trajectory", "session": session,
+                                                   "points": [{"t": 0.2, "q": {"left_knee": 1}}]})
+    assert code == 400 and "left_knee" in out["error"]
+    code, out = _post(server, "/joints/control", {"op": "trajectory", "session": session,
+                                                   "points": [{"t": 0.2, "q": {"left_elbow": 0.05}}]})
+    assert code == 200 and out["trajectory"]["state"] == "running"

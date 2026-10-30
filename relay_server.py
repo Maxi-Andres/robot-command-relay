@@ -161,6 +161,24 @@ try:
 except ValueError:
     JOINT_CTL_EXCURSION = 0.0
 JOINT_CTL_MARGIN = 0.05
+# The sender's top speed (rule 5 of joint_ctl_core.hpp), mirrored with the same default and cap:
+# a trajectory that asks for more is refused up front instead of falling behind its own clock.
+try:
+    JOINT_CTL_MAX_VEL = min(1.0, max(0.05, float(os.environ.get("JOINT_CTL_MAX_VEL", "0.5"))))
+except ValueError:
+    JOINT_CTL_MAX_VEL = 0.5
+# Trajectories (op "trajectory" inside a control session, 2026-10-30): the arm motion a planner
+# (GR00T, an IK, a replayed demo) hands over as points in time. The relay interpolates them and
+# feeds the sender TRAJ_HZ points a second; every rule of joint_ctl_core.hpp still applies.
+TRAJ_MAX_POINTS = 600
+TRAJ_MAX_S = 60.0
+TRAJ_HZ = 20.0
+TRAJ_TOL = 0.05          # rad: every joint this close to its last point = arrived
+TRAJ_SETTLE_S = 3.0      # after the last point, how long it may take to get there
+# Where each arm_sdk joint sits in rt/lowstate's 29 (the joint stream's "q"), to check arrival.
+BODY_INDEX = {"waist_yaw": 12,
+              **{name: 15 + k for k, name in enumerate(ARM_SDK_JOINTS[1:8])},
+              **{name: 22 + k for k, name in enumerate(ARM_SDK_JOINTS[8:])}}
 # What the sender's replies look like: "<ok|err> ... state=<s> w=<weight>".
 _JOINT_REPLY = re.compile(r"^(ok|err)\b(.*?)\s+state=(\w+)\s+w=([0-9.]+)$")
 _JOINT_NAME = re.compile(r"^[a-z_]{1,40}$")
@@ -1095,6 +1113,166 @@ class JointStream:
                     "clients": self.clients, "max_clients": self.max_clients}
 
 
+def validate_trajectory(points, allowed, start=None, max_vel=None):
+    """A planner's trajectory as [(t, {joint: rad}, {side: [6 fingers]})], or ValueError.
+
+    `points`: [{"t": s, "q": {joint: rad}, "hands": {"left"|"right": [6 x 0-1000]}}], t > 0 and
+    strictly increasing, at most TRAJ_MAX_POINTS and TRAJ_MAX_S. The FIRST point names every
+    joint the trajectory moves; a later point may leave one out (it holds). Between points, and
+    from `start` (the measured pose, when known) to the first one, no joint may need more than
+    `max_vel` rad/s: the sender would never keep up, and the motion would lag its own clock."""
+    max_vel = JOINT_CTL_MAX_VEL if max_vel is None else max_vel
+    if not isinstance(points, list) or not points:
+        raise ValueError("points must be a non-empty list")
+    if len(points) > TRAJ_MAX_POINTS:
+        raise ValueError(f"at most {TRAJ_MAX_POINTS} points")
+    out, prev_t, prev_q = [], 0.0, dict(start or {})
+    for n, p in enumerate(points):
+        if not isinstance(p, dict):
+            raise ValueError(f"point {n} must be an object")
+        t, q, hands = p.get("t"), p.get("q") or {}, p.get("hands") or {}
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+            raise ValueError(f"point {n}: t must be a number of seconds")
+        if t <= prev_t:
+            raise ValueError(f"point {n}: t must be after the previous point (and > 0)")
+        if t > TRAJ_MAX_S:
+            raise ValueError(f"point {n}: at most {TRAJ_MAX_S:g} s in all")
+        if not isinstance(q, dict) or not isinstance(hands, dict):
+            raise ValueError(f"point {n}: q and hands must be objects")
+        if n == 0 and not q:
+            raise ValueError("the first point must name the joints the trajectory moves")
+        if n > 0 and set(q) - set(out[0][1]):
+            raise ValueError(f"point {n}: a joint not in the first point")
+        for name, v in q.items():
+            if name not in allowed:
+                raise ValueError(f"point {n}: joint not allowed: {name}")
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"point {n}: {name} must be a number of radians")
+            if name in prev_q and abs(v - prev_q[name]) / (t - prev_t) > max_vel + 1e-9:
+                raise ValueError(f"point {n}: {name} would move faster than {max_vel:g} rad/s")
+        for side, fingers in hands.items():
+            if side not in ("left", "right") or not isinstance(fingers, list) or len(fingers) != 6 \
+                    or not all(isinstance(f, (int, float)) and not isinstance(f, bool)
+                               and math.isfinite(f) for f in fingers):
+                raise ValueError(f"point {n}: hands are {{left|right: [6 numbers 0-1000]}}")
+        prev_q.update({k: float(v) for k, v in q.items()})
+        out.append((float(t), {k: float(v) for k, v in q.items()},
+                    {side: [round(min(1000.0, max(0.0, f))) for f in fingers]
+                     for side, fingers in hands.items()}))
+        prev_t = t
+    return out
+
+
+class Trajectory:
+    """Runs ONE validated trajectory inside a control session, on its own thread.
+
+    Every 1/TRAJ_HZ s it sends the sender one `targets` line: the pose interpolated for that
+    instant (from the measured pose to the first point, then point to point), and each point's
+    finger targets once its time comes. The planner contract (G1.md §6.9): progress while it
+    runs; a result — success (every joint within TRAJ_TOL of the last point, measured), uncertain
+    (not there TRAJ_SETTLE_S after the end, or no measured pose to tell), failure (a stall, a hot
+    motor, the release, the sender refusing) — and cancel, which freezes the arm where it is."""
+
+    def __init__(self, ctl, points, start=None, measured=None):
+        self.ctl = ctl
+        self.points = points
+        self.start = dict(start or {})
+        self.measured = measured or (lambda: None)
+        self.hz, self.tol, self.settle_s = TRAJ_HZ, TRAJ_TOL, TRAJ_SETTLE_S
+        self.joints = list(points[0][1])
+        self.duration = points[-1][0]
+        self.state, self.reason, self.error = "running", None, None
+        self.t = 0.0
+        self.cancelled = threading.Event()
+        self._last = {}
+        self._hands_done = 0
+        self.thread = threading.Thread(target=self._run, name="trajectory", daemon=True)
+
+    def pose_at(self, t):
+        """The pose for instant `t`, linear between points; before the first point, from the
+        measured start (a joint with no start goes straight to the first point's value)."""
+        prev_t, prev = 0.0, {j: self.start.get(j, self.points[0][1][j]) for j in self.joints}
+        for pt, q, _hands in self.points:
+            nxt = {**prev, **q}
+            if t <= pt:
+                f = (t - prev_t) / (pt - prev_t)
+                return {j: prev[j] + (nxt[j] - prev[j]) * f for j in self.joints}
+            prev_t, prev = pt, nxt
+        return prev
+
+    def snapshot(self):
+        return {"state": self.state, "reason": self.reason, "t": round(self.t, 2),
+                "duration": self.duration, "points": len(self.points),
+                "error_rad": None if self.error is None else round(self.error, 3)}
+
+    def _finish(self, state, reason=None):
+        self.state, self.reason = state, reason
+
+    def _send(self, line):
+        with self.ctl.lock:
+            if not self.ctl.busy() or self.ctl.traj is not self:
+                return "err no control session"
+            return self.ctl._send(line)
+
+    def _arrival_error(self):
+        q = self.measured()
+        if q is None:
+            return None
+        final = self.pose_at(self.duration)
+        return max(abs(q[j] - final[j]) for j in self.joints if j in q) if self.joints else 0.0
+
+    def _run(self):
+        # The joint stream runs only while someone watches: the trajectory watches too, so its
+        # arrival is checked even with the Joints page closed.
+        stream = self.ctl.stream
+        watching = stream is not None and stream.subscribe()
+        try:
+            self._loop()
+        finally:
+            if watching:
+                stream.unsubscribe()
+
+    def _loop(self):
+        t0, seq0 = time.monotonic(), self.ctl.event_seq
+        period = 1.0 / self.hz
+        while True:
+            self.t = time.monotonic() - t0
+            if self.cancelled.is_set():
+                # Freeze: the goal becomes where the arm IS (or the last pose sent), so the
+                # sender stops it with its own deceleration instead of finishing the motion.
+                here = self.measured() or self._last
+                if here:
+                    self._send("targets " + " ".join(f"{j} {here[j]:.4f}"
+                                                     for j in self.joints if j in here))
+                return self._finish("cancelled", "cancel asked")
+            if self.ctl.event_seq != seq0:
+                ev = self.ctl.last_event or ""
+                if ev.startswith(("stall", "released", "hot", "deadman")):
+                    return self._finish("failure", ev)
+                seq0 = self.ctl.event_seq
+            pose = self.pose_at(min(self.t, self.duration))
+            reply = self._send("targets " + " ".join(f"{j} {v:.4f}" for j, v in pose.items()))
+            if not reply.startswith("ok"):
+                return self._finish("failure", reply)
+            self._last = pose
+            while self._hands_done < len(self.points) and \
+                    self.points[self._hands_done][0] <= self.t:
+                for side, fingers in self.points[self._hands_done][2].items():
+                    for f, pos in enumerate(fingers):
+                        reply = self._send(f"hand {side} {f} {pos}")
+                        if not reply.startswith("ok"):
+                            return self._finish("failure", reply)
+                self._hands_done += 1
+            if self.t >= self.duration:
+                self.error = self._arrival_error()
+                if self.error is not None and self.error <= self.tol:
+                    return self._finish("success")
+                if self.t >= self.duration + self.settle_s:
+                    return self._finish("uncertain", "no measured pose to check" if self.error
+                                        is None else f"still {self.error:.3f} rad from the end")
+            time.sleep(max(0.0, period - (time.monotonic() - t0 - self.t)))
+
+
 class JointControl:
     """One g1_joint_sender child per control SESSION: moving single arm joints from the page.
 
@@ -1110,8 +1288,10 @@ class JointControl:
         stop_move from anywhere releases the arm (release_all).
     """
 
-    def __init__(self, argv, cmd_sender=None, order=None, reply_timeout=None):
+    def __init__(self, argv, cmd_sender=None, order=None, reply_timeout=None, stream=None):
         self.argv = argv
+        self.stream = stream                # JointStream: the measured pose, for trajectories
+        self.traj = None                    # the Trajectory running in this session, if any
         self.cmd_sender = cmd_sender
         self.order = order
         self.reply_timeout = reply_timeout or REPLY_TIMEOUT
@@ -1218,14 +1398,39 @@ class JointControl:
                        excursion=JOINT_CTL_EXCURSION, margin=JOINT_CTL_MARGIN)
             return code, out
 
-    def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None):
-        """keepalive | status | target | hand | release, inside a session."""
+    def measured(self):
+        """The arm_sdk joints' measured angles from the joint stream, or None without one."""
+        stream = self.stream
+        line = stream.latest if stream is not None else None
+        try:
+            q = json.loads(line)["q"] if line else None
+            return {name: float(q[i]) for name, i in BODY_INDEX.items()} if q else None
+        except (ValueError, KeyError, IndexError, TypeError):
+            return None
+
+    def _traj_running(self):
+        return self.traj is not None and self.traj.state == "running"
+
+    def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None,
+           points=None):
+        """keepalive | status | target | hand | trajectory | cancel | release, in a session."""
+        if op == "trajectory":
+            return self._start_trajectory(session, points)
         with self.lock:
             if not self.busy() or self.session is None:
                 return 409, {"ok": False, "error": "no control session", **self.state,
                              "event": self.last_event, "event_seq": self.event_seq}
             if not isinstance(session, str) or not hmac.compare_digest(session, self.session):
                 return 409, {"ok": False, "error": "another page holds the arms"}
+            if op == "cancel":
+                if self._traj_running():
+                    self.traj.cancelled.set()
+                return 200, {"ok": True, **self.state, "trajectory":
+                             self.traj.snapshot() if self.traj else None}
+            if op in ("target", "hand") and self._traj_running():
+                return 409, {"ok": False, "error": "a trajectory is running: cancel it first"}
+            if op == "release" and self._traj_running():
+                self.traj.cancelled.set()
             if op == "target":
                 if not isinstance(joint, str) or not _JOINT_NAME.match(joint):
                     return 400, {"ok": False, "error": "joint must be a joint name"}
@@ -1253,7 +1458,29 @@ class JointControl:
                 line = op
             else:
                 return 400, {"ok": False, "error": f"unknown op {op!r}"}
-            return self._answer(self._send(line))
+            code, out = self._answer(self._send(line))
+            if self.traj is not None:
+                out["trajectory"] = self.traj.snapshot()
+            return code, out
+
+    def _start_trajectory(self, session, points):
+        """Check a trajectory against the session, the allowlist and the speed limit, then run
+        it. Answers at once; progress and the result come with every later op (status)."""
+        with self.lock:
+            if not self.busy() or self.session is None:
+                return 409, {"ok": False, "error": "no control session", **self.state}
+            if not isinstance(session, str) or not hmac.compare_digest(session, self.session):
+                return 409, {"ok": False, "error": "another page holds the arms"}
+            if self._traj_running():
+                return 409, {"ok": False, "error": "a trajectory is already running"}
+            start = self.measured()
+            try:
+                plan = validate_trajectory(points, set(JOINT_CTL_ALLOW), start)
+            except ValueError as exc:
+                return 400, {"ok": False, "error": str(exc)}
+            self.traj = Trajectory(self, plan, start=start, measured=self.measured)
+            self.traj.thread.start()
+            return 200, {"ok": True, **self.state, "trajectory": self.traj.snapshot()}
 
     def release_all(self, why):
         """Hand the arms back whoever holds them (a stop pressed anywhere, shutdown)."""
@@ -1423,6 +1650,12 @@ class Handler(BaseHTTPRequestHandler):
           {"op": "target", "session", "joint", "q": rad}   -> {ok, reply, state, w}
           {"op": "hand", "session", "side", "finger": 0-5, "pos": 0-1000}
           {"op": "keepalive" | "status" | "release", "session"}
+          {"op": "trajectory", "session", "points": [{"t": s, "q": {joint: rad},
+                                                     "hands": {side: [6 x 0-1000]}}]}
+          {"op": "cancel", "session"}                       (freezes a running trajectory)
+          Every answer in a session with a trajectory carries {"trajectory": {state, reason,
+          t, duration, points, error_rad}}: state running | success | uncertain | failure |
+          cancelled (G1.md §6.9, the planner's contract).
 
         The limits are the sender's (src/joint_ctl_core.hpp); this checks the token, the
         session and the shape of the numbers, and keeps an audit line per op that moves
@@ -1451,11 +1684,15 @@ class Handler(BaseHTTPRequestHandler):
             audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
         else:
             code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"),
-                               body.get("side"), body.get("finger"), body.get("pos"))
-            if op in ("target", "hand", "release"):
+                               body.get("side"), body.get("finger"), body.get("pos"),
+                               body.get("points"))
+            if op in ("target", "hand", "release", "trajectory", "cancel"):
+                pts = body.get("points")
                 detail = (f"{body.get('joint')}={body.get('q')}" if op == "target" else
                           f"{body.get('side')}[{body.get('finger')}]={body.get('pos')}"
-                          if op == "hand" else "release")
+                          if op == "hand" else
+                          f"trajectory points={len(pts) if isinstance(pts, list) else '-'}"
+                          if op == "trajectory" else op)
                 audit(src, "joints-control", detail, out.get("reply") or out.get("error", "-"))
         return self._json(code, out)
 
@@ -1772,7 +2009,7 @@ def main():
     # Started lazily by the first viewer, so a relay nobody watches costs nothing extra.
     srv.joints = JointStream([JOINT_BRIDGE]) if ROBOT_MODEL == "g1" else None
     # Started by "take control" and gone after the release; G1 only.
-    srv.joint_control = (JointControl([JOINT_SENDER], srv.sender, srv.order)
+    srv.joint_control = (JointControl([JOINT_SENDER], srv.sender, srv.order, stream=srv.joints)
                          if ROBOT_MODEL == "g1" else None)
     srv.joint_limiter = RateLimiter(JOINT_CTL_MAX_PER_SEC)
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,

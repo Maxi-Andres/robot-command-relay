@@ -120,6 +120,31 @@ int main() {
         check(starts(d.handle("target left_elbow 9", t, in), "ok target left_elbow 1.5000"),
               "an excursion limit, when set, clamps to that far from the start");
     }
+    // A trajectory point: several joints at once, same rules, all or nothing.
+    {
+        Controller c{Config{}};
+        Inputs in = standing();
+        long long t = 0;
+        check(starts(c.handle("targets left_elbow 1.0", t, in), "err not in control"),
+              "targets refused before take");
+        c.handle("take", t, in);
+        check(starts(c.handle("targets left_elbow 1.0 left_shoulder_pitch 0.3", t, in),
+                     "ok targets 2"), "two joints in one point");
+        check(c.goal(index_of("left_elbow")) == 1.0f &&
+                  c.goal(index_of("left_shoulder_pitch")) == 0.3f,
+              "both goals set");
+        check(starts(c.handle("targets left_elbow 1.5 waist_pitch 0.1", t, in),
+                     "err joint not allowed: waist_pitch"), "a locked joint refuses the point");
+        check(c.goal(index_of("left_elbow")) == 1.0f, "and the point is not half applied");
+        check(starts(c.handle("targets left_elbow nan", t, in), "err targets needs"),
+              "NaN refused");
+        check(starts(c.handle("targets left_elbow", t, in), "err targets needs"),
+              "a joint without an angle refused");
+        check(starts(c.handle("targets", t, in), "err targets needs"), "an empty point refused");
+        c.handle("targets right_elbow 9", t, in);
+        check(std::fabs(c.goal(index_of("right_elbow")) - 2.0444f) < 1e-3f,
+              "clamped to the URDF range minus the margin, like target");
+    }
     // Rule 5: speed and smoothness — capped speed, capped acceleration, no overshoot.
     {
         Controller c{Config{}};

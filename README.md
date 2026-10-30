@@ -148,7 +148,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | UDP `RELAY_UDP_PORT` | `move` / `stop_move` datagrams, 40 bytes, HMAC; an authenticated one is answered with a 28-byte ack, anything else with silence |
 | `GET /joints/stream` | **G1 only, read-only.** The joint state for the app's Joints page: one JSON line per tick (`src/g1_joint_bridge.cpp` documents the fields) until the caller hangs up, `{"stale": true}` when nothing new arrives within 1 s. Same token |
 | `GET /audio/listen?seconds=N` | **G1 only.** N seconds (at most `MIC_MAX_S`, 15) of the robot's own microphone as a 16 kHz mono WAV. The relay switches the voice service's mic mode on (voice API 1008, through `g1_audio_sender`), reads PC1's multicast `239.168.123.161:5555` — which never leaves the robot's internal network — and switches the mode off after `MIC_IDLE_OFF_S` (60) without a listen. 504 when no audio arrives within 3 s, 409 while another listen records. Same token |
-| `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| hand \| keepalive \| status \| release, session, joint?, q?, side?, finger?, pos?}` (`hand`: one finger, 0 open .. 1000 closed). One session at a time. Same token |
+| `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| hand \| keepalive \| status \| release, session, joint?, q?, side?, finger?, pos?}` (`hand`: one finger, 0 open .. 1000 closed); `{op: trajectory, session, points}` and `{op: cancel, session}` (below). One session at a time. Same token |
 
 ### The joint stream (G1)
 
@@ -176,6 +176,20 @@ the body; the torque spent holding the arm's own weight is taken out first, `src
 or merely lifting the arm forward tripped it) and a temperature release (75 °C). The arm model is
 generated from the URDF by `tools/gen_g1_arm_model.py` into `src/g1_arm_model.hpp`. It is plain C++ with no SDK, so CI tests it:
 `pytest tests/test_joint_ctl_core.py` (builds `tests/joint_ctl_test.cpp` with g++).
+
+**Trajectories** (2026-10-30): a planner (GR00T, an IK, a replayed demo) hands the arm a whole
+motion — `{op: "trajectory", session, points: [{t: s, q: {joint: rad}, hands?: {left|right: [6 x
+0-1000]}}]}`. The relay checks it before anything moves (t > 0 and increasing, at most 60 s and
+600 points, allowed joints only, the first point names every joint it moves, and **no joint
+faster than `JOINT_CTL_MAX_VEL`**, from where the arm is measured to be and between points),
+then feeds the sender one `targets` line (every joint of the point at once, all or nothing) 20
+times a second, interpolating; each point's fingers go when its time comes. Every rule of the
+core still applies. Every answer in the session carries `trajectory: {state, reason, t,
+duration, points, error_rad}`, the planner's contract (`G1.md` §6.9): `running`, then `success`
+(every joint within 0.05 rad of the last point, measured on the joint stream), `uncertain` (not
+there 3 s after the end, or no measured pose), `failure` (a stall, a hot motor, the release, a
+refusal) or `cancelled` — `{op: "cancel"}` freezes the arm where it is. While one runs, `target`
+and `hand` are refused.
 
 While a session is open the relay keeps the robot standing: `take` sends `stop_move` first;
 `move` and the arm actions are refused with 409 on HTTP and dropped on UDP; and a `stop_move`

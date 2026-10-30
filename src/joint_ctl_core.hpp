@@ -69,8 +69,11 @@
 //      2026-10-22), so this has never really been measured.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
-//   take  |  target <joint> <rad>  |  hand <left|right> <finger 0-5> <pos 0-1000>
-//   keepalive  |  status  |  release
+//   take  |  target <joint> <rad>  |  targets <joint> <rad> [<joint> <rad> ...]
+//   hand <left|right> <finger 0-5> <pos 0-1000>  |  keepalive  |  status  |  release
+// `targets` is one point of a trajectory (the relay's, 2026-10-30): every joint in it moves
+// together, under the same rules as `target`, and it is all or nothing — one bad joint and
+// none of them change.
 // Every reply is one line, "ok ..." or "err ...", ending in " state=<s> w=<weight>".
 // Asynchronous events come as "ev <what>" lines.
 #pragma once
@@ -262,18 +265,42 @@ public:
             if (state_ != State::Up && state_ != State::Active)
                 return reply("err not in control");
             touch(now_ms);
-            const Joint& j = JOINTS[i];
-            float lo = j.lo + cfg_.margin, hi = j.hi - cfg_.margin;
-            if (cfg_.max_excursion > 0) {
-                lo = std::max(lo, origin_[i] - cfg_.max_excursion);
-                hi = std::min(hi, origin_[i] + cfg_.max_excursion);
-            }
-            goal_[i] = std::min(hi, std::max(lo, v));
+            goal_[i] = clamp_goal(i, v);
             std::ostringstream os;
             os << "ok target " << name << ' ' << fmt(goal_[i]);
             return reply(os.str());
         }
+        if (verb == "targets") {
+            // Checked whole before anything changes: a point is never half applied.
+            std::vector<std::pair<int, float>> point;
+            std::string name;
+            float v = 0;
+            while (is >> name) {
+                if (!(is >> v) || !std::isfinite(v)) return reply("err targets needs joint rad pairs");
+                const int i = index_of(name);
+                if (i < 0 || !cfg_.allowed.count(name) || is_locked(name))
+                    return reply("err joint not allowed: " + name);
+                point.emplace_back(i, v);
+            }
+            if (point.empty()) return reply("err targets needs joint rad pairs");
+            if (state_ != State::Up && state_ != State::Active)
+                return reply("err not in control");
+            touch(now_ms);
+            for (const auto& [i, q] : point) goal_[i] = clamp_goal(i, q);
+            return reply("ok targets " + std::to_string(point.size()));
+        }
         return reply("err unknown verb");
+    }
+
+    // Rule 4 for one joint: the URDF range minus the margin, and the excursion limit when set.
+    float clamp_goal(int i, float v) const {
+        const Joint& j = JOINTS[i];
+        float lo = j.lo + cfg_.margin, hi = j.hi - cfg_.margin;
+        if (cfg_.max_excursion > 0) {
+            lo = std::max(lo, origin_[i] - cfg_.max_excursion);
+            hi = std::min(hi, origin_[i] + cfg_.max_excursion);
+        }
+        return std::min(hi, std::max(lo, v));
     }
 
     // stdin closed: the relay is gone. Never leave the arm held by a dead caller.
