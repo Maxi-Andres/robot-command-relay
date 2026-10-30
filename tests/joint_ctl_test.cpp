@@ -145,6 +145,110 @@ int main() {
         check(std::fabs(c.goal(index_of("right_elbow")) - 2.0444f) < 1e-3f,
               "clamped to the URDF range minus the margin, like target");
     }
+    // Rule 12: grasp by touch.
+    {
+        auto hand_in = []() {
+            Inputs in = standing();
+            in.hand_ok[1] = true;                                   // the right hand answers
+            for (int f = 0; f < 6; ++f) in.hand_pos[1][f] = f < 2 ? 400 : 50;
+            in.touch_ok[1] = true;
+            for (int k = 0; k < 5; ++k) in.touch_valid[1][k] = true;
+            return in;
+        };
+        int pos[6], spd[6];
+        // Held: the thumb and the index touch. Every flexing finger stops where it is + squeeze.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            check(starts(c.handle("grasp right", t, in), "err not in control"),
+                  "grasp refused before take");
+            c.handle("take", t, in);
+            check(starts(c.handle("grasp left", t, in), "err left hand not available"),
+                  "a hand that did not answer at take cannot grasp");
+            check(starts(c.handle("grasp right -1", t, in), "err grasp force"), "a bad force refused");
+            check(starts(c.handle("grasp right", t, in), "ok grasp right 1.0000"), "grasp accepted");
+            check(c.hand_due(1, t, pos, spd) && pos[0] == 1000 && pos[2] == 1000 && pos[5] == 1000 &&
+                      pos[1] == 400,
+                  "closes the flexing fingers, not the thumb's rotation");
+            c.hand_written(1, t, pos);
+            std::vector<std::string> ev;
+            run(c, t, 0.2f, in, ev);
+            check(!has(ev, "grasp"), "nothing decided while nothing touches");
+            for (int f = 0; f < 6; ++f) in.hand_pos[1][f] = 600;
+            in.touch_n[1][0] = 1.5f;                                 // thumb
+            run(c, t, 0.1f, in, ev);
+            check(!has(ev, "grasp"), "the thumb alone is not a grasp");
+            in.touch_n[1][1] = 2.0f;                                 // index
+            run(c, t, 0.1f, in, ev);
+            check(has(ev, "grasp right held 1.50 2.00 0.00 0.00 0.00"), "thumb + index = held");
+            check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 630 && pos[2] == 630 && pos[1] == 400,
+                  "it stops at where the fingers are, squeezing a little, rotation untouched");
+            check(starts(c.handle("open right", t, in), "ok open right"), "open accepted");
+            check(c.hand_due(1, t + 2000, pos, spd) && pos[0] == 0 && pos[3] == 0 && pos[1] == 400,
+                  "open: the flexing fingers to 0");
+        }
+        // A void reading never counts, however high.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right 0.5", t, in);
+            in.touch_n[1][0] = 3.0f;
+            in.touch_n[1][2] = 5.0f;
+            in.touch_valid[1][2] = false;                            // the middle's stuck bit
+            std::vector<std::string> ev;
+            run(c, t, 0.2f, in, ev);
+            check(!has(ev, "grasp"), "a void fingertip reading is not a touch");
+            in.hand_state[1][3] = 2;                                 // ... but its motor stalls
+            run(c, t, 0.1f, in, ev);
+            check(has(ev, "grasp right held 3.00 0.00 -"), "a stalled motor counts, as the fallback");
+        }
+        // Empty: every flexing finger closed, nothing touched.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right", t, in);
+            for (int f = 0; f < 6; ++f) in.hand_pos[1][f] = f == 1 ? 400 : 980;
+            std::vector<std::string> ev;
+            run(c, t, 0.1f, in, ev);
+            check(has(ev, "grasp right empty"), "closed all the way with no touch = empty");
+        }
+        // Undecided: the time runs out; the fingers stop where they are.
+        {
+            Config cfg;
+            cfg.grasp_ms = 500;
+            Controller c{cfg};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right", t, in);
+            c.hand_due(1, t, pos, spd);
+            c.hand_written(1, t, pos);
+            for (int f = 0; f < 6; ++f) in.hand_pos[1][f] = 500;
+            std::vector<std::string> ev;
+            run(c, t, 0.6f, in, ev);
+            check(has(ev, "grasp right uncertain"), "undecided in grasp_ms = uncertain");
+            check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 500 && pos[5] == 500,
+                  "and it stops closing where it is");
+        }
+        // A release ends a grasp: nothing is decided after it.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right", t, in);
+            c.handle("release", t, in);
+            in.touch_n[1][0] = in.touch_n[1][1] = 3.0f;
+            std::vector<std::string> ev;
+            run(c, t, 0.1f, in, ev, false);
+            check(!has(ev, "grasp"), "no grasp decided after a release");
+        }
+    }
     // Rule 5: speed and smoothness — capped speed, capped acceleration, no overshoot.
     {
         Controller c{Config{}};

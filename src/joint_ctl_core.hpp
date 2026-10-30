@@ -63,14 +63,27 @@
 //      with no feedback from its own sag or sensor noise. Scaled by the hand-over weight (rises
 //      with `take`, falls with the release, 0 in the last message), capped at ff_max_frac of
 //      each joint's rated effort, and zero for a tick whose pose or tilt is not finite.
-//      ff_gain 0 turns it off (JOINT_CTL_FEEDFORWARD=0). The first try, 2026-10-16, felt worse —
+//      ff_gain 0 turns it off (JOINT_CTL_FEEDFORWARD=0).
+//  12. GRASP BY TOUCH (2026-10-30). `grasp <side> [N]` closes that hand's flexing fingers (the
+//      thumb's flex and the four fingers; the thumb's rotation stays where it is) at hand_speed,
+//      and every tick looks at the fingertips (Revo 2 Touch, 4200-4229). A finger is TOUCHING
+//      when its fingertip's normal force is at least N (grasp_force, 1 N by default) on a VALID
+//      reading — status bits 0-2 clear: a stuck bit held one at 0.05 N with nothing on it — or,
+//      the fallback, when its motor reports stalled (state 2). When the thumb and at least one
+//      other finger touch, every flexing finger stops at where it IS plus grasp_squeeze (of
+//      1000), so the grip holds without closing further: "ev grasp <side> held <forces>". All of
+//      them past grasp_closed with no touch: "ev grasp <side> empty" (nothing in the hand). Not
+//      decided in grasp_ms: stop where they are, "ev grasp <side> uncertain". The hand still
+//      limits its own current, so a grip is never harder than the hand allows. `open <side>`
+//      opens the flexing fingers. A release ends any grasp (rule 10 puts the hands back). The first try, 2026-10-16, felt worse —
 //      but that night the relay's CPUQuota=25% was freezing the whole process in bursts: the
 //      unit with CPUWeight was written but not yet installed on the robot. It is now (checked
 //      2026-10-22), so this has never really been measured.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
 //   take  |  target <joint> <rad>  |  targets <joint> <rad> [<joint> <rad> ...]
-//   hand <left|right> <finger 0-5> <pos 0-1000>  |  keepalive  |  status  |  release
+//   hand <left|right> <finger 0-5> <pos 0-1000>  |  grasp <left|right> [newtons]
+//   open <left|right>  |  keepalive  |  status  |  release
 // `targets` is one point of a trajectory (the relay's, 2026-10-30): every joint in it moves
 // together, under the same rules as `target`, and it is all or nothing — one bad joint and
 // none of them change.
@@ -166,6 +179,10 @@ struct Config {
     long hand_min_ms = 50;            // ... at most one write per hand this often
     float ff_gain = 1.0f;             // rule 11: share of the modelled holding torque sent; 0 = off
     float ff_max_frac = 0.5f;         // ... never more than this share of a joint's rated effort
+    float grasp_force = 1.0f;         // rule 12: N on a valid fingertip reading = touching
+    long grasp_ms = 4000;             // ... how long a grasp may take to decide
+    int grasp_squeeze = 30;           // ... of 1000: how far past the touch point it holds
+    int grasp_closed = 950;           // ... every finger past this with no touch = empty hand
 };
 
 // What the robot reports, as the caller last saw it.
@@ -179,10 +196,19 @@ struct Inputs {
     long fsm_age_ms = -1;             // since the last successful FSM read; -1 = never
     bool hand_ok[2] = {false, false}; // left, right: answering right now
     int hand_pos[2][6] = {};          // their fingers, 0 open .. 1000 closed
+    int hand_state[2][6] = {};        // their motors: 0 idle, 1 running, 2 stalled, 3 turbo
+    bool touch_ok[2] = {false, false};    // rule 12: a fresh touch block from that hand
+    float touch_n[2][5] = {};             // ... fingertip normal force, N, thumb .. pinky
+    bool touch_valid[2][5] = {};          // ... status bits 0-2 clear
 };
 
 constexpr int HAND_FINGERS = 6;
 inline int hand_side(const std::string& s) { return s == "left" ? 0 : s == "right" ? 1 : -1; }
+// Rule 12: the motors a grasp closes (all but the thumb's rotation, motor 1), and which of the
+// five fingertips each motor ends in.
+constexpr int GRASP_FINGERS[] = {0, 2, 3, 4, 5};
+constexpr int TIP_OF_MOTOR[HAND_FINGERS] = {0, 0, 1, 2, 3, 4};
+inline const char* side_name(int h) { return h == 0 ? "left" : "right"; }
 
 // What to publish this tick. publish=false: send nothing at all.
 struct Output {
@@ -254,6 +280,31 @@ public:
             hand_dirty_[h] = true;
             return reply("ok hand " + side + " " + std::to_string(finger) + " " +
                          std::to_string(hand_goal_[h][finger]));
+        }
+        if (verb == "grasp" || verb == "open") {
+            std::string side;
+            if (!(is >> side)) return reply("err " + verb + " needs a side");
+            const int h = hand_side(side);
+            if (h < 0) return reply("err no such hand: " + side);
+            float force = cfg_.grasp_force;
+            if (verb == "grasp" && (is >> force) && !(std::isfinite(force) && force > 0.0f))
+                return reply("err grasp force must be a positive number of newtons");
+            if (state_ != State::Up && state_ != State::Active)
+                return reply("err not in control");
+            if (!hand_taken_[h]) return reply("err " + side + " hand not available");
+            touch(now_ms);
+            for (int f : GRASP_FINGERS) hand_goal_[h][f] = verb == "grasp" ? 1000 : 0;
+            hand_dirty_[h] = true;
+            if (verb == "open") {
+                grasping_[h] = false;
+                return reply("ok open " + side);
+            }
+            grasping_[h] = true;
+            grasp_since_[h] = now_ms;
+            grasp_force_[h] = std::min(20.0f, force);
+            std::ostringstream os;
+            os << "ok grasp " << side << ' ' << fmt(grasp_force_[h]);
+            return reply(os.str());
         }
         if (verb == "target") {
             std::string name;
@@ -395,6 +446,10 @@ public:
             }
         }
 
+        // Rule 12: a grasp in progress decides from the fingertips.
+        if (state_ == State::Up || state_ == State::Active)
+            for (int h = 0; h < 2; ++h) grasp_step(h, now_ms, in, ev);
+
         // Rule 5: towards the goal at most max_vel, speed changing at most max_acc, braking so
         // as to stop on the goal (v = sqrt(2·a·d) is the fastest speed that still can).
         for (int i = 0; i < N; ++i) step_joint(i, dt);
@@ -436,9 +491,55 @@ private:
     int hand_goal_[2][HAND_FINGERS] = {};
     int hand_origin_[2][HAND_FINGERS] = {};
     long long hand_sent_ms_[2] = {-1000000, -1000000};
+    bool grasping_[2] = {false, false};   // rule 12
+    long long grasp_since_[2] = {0, 0};
+    float grasp_force_[2] = {0.0f, 0.0f};
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
+
+    // Rule 12 for hand h, one tick.
+    void grasp_step(int h, long long now_ms, const Inputs& in, std::vector<std::string>& ev) {
+        if (!grasping_[h] || !in.hand_ok[h]) return;
+        bool touching[HAND_FINGERS] = {};
+        bool any_other = false, all_closed = true;
+        for (int f : GRASP_FINGERS) {
+            const int tip = TIP_OF_MOTOR[f];
+            touching[f] = (in.touch_ok[h] && in.touch_valid[h][tip] &&
+                           in.touch_n[h][tip] >= grasp_force_[h]) ||
+                          in.hand_state[h][f] == 2;
+            if (f != 0 && touching[f]) any_other = true;
+            if (in.hand_pos[h][f] < cfg_.grasp_closed) all_closed = false;
+        }
+        const char* outcome = nullptr;
+        if (touching[0] && any_other) {
+            outcome = "held";
+        } else if (all_closed) {
+            outcome = "empty";
+        } else if (now_ms - grasp_since_[h] >= cfg_.grasp_ms) {
+            outcome = "uncertain";
+        }
+        if (!outcome) return;
+        grasping_[h] = false;
+        if (outcome[0] != 'e') {
+            // Held or undecided: every flexing finger stops where it is (a held one a little
+            // further in, so the grip does not slacken), instead of closing on.
+            const int squeeze = outcome[0] == 'h' ? cfg_.grasp_squeeze : 0;
+            for (int f : GRASP_FINGERS)
+                hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f] + squeeze));
+            hand_dirty_[h] = true;
+        }
+        std::ostringstream os;
+        os << "grasp " << side_name(h) << ' ' << outcome;
+        os.setf(std::ios::fixed);
+        os.precision(2);
+        for (int tip = 0; tip < 5; ++tip) {
+            os << ' ';
+            if (in.touch_ok[h] && in.touch_valid[h][tip]) os << in.touch_n[h][tip];
+            else os << '-';
+        }
+        ev.push_back(os.str());
+    }
 
     // Where joint i comes to rest if it brakes now at max_acc.
     float stopping_point(int i) const {
@@ -556,6 +657,7 @@ private:
             }
             hand_dirty_[h] = hand_dirty_[h] || moved;
         }
+        grasping_[0] = grasping_[1] = false;
         release_reason_ = why;
         state_ = State::Down;
         pending_.push_back("releasing " + why);

@@ -191,6 +191,14 @@ there 3 s after the end, or no measured pose), `failure` (a stall, a hot motor, 
 refusal) or `cancelled` — `{op: "cancel"}` freezes the arm where it is. While one runs, `target`
 and `hand` are refused.
 
+**Grasp by touch** (rule 12, 2026-10-30): `{op: "grasp", session, side, force?}` closes that hand's
+flexing fingers (not the thumb's rotation) and stops when the thumb and one more fingertip read at
+least `force` N (1 by default, `GRASP_FORCE_N`) on a valid reading, or their motor stalls — then
+holds a little past that point. Every answer carries `grasp: {left|right: {state, forces}}`:
+`closing`, then `held` (with the five fingertip forces), `empty` (closed with nothing in it) or
+`uncertain` (not decided in `GRASP_MS`, 4 s). `{op: "open", session, side}` opens it. The joint
+stream carries the fingertips too: `left|right.touch`, five newtons, `null` for a void reading.
+
 While a session is open the relay keeps the robot standing: `take` sends `stop_move` first;
 `move` and the arm actions are refused with 409 on HTTP and dropped on UDP; and a `stop_move`
 from anywhere releases the arm. Only one page holds the arms (the session id), and the AI-VL

@@ -1305,6 +1305,9 @@ class JointControl:
         # stalls of the same joint in a row would read the same; the count tells the page there
         # was a second one.
         self.event_seq = 0
+        # Rule 12 of the sender: each hand's last grasp, for the planner's contract (G1.md §6.9):
+        # {"state": closing | held | empty | uncertain, "forces": [5 x N or None]}.
+        self.grasp = {"left": None, "right": None}
 
     def busy(self):
         """True while a session holds (or is handing back) the arms."""
@@ -1317,6 +1320,11 @@ class JointControl:
             if line.startswith("ev "):
                 self.last_event = line[3:]
                 self.event_seq += 1
+                parts = line.split()
+                if len(parts) >= 4 and parts[1] == "grasp" and parts[2] in self.grasp:
+                    self.grasp[parts[2]] = {
+                        "state": parts[3],
+                        "forces": [None if f == "-" else float(f) for f in parts[4:9]]}
                 log(f"joint control: {line}")
                 audit("-", "joints-control", "event", line[3:])
                 if line.startswith("ev released"):
@@ -1359,7 +1367,8 @@ class JointControl:
         ok = reply.startswith("ok")
         m = _JOINT_REPLY.match(reply)
         out = {"ok": ok, "reply": m.group(2).strip() if m else reply, **self.state,
-               "event": self.last_event, "event_seq": self.event_seq}
+               "event": self.last_event, "event_seq": self.event_seq,
+               "grasp": dict(self.grasp)}
         return (200 if ok else code_err), out
 
     def take(self):
@@ -1384,6 +1393,7 @@ class JointControl:
             log(f"joint sender started (pid {self.proc.pid})")
             self.last_event = None
             self.event_seq = 0
+            self.grasp = {"left": None, "right": None}
             threading.Thread(target=self._read, args=(self.proc,), name="joint-sender",
                              daemon=True).start()
             # Longer than an op: the sender first joins DDS and reads the robot once (~1.5 s).
@@ -1413,7 +1423,8 @@ class JointControl:
 
     def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None,
            points=None):
-        """keepalive | status | target | hand | trajectory | cancel | release, in a session."""
+        """keepalive | status | target | hand | grasp | open | trajectory | cancel | release,
+        in a session. `grasp` and `open` take `side`; `grasp` an optional force in `pos` (N)."""
         if op == "trajectory":
             return self._start_trajectory(session, points)
         with self.lock:
@@ -1454,6 +1465,21 @@ class JointControl:
                 if not math.isfinite(pos):
                     return 400, {"ok": False, "error": "pos must be finite"}
                 line = f"hand {side} {finger} {round(min(1000.0, max(0.0, pos)))}"
+            elif op in ("grasp", "open"):
+                # Rule 12 of the sender: close until the fingertips confirm, or open.
+                if side not in ("left", "right"):
+                    return 400, {"ok": False, "error": "side must be left or right"}
+                line = f"{op} {side}"
+                if op == "grasp" and pos is not None:
+                    try:
+                        force = float(pos)
+                    except (TypeError, ValueError):
+                        return 400, {"ok": False, "error": "force must be a number of newtons"}
+                    if not (math.isfinite(force) and 0.2 <= force <= 10):
+                        return 400, {"ok": False, "error": "force must be 0.2-10 N"}
+                    line += f" {force:.2f}"
+                if op == "grasp":
+                    self.grasp[side] = {"state": "closing", "forces": None}
             elif op in ("keepalive", "status", "release"):
                 line = op
             else:
@@ -1653,6 +1679,10 @@ class Handler(BaseHTTPRequestHandler):
           {"op": "trajectory", "session", "points": [{"t": s, "q": {joint: rad},
                                                      "hands": {side: [6 x 0-1000]}}]}
           {"op": "cancel", "session"}                       (freezes a running trajectory)
+          {"op": "grasp", "session", "side", "force"?: N}   (close until the fingertips confirm)
+          {"op": "open", "session", "side"}
+          Every answer carries {"grasp": {"left"|"right": {state: closing | held | empty |
+          uncertain, forces: [5 x N or null]} | null}} (rule 12 of joint_ctl_core.hpp).
           Every answer in a session with a trajectory carries {"trajectory": {state, reason,
           t, duration, points, error_rad}}: state running | success | uncertain | failure |
           cancelled (G1.md §6.9, the planner's contract).
@@ -1683,16 +1713,18 @@ class Handler(BaseHTTPRequestHandler):
             code, out = ctl.take()
             audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
         else:
+            pos = body.get("force") if op == "grasp" else body.get("pos")
             code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"),
-                               body.get("side"), body.get("finger"), body.get("pos"),
+                               body.get("side"), body.get("finger"), pos,
                                body.get("points"))
-            if op in ("target", "hand", "release", "trajectory", "cancel"):
+            if op in ("target", "hand", "release", "trajectory", "cancel", "grasp", "open"):
                 pts = body.get("points")
                 detail = (f"{body.get('joint')}={body.get('q')}" if op == "target" else
                           f"{body.get('side')}[{body.get('finger')}]={body.get('pos')}"
                           if op == "hand" else
                           f"trajectory points={len(pts) if isinstance(pts, list) else '-'}"
-                          if op == "trajectory" else op)
+                          if op == "trajectory" else
+                          f"{op} {body.get('side')}" if op in ("grasp", "open") else op)
                 audit(src, "joints-control", detail, out.get("reply") or out.get("error", "-"))
         return self._json(code, out)
 

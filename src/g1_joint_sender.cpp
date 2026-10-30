@@ -10,7 +10,8 @@
 // WHAT IT TOUCHES
 //   reads    rt/lowstate          the joints' measured positions (where control starts)
 //            the loco service     the robot's FSM, every FSM_POLL_MS (GetFsmId, an RPC)
-//            the BrainCo hands    finger positions over Modbus (src/brainco_modbus.hpp), 50 Hz
+//            the BrainCo hands    finger positions, motor states and fingertip touch over
+//                                 Modbus (src/brainco_modbus.hpp), 50 Hz
 //   writes   rt/arm_sdk           only between `take` and the end of the release ramp
 //            the BrainCo hands    finger targets (src/brainco_command.hpp: registers 1022-1033
 //                                 only), only when the page moves a finger, inside a session
@@ -28,6 +29,8 @@
 //   JOINT_CTL_DEADMAN_MS / JOINT_CTL_RELEASE_MS                        (1000 / 5000)
 //   HAND_SPEED          finger speed, of the hand's 1..1000 (capped at 600)  (300)
 //   HANDS               0 = leave the hands alone                     (1)
+//   GRASP_FORCE_N / GRASP_MS  rule 12: fingertip newtons that count as touching, and how long
+//                       a grasp may take to decide                   (1.0 / 4000)
 // The caps are here and not only in relay.env so that a typo cannot make an arm fast.
 
 #include "brainco_command.hpp"
@@ -100,8 +103,15 @@ struct Shared {
     int fsm = -1;
     long long fsm_at = -1;
     int hand_pos[2][6] = {};
+    int hand_state[2][6] = {};
     long long hand_at[2] = {-1, -1};
+    brainco::Touch touch[2] = {};   // rule 12: the fingertips, read with the status
+    long long touch_at[2] = {-1, -1};
+    int touch_fails[2] = {0, 0};    // in a row; a hand without touch stops being asked
 };
+// A hand whose touch block fails this many reads in a row is not asked again (each failure
+// waits out the Modbus timeout, inside the 50 Hz hand loop).
+constexpr int TOUCH_GIVE_UP = 20;
 
 constexpr long HAND_FRESH_MS = 200;   // a hand read longer ago than this does not count
 
@@ -131,6 +141,8 @@ int main() {
     cfg.max_excursion = env_f("JOINT_CTL_EXCURSION", 0.0f, 0.0f, 6.3f);
     cfg.deadman_ms = static_cast<long>(env_f("JOINT_CTL_DEADMAN_MS", 1000, 200, 5000));
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
+    cfg.grasp_force = env_f("GRASP_FORCE_N", 1.0, 0.2, 10.0);
+    cfg.grasp_ms = static_cast<long>(env_f("GRASP_MS", 4000, 500, 15000));
     cfg.hand_speed = static_cast<int>(env_f("HAND_SPEED", 300, 1, 600));
     cfg.ff_gain = env_f("JOINT_CTL_FEEDFORWARD", 1.0f, 0.0f, 1.0f);
 
@@ -200,7 +212,15 @@ int main() {
         in.fsm_age_ms = sh.fsm_at < 0 ? -1 : static_cast<long>(t - sh.fsm_at);
         for (int h = 0; h < 2; ++h) {
             in.hand_ok[h] = sh.hand_at[h] >= 0 && t - sh.hand_at[h] < HAND_FRESH_MS;
-            for (int f = 0; f < 6; ++f) in.hand_pos[h][f] = sh.hand_pos[h][f];
+            for (int f = 0; f < 6; ++f) {
+                in.hand_pos[h][f] = sh.hand_pos[h][f];
+                in.hand_state[h][f] = sh.hand_state[h][f];
+            }
+            in.touch_ok[h] = sh.touch_at[h] >= 0 && t - sh.touch_at[h] < HAND_FRESH_MS;
+            for (int k = 0; k < brainco::TOUCH_FINGERS; ++k) {
+                in.touch_n[h][k] = sh.touch[h].normal[k];
+                in.touch_valid[h][k] = sh.touch[h].valid[k];
+            }
         }
         return in;
     };
@@ -227,9 +247,27 @@ int main() {
                 if (hand_port[h]->read(hand_id[h], brainco::STATUS_ADDR, brainco::STATUS_COUNT,
                                        regs)) {
                     const auto st = brainco::decode_status(regs);
-                    std::lock_guard<std::mutex> lk(sh.mu);
-                    for (int f = 0; f < 6; ++f) sh.hand_pos[h][f] = st.pos[f];
-                    sh.hand_at[h] = now_ms();
+                    {
+                        std::lock_guard<std::mutex> lk(sh.mu);
+                        for (int f = 0; f < 6; ++f) {
+                            sh.hand_pos[h][f] = st.pos[f];
+                            sh.hand_state[h][f] = st.state[f];
+                        }
+                        sh.hand_at[h] = now_ms();
+                    }
+                    uint16_t touch[brainco::TOUCH_COUNT];
+                    if (sh.touch_fails[h] < TOUCH_GIVE_UP) {
+                        const bool ok = hand_port[h]->read(hand_id[h], brainco::TOUCH_ADDR,
+                                                           brainco::TOUCH_COUNT, touch);
+                        std::lock_guard<std::mutex> lk(sh.mu);
+                        if (ok) {
+                            sh.touch[h] = brainco::decode_touch(touch);
+                            sh.touch_at[h] = now_ms();
+                            sh.touch_fails[h] = 0;
+                        } else {
+                            ++sh.touch_fails[h];
+                        }
+                    }
                 }
                 int pos[6], speed[6];
                 bool due;

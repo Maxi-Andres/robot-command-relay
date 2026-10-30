@@ -62,6 +62,11 @@ FAKE_SENDER = textwrap.dedent("""
                 if float(q) > 9:                 # unreachable: it stalls
                     print("ev stall %s" % j, flush=True)
             print("ok targets %d state=%s w=%.2f" % (len(pairs) // 2, state, w), flush=True)
+        elif verb in ("grasp", "open"):
+            side = line.split()[1]
+            print("ok %s %s state=%s w=%.2f" % (verb, side, state, w), flush=True)
+            if verb == "grasp":                  # the fingertips confirm at once
+                print("ev grasp %s held 1.50 2.00 - 0.00 0.00" % side, flush=True)
         elif verb == "hand":
             _, side, finger, pos = line.split()
             print("ok hand %s %s %s state=%s w=%.2f" % (side, finger, pos, state, w), flush=True)
@@ -502,3 +507,26 @@ def test_trajectory_over_http(server, monkeypatch):
     code, out = _post(server, "/joints/control", {"op": "trajectory", "session": session,
                                                    "points": [{"t": 0.2, "q": {"left_elbow": 0.05}}]})
     assert code == 200 and out["trajectory"]["state"] == "running"
+
+
+# --------------------------------------------------------------------------- #
+# Grasp by touch (rule 12 of the sender)
+# --------------------------------------------------------------------------- #
+def test_grasp_reports_what_the_fingertips_said(ctl, fake):
+    session = ctl.take()[1]["session"]
+    assert ctl.op(session, "grasp", side="up")[0] == 400
+    assert ctl.op(session, "grasp", side="right", pos=50)[0] == 400, "force over 10 N refused"
+    assert ctl.op(session, "grasp", side="right", pos=1.5)[0] == 200
+    assert _wait(lambda: (ctl.op(session, "status")[1]["grasp"]["right"] or {}).get("state")
+                 == "held")
+    assert ctl.op(session, "status")[1]["grasp"]["right"]["forces"] == [1.5, 2.0, None, 0.0, 0.0]
+    assert "grasp right 1.50" in fake[1].read_text().splitlines()
+    assert ctl.op(session, "open", side="right")[0] == 200
+    assert "open right" in fake[1].read_text().splitlines()
+
+
+def test_grasp_over_http(server):
+    session = _post(server, "/joints/control", {"op": "take"})[1]["session"]
+    code, out = _post(server, "/joints/control", {"op": "grasp", "session": session,
+                                                   "side": "left", "force": 1.0})
+    assert code == 200 and out["grasp"]["left"]["state"] in ("closing", "held")
