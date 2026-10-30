@@ -224,7 +224,8 @@ int main(int argc, char** argv) {
                 reply = rc == 0 ? "ok volume " + std::to_string(level)
                                 : "err volume: set rc=" + std::to_string(rc);
             } else if (line.rfind("led ", 0) == 0) {
-                // The head LED lives in Unitree's audio client too (API 1010, LedControl).
+                // The head LED lives in Unitree's audio client too (API 1010, LedControl):
+                // the MIDDLE one. Unitree turns it back to blue within seconds (2026-10-30).
                 int r = 0, g = 0, b = 0;
                 if (sscanf(line.c_str() + 4, "%d %d %d", &r, &g, &b) != 3) {
                     reply = "err led: expected 'led R G B'";

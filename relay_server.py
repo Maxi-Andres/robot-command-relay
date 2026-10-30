@@ -1518,6 +1518,8 @@ class Handler(BaseHTTPRequestHandler):
           GET  /audio/volume                     -> {ok, volume}
           POST /audio/volume  {"level": 0-10}    -> {ok, volume}
           POST /audio/led     {"r","g","b": 0-255} -> {ok}   (the G1's head LED; the Go2 says no)
+            It is the MIDDLE LED of the head. Unitree's own service sets it back to blue a few
+            seconds later: a colour that must stay is resent about once a second (2026-10-30).
           GET  /audio/listen?seconds=N           -> a 16 kHz mono WAV of the robot's mic (G1)
           GET  /audio/mic/stream                 -> the mic as raw 16 kHz s16le, until hung up
         """
