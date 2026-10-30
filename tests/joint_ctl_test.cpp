@@ -205,17 +205,60 @@ int main() {
             run(c, t, 0.1f, in, ev);
             check(has(ev, "grasp right held 3.00 0.00 -"), "a stalled motor counts, as the fallback");
         }
-        // Empty: every flexing finger closed, nothing touched.
+        // Empty, as the robot did it (2026-10-30): the thumb closes, the index and middle stop
+        // against it at 605 and 671, everything idle, no touch.
         {
             Controller c{Config{}};
             Inputs in = hand_in();
             long long t = 0;
             c.handle("take", t, in);
             c.handle("grasp right", t, in);
-            for (int f = 0; f < 6; ++f) in.hand_pos[1][f] = f == 1 ? 400 : 980;
+            for (int f : {0, 2, 3, 4, 5}) in.hand_state[1][f] = 1;      // running
             std::vector<std::string> ev;
+            run(c, t, 0.4f, in, ev);
+            check(!has(ev, "grasp"), "nothing decided while the fingers run");
+            const int empty[6] = {999, 400, 605, 671, 999, 999};
+            for (int f = 0; f < 6; ++f) { in.hand_pos[1][f] = empty[f]; in.hand_state[1][f] = 0; }
             run(c, t, 0.1f, in, ev);
-            check(has(ev, "grasp right empty"), "closed all the way with no touch = empty");
+            check(!has(ev, "grasp"), "stopped, but not yet for the settle time");
+            run(c, t, 0.2f, in, ev);
+            check(has(ev, "grasp right empty"), "all stopped and the thumb closed = empty");
+        }
+        // Held, as the robot did it on a bottle (2026-10-30): every finger stops short (68-277),
+        // idle, current ~0, fingertips under 1 N — blocked is the contact.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right", t, in);
+            for (int f : {0, 2, 3, 4, 5}) in.hand_state[1][f] = 1;
+            std::vector<std::string> ev;
+            run(c, t, 0.4f, in, ev);
+            const int bottle[6] = {105, 400, 68, 262, 277, 91};
+            for (int f = 0; f < 6; ++f) { in.hand_pos[1][f] = bottle[f]; in.hand_state[1][f] = 0; }
+            in.touch_n[1][3] = 0.28f;
+            run(c, t, 0.3f, in, ev);
+            check(has(ev, "grasp right held 0.00 0.00 0.00 0.28 0.00"),
+                  "fingers stopped short of closing = blocked by the object = held");
+            check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 135 && pos[2] == 98,
+                  "and it holds them where they stopped, a little further in");
+        }
+        // The fingers never move at all (the targets were not taken): no "held" out of nothing.
+        {
+            Config cfg;
+            cfg.grasp_ms = 1000;
+            Controller c{cfg};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right", t, in);
+            std::vector<std::string> ev;
+            run(c, t, 0.6f, in, ev);
+            check(!has(ev, "grasp"), "a hand that never moved is not blocked: nothing decided");
+            run(c, t, 0.5f, in, ev);
+            check(has(ev, "grasp right uncertain") && !has(ev, "grasp right held"),
+                  "it runs out the clock to uncertain, never held");
         }
         // Undecided: the time runs out; the fingers stop where they are.
         {

@@ -68,12 +68,18 @@
 //      thumb's flex and the four fingers; the thumb's rotation stays where it is) at hand_speed,
 //      and every tick looks at the fingertips (Revo 2 Touch, 4200-4229). A finger is TOUCHING
 //      when its fingertip's normal force is at least N (grasp_force, 1 N by default) on a VALID
-//      reading — status bits 0-2 clear: a stuck bit held one at 0.05 N with nothing on it — or,
-//      the fallback, when its motor reports stalled (state 2). When the thumb and at least one
-//      other finger touch, every flexing finger stops at where it IS plus grasp_squeeze (of
-//      1000), so the grip holds without closing further: "ev grasp <side> held <forces>". All of
-//      them past grasp_closed with no touch: "ev grasp <side> empty" (nothing in the hand). Not
-//      decided in grasp_ms: stop where they are, "ev grasp <side> uncertain". The hand still
+//      reading — status bits 0-2 clear: a stuck bit held one at 0.05 N with nothing on it — or
+//      when it is BLOCKED: its motor stalled (state 2), or every flexing finger has stopped
+//      (none running) for grasp_settle_ms and this one stopped short of grasp_closed. Blocked is
+//      what a real grasp looks like on this hand (2026-10-30, a bottle): the Revo 2 stops a
+//      finger that meets something (state 0, current ~0, not "stalled"), at 68-277 of 1000, and
+//      the object rests on the middle of the fingers, so the fingertips read under 1 N. When the
+//      thumb and at least one other finger touch, every flexing finger stops at where it IS plus
+//      grasp_squeeze (of 1000), so the grip holds without closing further: "ev grasp <side> held
+//      <forces>". Everything stopped and the thumb closed past grasp_closed: "ev grasp <side>
+//      empty" — an empty hand's index and middle stop against the thumb, at 605 and 671, so
+//      "every finger closed" alone never came. Not decided in grasp_ms: stop where they are,
+//      "ev grasp <side> uncertain". The hand still
 //      limits its own current, so a grip is never harder than the hand allows. `open <side>`
 //      opens the flexing fingers. A release ends any grasp (rule 10 puts the hands back). The first try, 2026-10-16, felt worse —
 //      but that night the relay's CPUQuota=25% was freezing the whole process in bursts: the
@@ -182,7 +188,8 @@ struct Config {
     float grasp_force = 1.0f;         // rule 12: N on a valid fingertip reading = touching
     long grasp_ms = 4000;             // ... how long a grasp may take to decide
     int grasp_squeeze = 30;           // ... of 1000: how far past the touch point it holds
-    int grasp_closed = 950;           // ... every finger past this with no touch = empty hand
+    int grasp_closed = 950;           // ... a finger stopped short of this is blocked by something
+    long grasp_settle_ms = 200;       // ... every flexing finger stopped this long = settled
 };
 
 // What the robot reports, as the caller last saw it.
@@ -301,6 +308,8 @@ public:
             }
             grasping_[h] = true;
             grasp_since_[h] = now_ms;
+            moved_[h] = false;
+            settled_since_[h] = -1;
             grasp_force_[h] = std::min(20.0f, force);
             std::ostringstream os;
             os << "ok grasp " << side << ' ' << fmt(grasp_force_[h]);
@@ -494,6 +503,8 @@ private:
     bool grasping_[2] = {false, false};   // rule 12
     long long grasp_since_[2] = {0, 0};
     float grasp_force_[2] = {0.0f, 0.0f};
+    bool moved_[2] = {false, false};
+    long long settled_since_[2] = {-1, -1};
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
@@ -501,20 +512,33 @@ private:
     // Rule 12 for hand h, one tick.
     void grasp_step(int h, long long now_ms, const Inputs& in, std::vector<std::string>& ev) {
         if (!grasping_[h] || !in.hand_ok[h]) return;
+        // Settled: no flexing finger running, for grasp_settle_ms — and only after one HAS run.
+        // A hand that never moved (the targets never reached it) is short of closing on every
+        // finger too, and must never read as "held": it runs out the clock to "uncertain".
+        bool running = false;
+        for (int f : GRASP_FINGERS) running = running || in.hand_state[h][f] == 1;
+        if (running) {
+            moved_[h] = true;
+            settled_since_[h] = -1;
+        } else if (settled_since_[h] < 0) {
+            settled_since_[h] = now_ms;
+        }
+        const bool settled = moved_[h] && settled_since_[h] >= 0 &&
+                             now_ms - settled_since_[h] >= cfg_.grasp_settle_ms;
         bool touching[HAND_FINGERS] = {};
-        bool any_other = false, all_closed = true;
+        bool any_other = false;
         for (int f : GRASP_FINGERS) {
             const int tip = TIP_OF_MOTOR[f];
-            touching[f] = (in.touch_ok[h] && in.touch_valid[h][tip] &&
-                           in.touch_n[h][tip] >= grasp_force_[h]) ||
-                          in.hand_state[h][f] == 2;
+            const bool blocked = in.hand_state[h][f] == 2 ||
+                                 (settled && in.hand_pos[h][f] < cfg_.grasp_closed);
+            touching[f] = blocked || (in.touch_ok[h] && in.touch_valid[h][tip] &&
+                                      in.touch_n[h][tip] >= grasp_force_[h]);
             if (f != 0 && touching[f]) any_other = true;
-            if (in.hand_pos[h][f] < cfg_.grasp_closed) all_closed = false;
         }
         const char* outcome = nullptr;
         if (touching[0] && any_other) {
             outcome = "held";
-        } else if (all_closed) {
+        } else if (settled && in.hand_pos[h][0] >= cfg_.grasp_closed) {
             outcome = "empty";
         } else if (now_ms - grasp_since_[h] >= cfg_.grasp_ms) {
             outcome = "uncertain";
