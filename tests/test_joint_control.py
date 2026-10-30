@@ -539,3 +539,10 @@ def test_grasp_turns_the_thumb_first_when_asked(ctl, fake):
     assert "grasp right 1.00 900" in fake[1].read_text().splitlines(), "default force, then thumb"
     assert ctl.op(session, "grasp", side="left", pos=2, thumb=700)[0] == 200
     assert "grasp left 2.00 700" in fake[1].read_text().splitlines()
+
+
+def test_grasp_with_the_thumb_as_a_post(ctl, fake):
+    session = ctl.take()[1]["session"]
+    assert ctl.op(session, "grasp", side="right", thumb=950, thumb_flex=30)[0] == 200
+    assert "grasp right 1.00 950 30" in fake[1].read_text().splitlines()
+    assert ctl.op(session, "grasp", side="right", thumb=950, thumb_flex=-5)[0] == 400

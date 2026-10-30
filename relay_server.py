@@ -1422,7 +1422,7 @@ class JointControl:
         return self.traj is not None and self.traj.state == "running"
 
     def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None,
-           points=None, thumb=None):
+           points=None, thumb=None, thumb_flex=None):
         """keepalive | status | target | hand | grasp | open | trajectory | cancel | release,
         in a session. `grasp` and `open` take `side`; `grasp` an optional force in `pos` (N)."""
         if op == "trajectory":
@@ -1487,6 +1487,11 @@ class JointControl:
                     if pos is None:
                         line += " 1.00"
                     line += f" {round(thumb)}"
+                    if thumb_flex is not None:
+                        if isinstance(thumb_flex, bool) or not isinstance(thumb_flex, (int, float)) \
+                                or not 0 <= thumb_flex <= 1000:
+                            return 400, {"ok": False, "error": "thumb_flex must be 0-1000"}
+                        line += f" {round(thumb_flex)}"
                 if op == "grasp":
                     self.grasp[side] = {"state": "closing", "forces": None}
             elif op in ("keepalive", "status", "release"):
@@ -1688,7 +1693,7 @@ class Handler(BaseHTTPRequestHandler):
           {"op": "trajectory", "session", "points": [{"t": s, "q": {joint: rad},
                                                      "hands": {side: [6 x 0-1000]}}]}
           {"op": "cancel", "session"}                       (freezes a running trajectory)
-          {"op": "grasp", "session", "side", "force"?: N, "thumb"?: 0-1000}
+          {"op": "grasp", "session", "side", "force"?: N, "thumb"?: 0-1000, "thumb_flex"?: 0-1000}
                                                             (close until the fingertips confirm,
                                                              the thumb turned there first)
           {"op": "open", "session", "side"}
@@ -1727,7 +1732,7 @@ class Handler(BaseHTTPRequestHandler):
             pos = body.get("force") if op == "grasp" else body.get("pos")
             code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"),
                                body.get("side"), body.get("finger"), pos,
-                               body.get("points"), body.get("thumb"))
+                               body.get("points"), body.get("thumb"), body.get("thumb_flex"))
             if op in ("target", "hand", "release", "trajectory", "cancel", "grasp", "open"):
                 pts = body.get("points")
                 detail = (f"{body.get('joint')}={body.get('q')}" if op == "target" else

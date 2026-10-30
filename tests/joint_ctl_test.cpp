@@ -309,6 +309,53 @@ int main() {
             check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 500 && pos[5] == 500,
                   "and it stops closing where it is");
         }
+        // The thumb as a post (the operator's bottle pose): it turns and holds its flex; the four
+        // fingers close; two of them blocked = held, and only they squeeze.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            check(starts(c.handle("grasp right 1 950 30", t, in), "ok grasp right"), "with a post");
+            check(c.hand_due(1, t, pos, spd) && pos[1] == 950 && pos[0] == 30 && pos[2] == 50,
+                  "first the thumb: rotation 950, flex 30");
+            c.hand_written(1, t, pos);
+            in.hand_pos[1][1] = 940;
+            in.hand_pos[1][0] = 30;
+            std::vector<std::string> ev;
+            run(c, t, 0.1f, in, ev);
+            check(c.hand_due(1, t + 100, pos, spd) && pos[0] == 30 && pos[2] == 1000 && pos[5] == 1000,
+                  "then the four fingers close and the thumb's flex stays at 30");
+            c.hand_written(1, t + 100, pos);
+            for (int f : {2, 3, 4, 5}) in.hand_state[1][f] = 1;
+            run(c, t, 0.3f, in, ev);
+            const int bottle[6] = {30, 940, 400, 450, 500, 980};    // pinky got past it
+            for (int f = 0; f < 6; ++f) { in.hand_pos[1][f] = bottle[f]; in.hand_state[1][f] = 0; }
+            run(c, t, 0.3f, in, ev);
+            check(has(ev, "grasp right held"), "three fingers stopped on it, the post still = held");
+            int ma[6];
+            check(c.grip_due(1, t + 1000, ma) && ma[0] == 0 && ma[1] == 0 && ma[2] == 250 &&
+                      ma[4] == 250 && ma[5] == 0,
+                  "the blocked fingers squeeze; the post, its rotation and the free pinky do not");
+        }
+        // With a post and an empty hand, the four fingers close all the way: empty.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            c.handle("grasp right 1 950 30", t, in);
+            in.hand_pos[1][1] = 950;
+            std::vector<std::string> ev;
+            run(c, t, 0.1f, in, ev);
+            for (int f : {2, 3, 4, 5}) in.hand_state[1][f] = 1;
+            run(c, t, 0.3f, in, ev);
+            const int closed[6] = {30, 950, 990, 990, 990, 990};
+            for (int f = 0; f < 6; ++f) { in.hand_pos[1][f] = closed[f]; in.hand_state[1][f] = 0; }
+            run(c, t, 0.3f, in, ev);
+            check(has(ev, "grasp right empty") && !has(ev, "grasp right held"),
+                  "with a post: the four closed all the way = empty");
+        }
         // A release ends a grasp: nothing is decided after it.
         {
             Controller c{Config{}};
