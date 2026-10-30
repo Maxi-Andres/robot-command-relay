@@ -100,19 +100,20 @@ int main() {
         check(tc.valid[0] && tc.valid[4], "a status with only its sequence byte is a reading");
         check(!tc.valid[1] && !tc.valid[2] && !tc.valid[3], "bits 0, 1 and 2 each void a finger");
     }
-    // The squeeze: function 10h, registers 1040-1045, six currents, gripping direction only.
+    // The squeeze: function 10h, registers 1060-1061, ONE finger and its current, gripping only.
     {
-        const int ma[6] = {300, 0, -200, 900, 450, 120};
-        const auto w = current_request(RIGHT_ID, ma);
-        check(w.size() == 9 + 12 && w[0] == 127 && w[1] == 0x10 && w[2] == 0x04 && w[3] == 0x10 &&
-                  w[4] == 0 && w[5] == 6 && w[6] == 12,
-              "current write: slave 127, function 10h, address 1040, 6 registers, 12 bytes");
-        check(w[7] == 0x01 && w[8] == 0x2C, "300 mA as big-endian");
-        check(w[11] == 0 && w[12] == 0, "a negative (releasing) current is sent as 0");
-        check(((w[13] << 8) | w[14]) == GRIP_MAX_MA, "and never more than GRIP_MAX_MA");
+        const auto w = current_request(RIGHT_ID, 3, 300);
+        check(w.size() == 9 + 4 && w[0] == 127 && w[1] == 0x10 && w[2] == 0x04 && w[3] == 0x24 &&
+                  w[4] == 0 && w[5] == 2 && w[6] == 4,
+              "current write: slave 127, function 10h, address 1060, 2 registers, 4 bytes");
+        check(w[7] == 0 && w[8] == 3 && w[9] == 0x01 && w[10] == 0x2C, "finger 3, 300 mA big-endian");
+        const auto neg = current_request(RIGHT_ID, 2, -200);
+        check(neg[9] == 0 && neg[10] == 0, "a negative (releasing) current is sent as 0");
+        const auto big = current_request(RIGHT_ID, 2, 900);
+        check(((big[9] << 8) | big[10]) == GRIP_MAX_MA, "and never more than GRIP_MAX_MA");
         check(crc16(w.data(), w.size() - 2) == (w[w.size() - 2] | (w[w.size() - 1] << 8)),
               "current write CRC");
-        std::vector<uint8_t> ack = {127, 0x10, 0x04, 0x10, 0, 6};
+        std::vector<uint8_t> ack = {127, 0x10, 0x04, 0x24, 0, 2};
         const uint16_t c = crc16(ack.data(), 6);
         ack.push_back(c & 0xFF);
         ack.push_back(c >> 8);

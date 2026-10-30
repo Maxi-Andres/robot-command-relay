@@ -1,8 +1,11 @@
 // brainco_command.hpp — the TWO writes g1_joint_sender sends to the BrainCo hands (function 10h,
 // "write multiple registers"):
 //   * six finger positions with their speeds, registers 1022-1033 — every move;
-//   * six finger CURRENTS, registers 1040-1045 — only to SQUEEZE an object a grasp has already
-//     closed on (rule 12 of joint_ctl_core.hpp, 2026-10-30).
+//   * ONE finger's CURRENT, registers 1060-1061 (finger, mA) — only to SQUEEZE an object a grasp
+//     has already closed on (rule 12 of joint_ctl_core.hpp, 2026-10-30), and only for the
+//     fingers that squeeze. Not the six-finger block (1040-1045): writing it puts EVERY motor in
+//     current mode, and on the robot the thumb's rotation — given 0 mA, and with no mechanical
+//     lock (BrainCo) — went limp and the bottle pushed it from 950 to 448.
 //
 // Read src/brainco_modbus.hpp first (the hands, the ports, the registers it reads). This file is
 // separate on purpose: g1_joint_bridge does not include it, so the read-only viewer cannot move
@@ -69,22 +72,22 @@ inline bool write_targets(Port& port, uint8_t id, const int* pos, const int* spe
            targets_ack(resp.data(), resp.size(), id);
 }
 
-constexpr uint16_t CURRENT_ADDR = 1040;
-constexpr uint16_t CURRENT_COUNT = 6;
+constexpr uint16_t CURRENT_ADDR = 1060;   // single finger: [finger 0-5, current mA]
+constexpr uint16_t CURRENT_COUNT = 2;
 constexpr int GRIP_MAX_MA = 450;      // under the hand's default protection current, 500 mA
 
-// Six gripping currents, mA, clamped to 0 .. GRIP_MAX_MA: never a releasing (negative) one.
-inline std::vector<uint8_t> current_request(uint8_t id, const int* ma) {
+// One finger's gripping current, mA, clamped to 0 .. GRIP_MAX_MA: never a releasing (negative)
+// one. The other fingers stay in whatever mode they are in.
+inline std::vector<uint8_t> current_request(uint8_t id, int finger, int ma) {
+    const int fi = std::min(FINGERS - 1, std::max(0, finger));
+    const int c = std::min(GRIP_MAX_MA, std::max(0, ma));
     std::vector<uint8_t> f = {id, WRITE_MULTIPLE, CURRENT_ADDR >> 8, CURRENT_ADDR & 0xFF, 0,
-                              CURRENT_COUNT, 2 * CURRENT_COUNT};
-    for (int i = 0; i < FINGERS; ++i) {
-        const int c = std::min(GRIP_MAX_MA, std::max(0, ma[i]));
-        f.push_back(static_cast<uint8_t>(c >> 8));
-        f.push_back(static_cast<uint8_t>(c & 0xFF));
-    }
-    const uint16_t c = crc16(f.data(), f.size());
-    f.push_back(static_cast<uint8_t>(c & 0xFF));
-    f.push_back(static_cast<uint8_t>(c >> 8));
+                              CURRENT_COUNT, 2 * CURRENT_COUNT,
+                              0, static_cast<uint8_t>(fi),
+                              static_cast<uint8_t>(c >> 8), static_cast<uint8_t>(c & 0xFF)};
+    const uint16_t crc = crc16(f.data(), f.size());
+    f.push_back(static_cast<uint8_t>(crc & 0xFF));
+    f.push_back(static_cast<uint8_t>(crc >> 8));
     return f;
 }
 
@@ -97,11 +100,17 @@ inline bool current_ack(const uint8_t* p, size_t n, uint8_t id) {
     return p[6] == (c & 0xFF) && p[7] == (c >> 8);
 }
 
-// Squeeze: six gripping currents (mA). True once acknowledged.
+// Squeeze: a gripping current (mA) for each finger with one over 0, one write per finger; the
+// fingers at 0 are not written at all, so they stay in position mode. True once all acknowledged.
 inline bool write_current(Port& port, uint8_t id, const int* ma) {
-    std::vector<uint8_t> resp;
-    return port.transact(current_request(id, ma), 8, resp) &&
-           current_ack(resp.data(), resp.size(), id);
+    for (int i = 0; i < FINGERS; ++i) {
+        if (ma[i] <= 0) continue;
+        std::vector<uint8_t> resp;
+        if (!(port.transact(current_request(id, i, ma[i]), 8, resp) &&
+              current_ack(resp.data(), resp.size(), id)))
+            return false;
+    }
+    return true;
 }
 
 }  // namespace brainco
