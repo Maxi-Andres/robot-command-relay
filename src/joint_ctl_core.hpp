@@ -79,16 +79,23 @@
 //      <forces>". Everything stopped and the thumb closed past grasp_closed: "ev grasp <side>
 //      empty" — an empty hand's index and middle stop against the thumb, at 605 and 671, so
 //      "every finger closed" alone never came. Not decided in grasp_ms: stop where they are,
-//      "ev grasp <side> uncertain". The hand still
-//      limits its own current, so a grip is never harder than the hand allows. `open <side>`
-//      opens the flexing fingers. A release ends any grasp (rule 10 puts the hands back). The first try, 2026-10-16, felt worse —
+//      "ev grasp <side> uncertain".
+//      SQUEEZE: on "held", the fingers that touch switch to the hand's CURRENT mode at
+//      grasp_current_ma (brainco_command.hpp: gripping direction only, at most 450 mA, under the
+//      hand's own 500 mA protection) — position mode alone stops a finger on contact with ~0 mA,
+//      and a bottle closed on that way was not held (2026-10-30). Any position write — `open`, a
+//      slider, a new grasp, the release — puts the hand back in position mode.
+//      THUMB: `grasp <side> [N] [thumb]` with a thumb rotation (0-1000) first turns the thumb to
+//      it — opposite the fingers, for a power grip — and starts closing when it gets there (within
+//      40) or after thumb_rotate_ms. `open <side>` opens the flexing fingers. A release ends any
+//      grasp (rule 10 puts the hands back). The first try, 2026-10-16, felt worse —
 //      but that night the relay's CPUQuota=25% was freezing the whole process in bursts: the
 //      unit with CPUWeight was written but not yet installed on the robot. It is now (checked
 //      2026-10-22), so this has never really been measured.
 //
 // Protocol on stdin (one command per line, whitespace-separated, like sender_core.hpp):
 //   take  |  target <joint> <rad>  |  targets <joint> <rad> [<joint> <rad> ...]
-//   hand <left|right> <finger 0-5> <pos 0-1000>  |  grasp <left|right> [newtons]
+//   hand <left|right> <finger 0-5> <pos 0-1000>  |  grasp <left|right> [newtons [thumb 0-1000]]
 //   open <left|right>  |  keepalive  |  status  |  release
 // `targets` is one point of a trajectory (the relay's, 2026-10-30): every joint in it moves
 // together, under the same rules as `target`, and it is all or nothing — one bad joint and
@@ -99,6 +106,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "arm_gravity.hpp"
 #include <set>
@@ -190,6 +198,8 @@ struct Config {
     int grasp_squeeze = 30;           // ... of 1000: how far past the touch point it holds
     int grasp_closed = 950;           // ... a finger stopped short of this is blocked by something
     long grasp_settle_ms = 200;       // ... every flexing finger stopped this long = settled
+    int grasp_current_ma = 250;       // ... the squeeze on a held object (brainco caps it at 450)
+    long thumb_rotate_ms = 800;       // ... longest wait for the thumb to turn before closing
 };
 
 // What the robot reports, as the caller last saw it.
@@ -285,6 +295,8 @@ public:
             touch(now_ms);
             hand_goal_[h][finger] = std::min(1000, std::max(0, static_cast<int>(std::lround(pos))));
             hand_dirty_[h] = true;
+            grip_mode_[h] = grip_dirty_[h] = false;        // a slider ends a squeeze
+            grasping_[h] = rotating_[h] = false;
             return reply("ok hand " + side + " " + std::to_string(finger) + " " +
                          std::to_string(hand_goal_[h][finger]));
         }
@@ -294,22 +306,33 @@ public:
             const int h = hand_side(side);
             if (h < 0) return reply("err no such hand: " + side);
             float force = cfg_.grasp_force;
-            if (verb == "grasp" && (is >> force) && !(std::isfinite(force) && force > 0.0f))
-                return reply("err grasp force must be a positive number of newtons");
+            int thumb = -1;
+            if (verb == "grasp" && (is >> force)) {
+                if (!(std::isfinite(force) && force > 0.0f))
+                    return reply("err grasp force must be a positive number of newtons");
+                if ((is >> thumb) && (thumb < 0 || thumb > 1000))
+                    return reply("err grasp thumb rotation must be 0-1000");
+            }
             if (state_ != State::Up && state_ != State::Active)
                 return reply("err not in control");
             if (!hand_taken_[h]) return reply("err " + side + " hand not available");
             touch(now_ms);
-            for (int f : GRASP_FINGERS) hand_goal_[h][f] = verb == "grasp" ? 1000 : 0;
-            hand_dirty_[h] = true;
+            grip_mode_[h] = grip_dirty_[h] = false;        // back to position mode, either way
             if (verb == "open") {
-                grasping_[h] = false;
+                for (int f : GRASP_FINGERS) hand_goal_[h][f] = 0;
+                hand_dirty_[h] = true;
+                grasping_[h] = rotating_[h] = false;
                 return reply("ok open " + side);
             }
             grasping_[h] = true;
-            grasp_since_[h] = now_ms;
-            moved_[h] = false;
-            settled_since_[h] = -1;
+            rotating_[h] = thumb >= 0;
+            if (rotating_[h]) {
+                hand_goal_[h][1] = thumb;                  // turn the thumb first ...
+                rotate_since_[h] = now_ms;
+            } else {
+                start_closing(h, now_ms);                  // ... or close right away
+            }
+            hand_dirty_[h] = true;
             grasp_force_[h] = std::min(20.0f, force);
             std::ostringstream os;
             os << "ok grasp " << side << ' ' << fmt(grasp_force_[h]);
@@ -378,6 +401,7 @@ public:
     // and calls hand_written() only once the hand acknowledged, so a lost write is retried.
     bool hand_due(int h, long long now_ms, int* pos, int* speed) const {
         if (h < 0 || h > 1 || !hand_taken_[h] || !hand_dirty_[h]) return false;
+        if (grip_mode_[h]) return false;     // a position write would end the squeeze
         // Down too: that is when a released hand is sent back to where it started.
         if (state_ != State::Up && state_ != State::Active && state_ != State::Down) return false;
         if (now_ms - hand_sent_ms_[h] < cfg_.hand_min_ms) return false;
@@ -393,6 +417,20 @@ public:
         for (int i = 0; i < HAND_FINGERS; ++i) same = same && pos[i] == hand_goal_[h][i];
         if (same) hand_dirty_[h] = false;            // a newer goal arrived meanwhile: keep it
     }
+    // Rule 12's squeeze: the six currents (mA) to write to hand `h` now, if due. Then
+    // grip_written() once the hand acknowledged.
+    bool grip_due(int h, long long now_ms, int* ma) const {
+        if (h < 0 || h > 1 || !hand_taken_[h] || !grip_mode_[h] || !grip_dirty_[h]) return false;
+        if (state_ != State::Up && state_ != State::Active) return false;
+        if (now_ms - hand_sent_ms_[h] < cfg_.hand_min_ms) return false;
+        for (int i = 0; i < HAND_FINGERS; ++i) ma[i] = grip_[h][i];
+        return true;
+    }
+    void grip_written(int h, long long now_ms) {
+        hand_sent_ms_[h] = now_ms;
+        grip_dirty_[h] = false;
+    }
+    bool gripping(int h) const { return h >= 0 && h < 2 && grip_mode_[h]; }
     bool hand_taken(int h) const { return h >= 0 && h < 2 && hand_taken_[h]; }
     int hand_goal(int h, int f) const { return hand_goal_[h][f]; }
 
@@ -505,13 +543,34 @@ private:
     float grasp_force_[2] = {0.0f, 0.0f};
     bool moved_[2] = {false, false};
     long long settled_since_[2] = {-1, -1};
+    bool rotating_[2] = {false, false};            // rule 12: turning the thumb before closing
+    long long rotate_since_[2] = {0, 0};
+    bool grip_mode_[2] = {false, false};           // ... squeezing in current mode
+    bool grip_dirty_[2] = {false, false};
+    int grip_[2][HAND_FINGERS] = {};               // ... mA per finger
     bool final_sent_ = false;
     std::string release_reason_;
     std::vector<std::string> pending_;
 
     // Rule 12 for hand h, one tick.
+    void start_closing(int h, long long now_ms) {
+        for (int f : GRASP_FINGERS) hand_goal_[h][f] = 1000;
+        hand_dirty_[h] = true;
+        grasp_since_[h] = now_ms;
+        moved_[h] = false;
+        settled_since_[h] = -1;
+    }
+
     void grasp_step(int h, long long now_ms, const Inputs& in, std::vector<std::string>& ev) {
         if (!grasping_[h] || !in.hand_ok[h]) return;
+        if (rotating_[h]) {
+            if (std::abs(in.hand_pos[h][1] - hand_goal_[h][1]) <= 40 ||
+                now_ms - rotate_since_[h] >= cfg_.thumb_rotate_ms) {
+                rotating_[h] = false;
+                start_closing(h, now_ms);
+            }
+            return;
+        }
         // Settled: no flexing finger running, for grasp_settle_ms — and only after one HAS run.
         // A hand that never moved (the targets never reached it) is short of closing on every
         // finger too, and must never read as "held": it runs out the clock to "uncertain".
@@ -545,12 +604,18 @@ private:
         }
         if (!outcome) return;
         grasping_[h] = false;
-        if (outcome[0] != 'e') {
-            // Held or undecided: every flexing finger stops where it is (a held one a little
-            // further in, so the grip does not slacken), instead of closing on.
-            const int squeeze = outcome[0] == 'h' ? cfg_.grasp_squeeze : 0;
-            for (int f : GRASP_FINGERS)
-                hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f] + squeeze));
+        if (outcome[0] == 'h') {
+            // Held: the fingers that touch squeeze (current mode); the others hold where they are.
+            for (int f = 0; f < HAND_FINGERS; ++f) grip_[h][f] = 0;
+            for (int f : GRASP_FINGERS) {
+                hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f] + cfg_.grasp_squeeze));
+                if (touching[f]) grip_[h][f] = cfg_.grasp_current_ma;
+            }
+            hand_dirty_[h] = false;
+            grip_mode_[h] = grip_dirty_[h] = true;
+        } else if (outcome[0] == 'u') {
+            // Undecided: every flexing finger stops where it is, instead of closing on.
+            for (int f : GRASP_FINGERS) hand_goal_[h][f] = std::min(1000, std::max(0, in.hand_pos[h][f]));
             hand_dirty_[h] = true;
         }
         std::ostringstream os;
@@ -681,7 +746,14 @@ private:
             }
             hand_dirty_[h] = hand_dirty_[h] || moved;
         }
-        grasping_[0] = grasping_[1] = false;
+        grasping_[0] = grasping_[1] = rotating_[0] = rotating_[1] = false;
+        // Out of current mode: the position write below (each hand back to its start) is what
+        // ends a squeeze, so a hand that squeezed must be written even if its goal looks unchanged.
+        for (int h = 0; h < 2; ++h)
+            if (grip_mode_[h]) {
+                grip_mode_[h] = grip_dirty_[h] = false;
+                hand_dirty_[h] = hand_taken_[h];
+            }
         release_reason_ = why;
         state_ = State::Down;
         pending_.push_back("releasing " + why);

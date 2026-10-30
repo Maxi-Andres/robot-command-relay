@@ -196,7 +196,7 @@ flexing fingers (not the thumb's rotation) and stops when the thumb and one more
 least `force` N (1 by default, `GRASP_FORCE_N`) on a valid reading, or their motor stalls — then
 holds a little past that point. Every answer carries `grasp: {left|right: {state, forces}}`:
 `closing`, then `held` (with the five fingertip forces), `empty` (closed with nothing in it) or
-`uncertain` (not decided in `GRASP_MS`, 4 s). `{op: "open", session, side}` opens it. The joint
+`uncertain` (not decided in `GRASP_MS`, 4 s). On `held` the touching fingers **squeeze**: the hand's current mode at `GRASP_CURRENT_MA` (250, never over 450, under the hand's 500 mA protection) — position mode stops a finger on contact with ~0 mA and does not hold anything. `thumb` (0-1000) turns the thumb opposite the fingers before closing (a power grip). `{op: "open", session, side}` opens it, and any position write (a slider, the release) ends the squeeze. The joint
 stream carries the fingertips too: `left|right.touch`, five newtons, `null` for a void reading.
 
 While a session is open the relay keeps the robot standing: `take` sends `stop_move` first;

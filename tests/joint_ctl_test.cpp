@@ -182,9 +182,15 @@ int main() {
             in.touch_n[1][1] = 2.0f;                                 // index
             run(c, t, 0.1f, in, ev);
             check(has(ev, "grasp right held 1.50 2.00 0.00 0.00 0.00"), "thumb + index = held");
-            check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 630 && pos[2] == 630 && pos[1] == 400,
-                  "it stops at where the fingers are, squeezing a little, rotation untouched");
+            int ma[6];
+            check(!c.hand_due(1, t + 1000, pos, spd), "held: no position write, it would end the squeeze");
+            check(c.grip_due(1, t + 1000, ma) && ma[0] == 250 && ma[2] == 250 && ma[3] == 0 &&
+                      ma[1] == 0,
+                  "the touching fingers squeeze at grasp_current_ma, the rest and the rotation do not");
+            c.grip_written(1, t + 1000);
+            check(!c.grip_due(1, t + 2000, ma), "the squeeze is written once");
             check(starts(c.handle("open right", t, in), "ok open right"), "open accepted");
+            check(!c.gripping(1), "open ends the squeeze");
             check(c.hand_due(1, t + 2000, pos, spd) && pos[0] == 0 && pos[3] == 0 && pos[1] == 400,
                   "open: the flexing fingers to 0");
         }
@@ -241,8 +247,33 @@ int main() {
             run(c, t, 0.3f, in, ev);
             check(has(ev, "grasp right held 0.00 0.00 0.00 0.28 0.00"),
                   "fingers stopped short of closing = blocked by the object = held");
-            check(c.hand_due(1, t + 1000, pos, spd) && pos[0] == 135 && pos[2] == 98,
-                  "and it holds them where they stopped, a little further in");
+            int ma[6];
+            check(c.grip_due(1, t + 1000, ma) && ma[0] == 250 && ma[2] == 250 && ma[5] == 250,
+                  "and squeezes every finger that stopped on it");
+            c.handle("release", t, in);
+            check(!c.gripping(1) && c.hand_due(1, t + 2000, pos, spd) && pos[2] == 50,
+                  "the release ends the squeeze: a position write back to where it started");
+        }
+        // Thumb first: the rotation turns, then the flexing fingers close.
+        {
+            Controller c{Config{}};
+            Inputs in = hand_in();
+            long long t = 0;
+            c.handle("take", t, in);
+            check(starts(c.handle("grasp right 1 2000", t, in), "err grasp thumb"),
+                  "a thumb rotation outside 0-1000 refused");
+            check(starts(c.handle("grasp right 1 900", t, in), "ok grasp right"), "with a thumb");
+            check(c.hand_due(1, t, pos, spd) && pos[1] == 900 && pos[0] == 400 && pos[2] == 50,
+                  "first only the thumb's rotation moves");
+            c.hand_written(1, t, pos);
+            std::vector<std::string> ev;
+            run(c, t, 0.2f, in, ev);
+            check(!c.hand_due(1, t, pos, spd), "nothing closes while the thumb turns");
+            in.hand_pos[1][1] = 880;                               // close enough to 900
+            run(c, t, 0.1f, in, ev);
+            check(c.hand_due(1, t + 100, pos, spd) && pos[0] == 1000 && pos[2] == 1000 &&
+                      pos[1] == 900,
+                  "then the flexing fingers close, the thumb staying opposed");
         }
         // The fingers never move at all (the targets were not taken): no "held" out of nothing.
         {

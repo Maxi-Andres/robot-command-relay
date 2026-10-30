@@ -530,3 +530,12 @@ def test_grasp_over_http(server):
     code, out = _post(server, "/joints/control", {"op": "grasp", "session": session,
                                                    "side": "left", "force": 1.0})
     assert code == 200 and out["grasp"]["left"]["state"] in ("closing", "held")
+
+
+def test_grasp_turns_the_thumb_first_when_asked(ctl, fake):
+    session = ctl.take()[1]["session"]
+    assert ctl.op(session, "grasp", side="right", thumb=1500)[0] == 400
+    assert ctl.op(session, "grasp", side="right", thumb=900)[0] == 200
+    assert "grasp right 1.00 900" in fake[1].read_text().splitlines(), "default force, then thumb"
+    assert ctl.op(session, "grasp", side="left", pos=2, thumb=700)[0] == 200
+    assert "grasp left 2.00 700" in fake[1].read_text().splitlines()

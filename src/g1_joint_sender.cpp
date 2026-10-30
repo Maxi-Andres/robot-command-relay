@@ -13,8 +13,9 @@
 //            the BrainCo hands    finger positions, motor states and fingertip touch over
 //                                 Modbus (src/brainco_modbus.hpp), 50 Hz
 //   writes   rt/arm_sdk           only between `take` and the end of the release ramp
-//            the BrainCo hands    finger targets (src/brainco_command.hpp: registers 1022-1033
-//                                 only), only when the page moves a finger, inside a session
+//            the BrainCo hands    finger targets (src/brainco_command.hpp: registers 1022-1033)
+//                                 inside a session, and a grasp's gripping currents (1040-1045,
+//                                 at most 450 mA) only after rule 12 confirmed the grasp
 // It never writes rt/lowcmd: PC1 keeps balancing the robot the whole time.
 //
 // Configuration, all optional (relay.env):
@@ -31,6 +32,7 @@
 //   HANDS               0 = leave the hands alone                     (1)
 //   GRASP_FORCE_N / GRASP_MS  rule 12: fingertip newtons that count as touching, and how long
 //                       a grasp may take to decide                   (1.0 / 4000)
+//   GRASP_CURRENT_MA    ... the squeeze on a held object, mA (capped at 450)       (250)
 // The caps are here and not only in relay.env so that a typo cannot make an arm fast.
 
 #include "brainco_command.hpp"
@@ -143,6 +145,7 @@ int main() {
     cfg.release_ms = static_cast<long>(env_f("JOINT_CTL_RELEASE_MS", 5000, 500, 30000));
     cfg.grasp_force = env_f("GRASP_FORCE_N", 1.0, 0.2, 10.0);
     cfg.grasp_ms = static_cast<long>(env_f("GRASP_MS", 4000, 500, 15000));
+    cfg.grasp_current_ma = static_cast<int>(env_f("GRASP_CURRENT_MA", 250, 50, brainco::GRIP_MAX_MA));
     cfg.hand_speed = static_cast<int>(env_f("HAND_SPEED", 300, 1, 600));
     cfg.ff_gain = env_f("JOINT_CTL_FEEDFORWARD", 1.0f, 0.0f, 1.0f);
 
@@ -278,6 +281,17 @@ int main() {
                 if (due && brainco::write_targets(*hand_port[h], hand_id[h], pos, speed)) {
                     std::lock_guard<std::mutex> lk(sh.mu);
                     ctl.hand_written(h, now_ms(), pos);
+                }
+                // Rule 12's squeeze, after a confirmed grasp: the gripping currents.
+                int ma[6];
+                bool grip;
+                {
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    grip = ctl.grip_due(h, now_ms(), ma);
+                }
+                if (grip && brainco::write_current(*hand_port[h], hand_id[h], ma)) {
+                    std::lock_guard<std::mutex> lk(sh.mu);
+                    ctl.grip_written(h, now_ms());
                 }
             }
             std::this_thread::sleep_until(t0 + std::chrono::milliseconds(20));

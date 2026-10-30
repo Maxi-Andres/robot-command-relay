@@ -1422,7 +1422,7 @@ class JointControl:
         return self.traj is not None and self.traj.state == "running"
 
     def op(self, session, op, joint=None, q=None, side=None, finger=None, pos=None,
-           points=None):
+           points=None, thumb=None):
         """keepalive | status | target | hand | grasp | open | trajectory | cancel | release,
         in a session. `grasp` and `open` take `side`; `grasp` an optional force in `pos` (N)."""
         if op == "trajectory":
@@ -1478,6 +1478,15 @@ class JointControl:
                     if not (math.isfinite(force) and 0.2 <= force <= 10):
                         return 400, {"ok": False, "error": "force must be 0.2-10 N"}
                     line += f" {force:.2f}"
+                if op == "grasp" and thumb is not None:
+                    # Turn the thumb opposite the fingers first (a power grip); the core needs a
+                    # force before the thumb, so the default one goes in when none was given.
+                    if isinstance(thumb, bool) or not isinstance(thumb, (int, float)) \
+                            or not 0 <= thumb <= 1000:
+                        return 400, {"ok": False, "error": "thumb must be 0-1000"}
+                    if pos is None:
+                        line += " 1.00"
+                    line += f" {round(thumb)}"
                 if op == "grasp":
                     self.grasp[side] = {"state": "closing", "forces": None}
             elif op in ("keepalive", "status", "release"):
@@ -1679,7 +1688,9 @@ class Handler(BaseHTTPRequestHandler):
           {"op": "trajectory", "session", "points": [{"t": s, "q": {joint: rad},
                                                      "hands": {side: [6 x 0-1000]}}]}
           {"op": "cancel", "session"}                       (freezes a running trajectory)
-          {"op": "grasp", "session", "side", "force"?: N}   (close until the fingertips confirm)
+          {"op": "grasp", "session", "side", "force"?: N, "thumb"?: 0-1000}
+                                                            (close until the fingertips confirm,
+                                                             the thumb turned there first)
           {"op": "open", "session", "side"}
           Every answer carries {"grasp": {"left"|"right": {state: closing | held | empty |
           uncertain, forces: [5 x N or null]} | null}} (rule 12 of joint_ctl_core.hpp).
@@ -1716,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
             pos = body.get("force") if op == "grasp" else body.get("pos")
             code, out = ctl.op(body.get("session"), op, body.get("joint"), body.get("q"),
                                body.get("side"), body.get("finger"), pos,
-                               body.get("points"))
+                               body.get("points"), body.get("thumb"))
             if op in ("target", "hand", "release", "trajectory", "cancel", "grasp", "open"):
                 pts = body.get("points")
                 detail = (f"{body.get('joint')}={body.get('q')}" if op == "target" else
