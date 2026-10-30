@@ -223,6 +223,17 @@ int main(int argc, char** argv) {
                 int32_t rc = speaker.client.SetVolume((uint8_t)level);
                 reply = rc == 0 ? "ok volume " + std::to_string(level)
                                 : "err volume: set rc=" + std::to_string(rc);
+            } else if (line.rfind("led ", 0) == 0) {
+                // The head LED lives in Unitree's audio client too (API 1010, LedControl).
+                int r = 0, g = 0, b = 0;
+                if (sscanf(line.c_str() + 4, "%d %d %d", &r, &g, &b) != 3) {
+                    reply = "err led: expected 'led R G B'";
+                } else {
+                    int32_t rc = speaker.client.LedControl((uint8_t)r, (uint8_t)g, (uint8_t)b);
+                    reply = rc == 0 ? "ok led " + std::to_string(r) + " " + std::to_string(g) +
+                                      " " + std::to_string(b)
+                                    : "err led: rc=" + std::to_string(rc);
+                }
             } else if (line == "mic on" || line == "mic off") {
                 const bool on = line == "mic on";
                 int32_t rc = speaker.client.SetMode(on ? MIC_ON : MIC_OFF);

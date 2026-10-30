@@ -98,6 +98,8 @@ FAKE_SENDER = textwrap.dedent("""
             print(f"ok volume {volume}", flush=True)
         elif line.startswith("volume "):
             volume = int(line.split()[1]); print(f"ok volume {volume}", flush=True)
+        elif line.startswith("led "):
+            print(f"ok {line}", flush=True)
         else:
             print("err unknown", flush=True)
 """)
@@ -148,6 +150,28 @@ def test_volume_round_trip(relay):
     assert call(url, "/audio/volume", json.dumps({"level": 4}).encode()) == \
         (200, {"ok": True, "volume": 4, "max": 10})
     assert call(url, "/audio/volume", method="GET")[1]["volume"] == 4
+
+
+@pytest.mark.parametrize("body", [{"r": 255, "g": 0, "b": 0}, {"r": 0, "g": 128.0, "b": 255}])
+def test_led_colours_are_accepted(body):
+    assert relay_server.validate_rgb(body) == tuple(int(body[k]) for k in "rgb")
+
+
+@pytest.mark.parametrize("body", [{"r": 256, "g": 0, "b": 0}, {"r": -1, "g": 0, "b": 0},
+                                  {"r": 1.5, "g": 0, "b": 0}, {"r": "255", "g": 0, "b": 0},
+                                  {"r": True, "g": 0, "b": 0}, {"g": 0, "b": 0}, [255, 0, 0]])
+def test_bad_led_colours_are_refused(body):
+    with pytest.raises(ValueError):
+        relay_server.validate_rgb(body)
+
+
+def test_led_reaches_the_sender(relay):
+    url, _srv, calls = relay
+    assert call(url, "/audio/led", json.dumps({"r": 255, "g": 0, "b": 0}).encode()) == \
+        (200, {"ok": True})
+    assert "led 255 0 0" in calls.read_text().splitlines()
+    code, body = call(url, "/audio/led", json.dumps({"r": 300, "g": 0, "b": 0}).encode())
+    assert code == 400 and "'r'" in body["error"]
 
 
 def test_a_bad_wav_never_reaches_the_robot(relay):

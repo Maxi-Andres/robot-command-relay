@@ -610,6 +610,21 @@ def validate_volume(value):
     return int(value)
 
 
+def validate_rgb(body):
+    """The head LED colour {"r", "g", "b"} as three ints 0-255, or ValueError."""
+    if not isinstance(body, dict):
+        raise ValueError("expected a JSON object with 'r', 'g' and 'b'")
+    out = []
+    for key in ("r", "g", "b"):
+        value = body.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+            raise ValueError(f"'{key}' must be a whole number, got {value!r}")
+        if not 0 <= value <= 255:
+            raise ValueError(f"'{key}' must be between 0 and 255, got {value}")
+        out.append(int(value))
+    return tuple(out)
+
+
 def audit(addr, verb, detail, result):
     line = (f'{time.strftime("%Y-%m-%dT%H:%M:%S")} src={addr} verb={verb} '
             f'{detail} result={result}\n')
@@ -1502,6 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
           POST /audio/stop                       -> {ok}
           GET  /audio/volume                     -> {ok, volume}
           POST /audio/volume  {"level": 0-10}    -> {ok, volume}
+          POST /audio/led     {"r","g","b": 0-255} -> {ok}   (the G1's head LED; the Go2 says no)
           GET  /audio/listen?seconds=N           -> a 16 kHz mono WAV of the robot's mic (G1)
           GET  /audio/mic/stream                 -> the mic as raw 16 kHz s16le, until hung up
         """
@@ -1531,6 +1547,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, AttributeError) as exc:
                 return self._json(400, {"ok": False, "error": str(exc)})
             line = f"volume {level}"
+        elif method == "POST" and path == "/audio/led":
+            try:
+                r, g, b = validate_rgb(json.loads(body or b"{}"))
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            line = f"led {r} {g} {b}"
         elif method == "POST" and path == "/audio/stop":
             line = "stop"
         elif method == "POST" and path == "/audio/say":
