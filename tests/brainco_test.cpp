@@ -84,5 +84,21 @@ int main() {
     auto wrong = with_crc({LEFT_ID, 0x10, 0x03, 0xFF, 0x00, 12});
     check(!targets_ack(wrong.data(), wrong.size(), LEFT_ID), "an echo of another address does not");
     std::printf(failures ? "FAILED: %d\n" : "PASS\n", failures);
+    // Touch: normal force in 0.01 N every third register; a status bit 0-2 voids the finger.
+    {
+        uint16_t r[TOUCH_COUNT] = {};
+        r[0] = 365;  r[3] = 696;  r[6] = 5;  r[9] = 333;  r[12] = 572;   // thumb .. pinky
+        r[1] = 120;  r[2] = 0xFFFF;                                       // tangential, direction
+        r[25] = 0x1200;                       // sequence only: valid
+        r[26] = 0x3401;                       // bit 0: raw invalid
+        r[27] = 0x0004;                       // bit 2: trigger timeout (the stuck one)
+        r[28] = 0x0002;                       // bit 1: not updated
+        r[29] = 0x7F00;
+        const Touch tc = decode_touch(r);
+        check(tc.normal[0] > 3.649f && tc.normal[0] < 3.651f && tc.normal[1] > 6.95f,
+              "normal force in newtons, every third register");
+        check(tc.valid[0] && tc.valid[4], "a status with only its sequence byte is a reading");
+        check(!tc.valid[1] && !tc.valid[2] && !tc.valid[3], "bits 0, 1 and 2 each void a finger");
+    }
     return failures ? 1 : 0;
 }

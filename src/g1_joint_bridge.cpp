@@ -23,7 +23,8 @@
 // OUTPUT, one line per tick (numbers only, so no JSON string escaping is ever needed):
 //   {"t":<unix s>,"age_ms":<ms since the last lowstate, -1 = never>,"mode_machine":6,
 //    "imu":[roll,pitch,yaw],"q":[29],"dq":[29],"tau":[29],"temp":[29],
-//    "left":{"age_ms":..,"pos":[6],"speed":[6],"current":[6],"state":[6],"errors":n}|null,
+//    "left":{"age_ms":..,"pos":[6],"speed":[6],"current":[6],"state":[6],"errors":n,
+//            "touch":[5]}|null,
 //    "right":{...}|null}
 // Radians, rad/s, N·m, °C. `temp` is the hotter of a motor's two sensors (the telemetry
 // reader's rule). Hands in the hand's own units: pos 0 open .. 1000 closed, speed ±1000,
@@ -122,10 +123,16 @@ struct Hand {
     Clock::time_point at{};
     bool have = false;
     long errors = 0;                 // failed reads since the last good one
+    brainco::Touch tc{};             // fingertip force, thumb .. pinky (Revo 2 Touch)
+    bool have_touch = false;
+    int touch_fails = 0;             // in a row; a hand without touch stops being asked
 };
 std::mutex hands_mu;
-Hand hands[2] = {{"left", brainco::LEFT_ID, nullptr, {}, {}, false, 0},
-                 {"right", brainco::RIGHT_ID, nullptr, {}, {}, false, 0}};
+Hand hands[2] = {{"left", brainco::LEFT_ID, nullptr, {}, {}, false, 0, {}, false, 0},
+                 {"right", brainco::RIGHT_ID, nullptr, {}, {}, false, 0, {}, false, 0}};
+// A hand whose touch block fails this many reads in a row is not asked again: every failed
+// read waits out the Modbus timeout, and a hand without touch would slow the stream for nothing.
+constexpr int TOUCH_GIVE_UP = 20;
 
 // Each missing hand is looked for on every candidate port (brainco::find_hand: /dev/ttyUSB0-7,
 // or HAND_PORTS), skipping the port the other hand already holds.
@@ -161,7 +168,19 @@ void hands_loop(const std::atomic<bool>& running, double rate) {
             if (!port) { missing = true; continue; }
             uint16_t regs[brainco::STATUS_COUNT];
             const bool ok = port->read(h.id, brainco::STATUS_ADDR, brainco::STATUS_COUNT, regs);
+            uint16_t touch[brainco::TOUCH_COUNT];
+            const bool ask_touch = ok && h.touch_fails < TOUCH_GIVE_UP;
+            const bool touch_ok = ask_touch &&
+                port->read(h.id, brainco::TOUCH_ADDR, brainco::TOUCH_COUNT, touch);
             std::lock_guard<std::mutex> lk(hands_mu);
+            if (touch_ok) {
+                h.tc = brainco::decode_touch(touch);
+                h.have_touch = true;
+                h.touch_fails = 0;
+            } else if (ask_touch && ++h.touch_fails == TOUCH_GIVE_UP) {
+                h.have_touch = false;
+                fprintf(stderr, "[g1-joints] %s hand: no touch readings, not asking again\n", h.key);
+            }
             if (ok) {
                 h.st = brainco::decode_status(regs);
                 h.at = Clock::now();
@@ -203,7 +222,23 @@ void hand_json(std::string& s, const Hand& h, Clock::time_point now) {
     arr("speed", h.st.speed);
     arr("current", h.st.current);
     arr("state", h.st.state);
-    s += ",\"errors\":" + std::to_string(h.errors) + '}';
+    s += ",\"errors\":" + std::to_string(h.errors);
+    if (h.have_touch) {
+        // Newtons, two decimals; null for a finger whose reading is void (status bits 0-2).
+        s += ",\"touch\":[";
+        for (int i = 0; i < brainco::TOUCH_FINGERS; ++i) {
+            if (i) s += ',';
+            if (h.tc.valid[i]) {
+                char b[16];
+                snprintf(b, sizeof b, "%.2f", h.tc.normal[i]);
+                s += b;
+            } else {
+                s += "null";
+            }
+        }
+        s += ']';
+    }
+    s += '}';
 }
 
 std::string build_line() {

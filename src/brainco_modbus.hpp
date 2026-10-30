@@ -97,6 +97,34 @@ inline Status decode_status(const uint16_t* r) {
     return s;
 }
 
+// TOUCH (Revo 2 Touch, capacitive: register 970 = 1 on both hands, checked 2026-10-22). BrainCo's
+// "Modbus / CAN FD Touch" page; input registers, one block of 30 from 4200:
+//   4200-4214  per finger, thumb .. pinky: normal force, tangential force (0.01 N, 0-25 N),
+//              tangential direction (degrees, 0xFFFF = invalid)
+//   4215-4224  proximity, 32 bits per finger (not used here)
+//   4225-4229  status per finger: high byte = sequence; bit 0 raw invalid, bit 1 not updated,
+//              bit 2 trigger timeout
+// FIVE fingers, not the six motors: the thumb has one fingertip for its two motors. A finger
+// with any of bits 0-2 set is NOT a reading — on 2026-10-22 a stuck bit 2 held a middle finger
+// at 0.05 N with nothing touching it (it cleared by itself when touched).
+constexpr int TOUCH_FINGERS = 5;
+constexpr uint16_t TOUCH_ADDR = 4200;
+constexpr uint16_t TOUCH_COUNT = 30;
+
+struct Touch {
+    float normal[TOUCH_FINGERS];     // newtons
+    bool valid[TOUCH_FINGERS];
+};
+
+inline Touch decode_touch(const uint16_t* r) {
+    Touch t{};
+    for (int i = 0; i < TOUCH_FINGERS; ++i) {
+        t.normal[i] = r[3 * i] * 0.01f;
+        t.valid[i] = (r[25 + i] & 0x7) == 0;
+    }
+    return t;
+}
+
 // A serial port at 460800, 8N1, raw. Owns its fd.
 class Port {
 public:
