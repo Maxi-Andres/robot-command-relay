@@ -419,6 +419,28 @@ def camera_apply(camera):
                          f"(is the video service running a version with camera_source?)"}
 
 
+def depth_fetch(frames):
+    """(png bytes, info header) from camera_source's GET /depth, or (None, (status, dict)).
+
+    The robot side decides whether snapshots exist at all (DEPTH_SNAPSHOT, off on the Go2), so
+    its 404 is passed through as it is: the answer says why, not just "not found". The timeout
+    covers the frames it medians (5 at 15 fps) plus opening the node when depth is not live."""
+    try:
+        with urllib.request.urlopen(f"{CAMERA_LOCAL}/depth?frames={int(frames)}",
+                                    timeout=8) as r:
+            return r.read(), r.headers.get("X-Depth-Info", "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read() or b"{}")
+        except ValueError:
+            body = {}
+        return None, (exc.code, {"ok": False,
+                                 "error": body.get("error") or f"HTTP {exc.code}"})
+    except Exception as exc:
+        return None, (502, {"ok": False, "error": f"camera_source unreachable on "
+                                                  f"{CAMERA_LOCAL}: {exc}"})
+
+
 def mjpeg_apply(body):
     """Push {fps,width,quality} to the publisher on localhost. {'error': …} on failure."""
     try:
@@ -1747,6 +1769,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
             return self._audio("GET")
+        if self.path.split("?")[0].rstrip("/") == "/camera/depth":
+            return self._depth()
         if self.path.split("?")[0].rstrip("/") == "/joints/stream":
             return self._joint_stream()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
@@ -1794,6 +1818,37 @@ class Handler(BaseHTTPRequestHandler):
                                            if self.server.joint_control
                                            else {"active": False, "available": False}),
                          "audio": {"available": self.server.audio is not None}})
+
+    def _depth(self):
+        """GET /camera/depth?frames=N -> image/png, 16-bit millimetres, plus X-Depth-Info.
+
+        One picture on request, for the PC to measure where a thing is before a grasp; never a
+        stream. Whether the robot serves it at all is camera_source's DEPTH_SNAPSHOT (on on the
+        G1, off on the Go2's LTE). The token, like every route that reaches the robot."""
+        src = self.client_address[0]
+        if not self._authorised():
+            audit(src, "camera-depth", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        query = dict(p.split("=", 1) for p in self.path.partition("?")[2].split("&") if "=" in p)
+        try:
+            frames = int(query.get("frames", "5"))
+            if not 1 <= frames <= 15:
+                raise ValueError
+        except ValueError:
+            return self._json(400, {"ok": False, "error": "'frames' must be 1..15"})
+        png, info = depth_fetch(frames)
+        if png is None:
+            code, body = info
+            audit(src, "camera-depth", f"frames={frames}", f"refused {body['error']}")
+            return self._json(code, body)
+        audit(src, "camera-depth", f"frames={frames}", f"ok {len(png)} bytes")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self.send_header("X-Depth-Info", info)
+        self.end_headers()
+        self.wfile.write(png)
+        return None
 
     def _audio(self, method):
         """The Go2's speaker. All of it needs the token, like every other route that acts.
