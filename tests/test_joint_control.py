@@ -546,3 +546,127 @@ def test_grasp_with_the_thumb_as_a_post(ctl, fake):
     assert ctl.op(session, "grasp", side="right", thumb=950, thumb_flex=30)[0] == 200
     assert "grasp right 1.00 950 30" in fake[1].read_text().splitlines()
     assert ctl.op(session, "grasp", side="right", thumb=950, thumb_flex=-5)[0] == 400
+
+
+# --------------------------------------------------------------------------- #
+# Retreat to the safe pose before letting go (2026-11-03)
+# --------------------------------------------------------------------------- #
+SAFE = {"right_shoulder_pitch": 0.57, "right_elbow": -0.04}
+OUT = {"right_shoulder_pitch": 0.0, "right_elbow": 0.4}       # reached out over the table
+
+
+class HotStream(FakeStream):
+    """The joint stream with temperatures too (°C, rt/lowstate's 29)."""
+
+    def __init__(self, pose, temp=40.0):
+        self.temp = [temp] * 29
+        super().__init__(pose)
+
+    def set(self, pose):
+        super().set(pose)
+        d = json.loads(self.latest)
+        d["temp"] = self.temp
+        self.latest = json.dumps(d)
+
+    def heat(self, joint, c):
+        self.temp[relay_server.BODY_INDEX[joint]] = c
+        self.set({k: json.loads(self.latest)["q"][i] for k, i in relay_server.BODY_INDEX.items()})
+
+
+def _retreat_ctl(fake, stream, monkeypatch, lost_s=30.0):
+    monkeypatch.setattr(relay_server, "JOINT_CTL_CLIENT_LOST_S", lost_s)
+    monkeypatch.setattr(relay_server, "JOINT_CTL_MAX_VEL", 5.0)      # short retreats in tests
+    return _traj_ctl(fake, stream, monkeypatch)
+
+
+def _sent(fake):
+    return fake[1].read_text().splitlines()
+
+
+def test_a_warm_joint_brings_the_arm_back_to_the_safe_pose_before_letting_go(fake, monkeypatch):
+    """The defect (G1, 2026-11-03): a hot shoulder released the arm mid-grasp; PC1 took it to
+    ITS pose, straight down, and the hand hit the table. Under the sender's 75 °C, the relay
+    moves the arm to the session's safe pose first, and only then releases."""
+    stream = HotStream(OUT)
+    jc = _retreat_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take(SAFE)[1]["session"]
+        stream.heat("right_shoulder_pitch", relay_server.JOINT_CTL_RETREAT_C + 1)
+        assert _wait(lambda: (jc.retreat or {}).get("state") == "running")
+        assert "warm right_shoulder_pitch" in jc.retreat["reason"]
+        assert jc.op(session, "target", "right_elbow", 0.1)[0] == 409, "nothing else meanwhile"
+        stream.set(SAFE)                                   # the arm got back
+        assert _wait(lambda: not jc.busy(), timeout=5)
+        lines = _sent(fake)
+        assert any(ln.startswith("targets") and "right_shoulder_pitch 0.5700" in ln
+                   for ln in lines)
+        last_move = max(i for i, ln in enumerate(lines) if ln.startswith("targets"))
+        assert lines.index("release") > last_move, "released only after the retreat"
+    finally:
+        jc.stop()
+
+
+def test_a_client_that_goes_quiet_gets_the_arm_put_away(fake, monkeypatch):
+    """The defect: the planner's PC dies with the hand over the table; the sender's dead-man
+    would release it there 5 s later. The relay notices the silence first and retreats."""
+    stream = HotStream(OUT)
+    jc = _retreat_ctl(fake, stream, monkeypatch, lost_s=0.3)
+    try:
+        jc.take(SAFE)
+        assert _wait(lambda: (jc.retreat or {}).get("reason") == "client lost")
+        stream.set(SAFE)
+        assert _wait(lambda: not jc.busy(), timeout=5)
+        assert "release" in _sent(fake)
+    finally:
+        jc.stop()
+
+
+def test_a_release_asked_away_from_the_safe_pose_goes_there_first(fake, monkeypatch):
+    stream = HotStream(OUT)
+    jc = _retreat_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take(SAFE)[1]["session"]
+        code, out = jc.op(session, "release")
+        assert code == 200 and out["retreat"]["reason"] == "release asked"
+        assert "release" not in _sent(fake), "not yet: the arm is still out"
+        stream.set(SAFE)
+        assert _wait(lambda: not jc.busy(), timeout=5)
+    finally:
+        jc.stop()
+
+
+def test_a_release_at_the_safe_pose_is_immediate(fake, monkeypatch):
+    stream = HotStream(SAFE)
+    jc = _retreat_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take(SAFE)[1]["session"]
+        assert jc.op(session, "release")[0] == 200
+        assert _wait(lambda: not jc.busy())
+        assert jc.retreat is None
+    finally:
+        jc.stop()
+
+
+def test_without_a_safe_pose_nothing_changes(fake, monkeypatch):
+    """The Joints page names no safe pose: a warm joint is the sender's business (rule 9)."""
+    stream = HotStream(OUT, temp=72.0)
+    jc = _retreat_ctl(fake, stream, monkeypatch, lost_s=0.2)
+    try:
+        session = jc.take()[1]["session"]
+        time.sleep(0.6)
+        assert jc.retreat is None and jc.busy()
+        assert jc.op(session, "release")[0] == 200
+    finally:
+        jc.stop()
+
+
+@pytest.mark.parametrize("safe, why", [
+    ({"left_knee": 0.1}, "not allowed"),
+    ({"right_elbow": 9.0}, "radians"),
+    ({}, "non-empty"),
+    ([0.1], "non-empty"),
+])
+def test_a_bad_safe_pose_is_refused_before_anything_starts(ctl, fake, safe, why):
+    code, out = ctl.take(safe)
+    assert code == 400 and why in out["error"]
+    assert not ctl.busy()

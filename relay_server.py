@@ -172,6 +172,18 @@ except ValueError:
 # feeds the sender TRAJ_HZ points a second; every rule of joint_ctl_core.hpp still applies.
 TRAJ_MAX_POINTS = 600
 TRAJ_MAX_S = 60.0
+# RETREAT BEFORE LETTING GO (2026-11-03). A released arm is taken back by PC1 to ITS pose —
+# hanging straight down — and from a hand reached out over a table that path goes THROUGH the
+# table: a hot shoulder released the arm mid-grasp and the hand hit it. A session may name a
+# SAFE pose at `take` (the hand tucked in front of the belly, behind any table edge); then, when
+# a held joint reaches JOINT_CTL_RETREAT_C (under the sender's own 75 °C release, rule 9), when
+# the client goes quiet for JOINT_CTL_CLIENT_LOST_S (under the sender's 1 s dead-man), or when
+# a release is asked away from it, the relay first moves the arm there, then releases. Without
+# a safe pose nothing changes, and the sender's own limits stay the last line either way.
+JOINT_CTL_RETREAT_C = int(os.environ.get("JOINT_CTL_RETREAT_C", "68"))
+JOINT_CTL_CLIENT_LOST_S = float(os.environ.get("JOINT_CTL_CLIENT_LOST_S", "0.9"))
+RETREAT_VEL_FRACTION = 0.5     # of JOINT_CTL_MAX_VEL
+RETREAT_AT_RAD = 0.15          # a release this close to the safe pose needs no retreat
 TRAJ_HZ = 20.0
 TRAJ_TOL = 0.05          # rad: every joint this close to its last point = arrived
 TRAJ_SETTLE_S = 3.0      # after the last point, how long it may take to get there
@@ -1185,6 +1197,23 @@ def validate_trajectory(points, allowed, start=None, max_vel=None):
     return out
 
 
+def validate_safe_pose(pose, allowed):
+    """{joint: rad} for the session's safe pose, or ValueError. None stays None."""
+    if pose is None:
+        return None
+    if not isinstance(pose, dict) or not pose:
+        raise ValueError("'safe' must be a non-empty {joint: rad} object")
+    out = {}
+    for name, v in pose.items():
+        if name not in allowed:
+            raise ValueError(f"safe pose: joint not allowed: {name}")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+                or abs(v) > math.pi:
+            raise ValueError(f"safe pose: {name} must be radians in [-pi, pi]")
+        out[name] = float(v)
+    return out
+
+
 class Trajectory:
     """Runs ONE validated trajectory inside a control session, on its own thread.
 
@@ -1330,6 +1359,10 @@ class JointControl:
         # Rule 12 of the sender: each hand's last grasp, for the planner's contract (G1.md §6.9):
         # {"state": closing | held | empty | uncertain, "forces": [5 x N or None]}.
         self.grasp = {"left": None, "right": None}
+        # The session's safe pose and its retreat (see JOINT_CTL_RETREAT_C).
+        self.safe = None
+        self.retreat = None                 # {"state": running | done, "reason", "result"}
+        self.last_client = 0.0
 
     def busy(self):
         """True while a session holds (or is handing back) the arms."""
@@ -1393,7 +1426,11 @@ class JointControl:
                "grasp": dict(self.grasp)}
         return (200 if ok else code_err), out
 
-    def take(self):
+    def take(self, safe=None):
+        try:
+            safe = validate_safe_pose(safe, set(JOINT_CTL_ALLOW))
+        except ValueError as exc:
+            return 400, {"ok": False, "error": str(exc)}
         with self.lock:
             if self.busy():
                 return 409, {"ok": False, "error": "the arms are already being controlled",
@@ -1425,10 +1462,95 @@ class JointControl:
                 self._close_locked()
                 return self._answer(reply)
             self.session = secrets.token_hex(8)
+            self.safe, self.retreat = safe, None
+            self.last_client = time.monotonic()
+            if safe is not None:
+                threading.Thread(target=self._guard, args=(self.proc, self.session),
+                                 name="joint-guard", daemon=True).start()
             code, out = self._answer(reply)
             out.update(session=self.session, allowed=JOINT_CTL_ALLOW,
-                       excursion=JOINT_CTL_EXCURSION, margin=JOINT_CTL_MARGIN)
+                       excursion=JOINT_CTL_EXCURSION, margin=JOINT_CTL_MARGIN,
+                       safe=safe is not None)
             return code, out
+
+    def measured_temp(self):
+        """{joint: °C} of the arm_sdk joints from the joint stream, or None without one."""
+        stream = self.stream
+        line = stream.latest if stream is not None else None
+        try:
+            t = json.loads(line).get("temp") if line else None
+            return {name: float(t[i]) for name, i in BODY_INDEX.items()} if t else None
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            return None
+
+    def _guard(self, proc, session):
+        """While this session lasts: retreat to the safe pose on a warm joint or a lost client.
+        Watches the joint stream (temperatures, pose) for as long as it runs."""
+        stream = self.stream
+        watching = stream is not None and stream.subscribe()
+        try:
+            while self.proc is proc and self.session == session and proc.poll() is None:
+                time.sleep(0.2)
+                if self.retreat is not None:
+                    continue
+                temps = self.measured_temp() or {}
+                warm = [(j, t) for j, t in temps.items()
+                        if j in self.safe and t >= JOINT_CTL_RETREAT_C]
+                if warm:
+                    j, t = max(warm, key=lambda x: x[1])
+                    self._start_retreat(session, f"warm {j} {t:.0f}C")
+                elif time.monotonic() - self.last_client > JOINT_CTL_CLIENT_LOST_S:
+                    self._start_retreat(session, "client lost")
+        finally:
+            if watching:
+                stream.unsubscribe()
+
+    def _near_safe(self):
+        q = self.measured()
+        return q is not None and all(abs(q[j] - v) <= RETREAT_AT_RAD
+                                     for j, v in self.safe.items() if j in q)
+
+    def _start_retreat(self, session, reason):
+        """Cancel what runs, move to the safe pose, then release. Never called with self.lock
+        held: the running trajectory needs it to stop. False if it could not start (no safe
+        pose, no measured pose): the sender's own limits then decide, as before."""
+        if self.safe is None or self.retreat is not None:
+            return False
+        traj = self.traj
+        if traj is not None and traj.state == "running":
+            traj.cancelled.set()
+            traj.thread.join(timeout=2.0)
+        start = self.measured()
+        if start is None:
+            return False
+        far = max(abs(start.get(j, v) - v) for j, v in self.safe.items())
+        t = max(1.5, far / (JOINT_CTL_MAX_VEL * RETREAT_VEL_FRACTION))
+        try:
+            plan = validate_trajectory([{"t": round(t, 2), "q": self.safe}],
+                                       set(JOINT_CTL_ALLOW), start)
+        except ValueError as exc:
+            log(f"joint control: no retreat ({exc})")
+            return False
+        with self.lock:
+            if self.session != session or not self.busy():
+                return False
+            self.retreat = {"state": "running", "reason": reason, "result": None}
+            self.traj = Trajectory(self, plan, start=start, measured=self.measured)
+            retreat_traj = self.traj
+        log(f"joint control: retreating to the safe pose ({reason}), {t:.1f} s")
+        audit("-", "joints-control", "retreat", reason)
+        retreat_traj.thread.start()
+
+        def finish():
+            retreat_traj.thread.join()
+            with self.lock:
+                if self.session == session and self.busy():
+                    reply = self._send("release")
+                    log(f"joint control: released after the retreat: {reply}")
+            self.retreat = {"state": "done", "reason": reason,
+                            "result": retreat_traj.snapshot()}
+        threading.Thread(target=finish, name="joint-retreat", daemon=True).start()
+        return True
 
     def measured(self):
         """The arm_sdk joints' measured angles from the joint stream, or None without one."""
@@ -1447,12 +1569,25 @@ class JointControl:
            points=None, thumb=None, thumb_flex=None):
         """keepalive | status | target | hand | grasp | open | trajectory | cancel | release,
         in a session. `grasp` and `open` take `side`; `grasp` an optional force in `pos` (N)."""
+        if isinstance(session, str) and self.session is not None and \
+                hmac.compare_digest(session, self.session):
+            self.last_client = time.monotonic()
+            if self.retreat is not None and op not in ("keepalive", "status", "release"):
+                return 409, {"ok": False, **self.state, "retreat": self.retreat,
+                             "error": f"retreating to the safe pose ({self.retreat['reason']})"}
+            if self.retreat is not None:          # keepalive/status/release: report, nothing more
+                return 200, {"ok": True, **self.state, "retreat": self.retreat,
+                             "trajectory": self.traj.snapshot() if self.traj else None}
+            if op == "release" and self.safe is not None and not self._near_safe() and \
+                    self._start_retreat(session, "release asked"):
+                return 200, {"ok": True, **self.state, "retreat": self.retreat}
         if op == "trajectory":
             return self._start_trajectory(session, points)
         with self.lock:
             if not self.busy() or self.session is None:
                 return 409, {"ok": False, "error": "no control session", **self.state,
-                             "event": self.last_event, "event_seq": self.event_seq}
+                             "event": self.last_event, "event_seq": self.event_seq,
+                             "retreat": self.retreat}
             if not isinstance(session, str) or not hmac.compare_digest(session, self.session):
                 return 409, {"ok": False, "error": "another page holds the arms"}
             if op == "cancel":
@@ -1570,7 +1705,8 @@ class JointControl:
 
     def status(self):
         return {"active": self.busy(), **self.state, "event": self.last_event,
-                "event_seq": self.event_seq, "allowed": JOINT_CTL_ALLOW}
+                "event_seq": self.event_seq, "allowed": JOINT_CTL_ALLOW,
+                "safe": self.safe is not None, "retreat": self.retreat}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1708,7 +1844,9 @@ class Handler(BaseHTTPRequestHandler):
     def _joint_control(self):
         """POST /joints/control — move single arm joints of the G1 from the Joints page.
 
-          {"op": "take"}                                   -> {ok, session, allowed, state, w}
+          {"op": "take", "safe"?: {joint: rad}}             -> {ok, session, allowed, state, w}
+            With "safe", a warm joint, a quiet client or a release away from that pose first
+            moves the arm there, then releases ("retreat" in every answer while it runs).
           {"op": "target", "session", "joint", "q": rad}   -> {ok, reply, state, w}
           {"op": "hand", "session", "side", "finger": 0-5, "pos": 0-1000}
           {"op": "keepalive" | "status" | "release", "session"}
@@ -1748,7 +1886,7 @@ class Handler(BaseHTTPRequestHandler):
         if op != "release" and not self.server.joint_limiter.allow():
             return self._json(429, {"error": "rate limited"})
         if op == "take":
-            code, out = ctl.take()
+            code, out = ctl.take(body.get("safe"))
             audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
         else:
             pos = body.get("force") if op == "grasp" else body.get("pos")
