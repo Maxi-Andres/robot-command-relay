@@ -1363,6 +1363,7 @@ class JointControl:
         self.safe = None
         self.retreat = None                 # {"state": running | done, "reason", "result"}
         self.last_client = 0.0
+        self.take_pose = None               # where the arm was at `take`: PC1's own pose
 
     def busy(self):
         """True while a session holds (or is handing back) the arms."""
@@ -1464,6 +1465,7 @@ class JointControl:
             self.session = secrets.token_hex(8)
             self.safe, self.retreat = safe, None
             self.last_client = time.monotonic()
+            self.take_pose = self.measured()
             if safe is not None:
                 threading.Thread(target=self._guard, args=(self.proc, self.session),
                                  name="joint-guard", daemon=True).start()
@@ -1505,16 +1507,26 @@ class JointControl:
             if watching:
                 stream.unsubscribe()
 
-    def _near_safe(self):
+    def _near(self, pose):
         q = self.measured()
-        return q is not None and all(abs(q[j] - v) <= RETREAT_AT_RAD
-                                     for j, v in self.safe.items() if j in q)
+        return q is not None and pose is not None and all(
+            abs(q[j] - v) <= RETREAT_AT_RAD for j, v in pose.items() if j in q)
+
+    def _near_safe(self):
+        return self._near(self.safe)
+
+    def _at_rest(self):
+        """Back where the arm was when it was taken — the pose PC1 takes it to on release, so
+        letting go there moves nothing. A retreat from there would raise the arm only for PC1
+        to lower it again (2026-11-03: the planner brought the arm home, released, and the
+        relay lifted it to the safe pose first)."""
+        return self._near({j: self.take_pose[j] for j in self.safe if j in (self.take_pose or {})})
 
     def _start_retreat(self, session, reason):
         """Cancel what runs, move to the safe pose, then release. Never called with self.lock
         held: the running trajectory needs it to stop. False if it could not start (no safe
         pose, no measured pose): the sender's own limits then decide, as before."""
-        if self.safe is None or self.retreat is not None:
+        if self.safe is None or self.retreat is not None or self._at_rest():
             return False
         traj = self.traj
         if traj is not None and traj.state == "running":
@@ -1579,7 +1591,7 @@ class JointControl:
                 return 200, {"ok": True, **self.state, "retreat": self.retreat,
                              "trajectory": self.traj.snapshot() if self.traj else None}
             if op == "release" and self.safe is not None and not self._near_safe() and \
-                    self._start_retreat(session, "release asked"):
+                    not self._at_rest() and self._start_retreat(session, "release asked"):
                 return 200, {"ok": True, **self.state, "retreat": self.retreat}
         if op == "trajectory":
             return self._start_trajectory(session, points)

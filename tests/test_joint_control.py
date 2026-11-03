@@ -552,6 +552,7 @@ def test_grasp_with_the_thumb_as_a_post(ctl, fake):
 # Retreat to the safe pose before letting go (2026-11-03)
 # --------------------------------------------------------------------------- #
 SAFE = {"right_shoulder_pitch": 0.57, "right_elbow": -0.04}
+REST = {"right_shoulder_pitch": 0.3, "right_elbow": 0.98}     # hanging, where it is taken
 OUT = {"right_shoulder_pitch": 0.0, "right_elbow": 0.4}       # reached out over the table
 
 
@@ -587,10 +588,11 @@ def test_a_warm_joint_brings_the_arm_back_to_the_safe_pose_before_letting_go(fak
     """The defect (G1, 2026-11-03): a hot shoulder released the arm mid-grasp; PC1 took it to
     ITS pose, straight down, and the hand hit the table. Under the sender's 75 °C, the relay
     moves the arm to the session's safe pose first, and only then releases."""
-    stream = HotStream(OUT)
+    stream = HotStream(REST)
     jc = _retreat_ctl(fake, stream, monkeypatch)
     try:
         session = jc.take(SAFE)[1]["session"]
+        stream.set(OUT)                                    # then reached out
         stream.heat("right_shoulder_pitch", relay_server.JOINT_CTL_RETREAT_C + 1)
         assert _wait(lambda: (jc.retreat or {}).get("state") == "running")
         assert "warm right_shoulder_pitch" in jc.retreat["reason"]
@@ -609,10 +611,11 @@ def test_a_warm_joint_brings_the_arm_back_to_the_safe_pose_before_letting_go(fak
 def test_a_client_that_goes_quiet_gets_the_arm_put_away(fake, monkeypatch):
     """The defect: the planner's PC dies with the hand over the table; the sender's dead-man
     would release it there 5 s later. The relay notices the silence first and retreats."""
-    stream = HotStream(OUT)
+    stream = HotStream(REST)
     jc = _retreat_ctl(fake, stream, monkeypatch, lost_s=0.3)
     try:
         jc.take(SAFE)
+        stream.set(OUT)                                    # then reached out
         assert _wait(lambda: (jc.retreat or {}).get("reason") == "client lost")
         stream.set(SAFE)
         assert _wait(lambda: not jc.busy(), timeout=5)
@@ -622,10 +625,11 @@ def test_a_client_that_goes_quiet_gets_the_arm_put_away(fake, monkeypatch):
 
 
 def test_a_release_asked_away_from_the_safe_pose_goes_there_first(fake, monkeypatch):
-    stream = HotStream(OUT)
+    stream = HotStream(REST)
     jc = _retreat_ctl(fake, stream, monkeypatch)
     try:
         session = jc.take(SAFE)[1]["session"]
+        stream.set(OUT)                                    # then reached out
         code, out = jc.op(session, "release")
         assert code == 200 and out["retreat"]["reason"] == "release asked"
         assert "release" not in _sent(fake), "not yet: the arm is still out"
@@ -670,3 +674,19 @@ def test_a_bad_safe_pose_is_refused_before_anything_starts(ctl, fake, safe, why)
     code, out = ctl.take(safe)
     assert code == 400 and why in out["error"]
     assert not ctl.busy()
+
+
+def test_a_release_back_at_rest_does_not_lift_the_arm_first(fake, monkeypatch):
+    """The defect (G1, 2026-11-03): the planner brought the arm home to where it was taken,
+    released, and the relay lifted it to the safe pose first — for PC1 to lower it again. At
+    the pose it was taken from there is nothing to protect: release at once."""
+    stream = HotStream(OUT)
+    jc = _retreat_ctl(fake, stream, monkeypatch)
+    try:
+        session = jc.take(SAFE)[1]["session"]       # taken at OUT: that is its rest
+        assert jc.op(session, "release")[0] == 200
+        assert _wait(lambda: not jc.busy())
+        assert jc.retreat is None
+        assert not any(ln.startswith("targets") for ln in _sent(fake))
+    finally:
+        jc.stop()
