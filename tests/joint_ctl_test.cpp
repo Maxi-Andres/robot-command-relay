@@ -603,6 +603,25 @@ int main() {
         check(starts(c.handle("hand left 2 500", t + 300, in), "err not in control"),
               "no finger target is taken while releasing");
     }
+    // Rule 10, keep_hands: a planner that folded the hand to go home keeps it folded.
+    {
+        Controller c{Config{}};
+        Inputs in = standing();
+        in.hand_ok[0] = true;
+        for (int f = 0; f < 6; ++f) in.hand_pos[0][f] = 0;      // taken open
+        long long t = 0;
+        check(starts(c.handle("keep_hands", t, in), "err not in control"),
+              "keep_hands refused before take");
+        c.handle("take", t, in);
+        int pos[6], spd[6];
+        c.handle("hand left 2 899", t, in);
+        c.hand_due(0, t, pos, spd);
+        c.hand_written(0, t, pos);
+        check(starts(c.handle("keep_hands", t + 60, in), "ok keep_hands"), "keep_hands accepted");
+        c.handle("release", t + 70, in);
+        check(!c.hand_due(0, t + 200, pos, spd),
+              "after keep_hands the release leaves the hand folded, nothing written");
+    }
     // Rule 11: the arm's own weight goes out as torque, so the kp spring does not sag under it.
     {
         Inputs in = standing();

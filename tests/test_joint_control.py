@@ -690,3 +690,10 @@ def test_a_release_back_at_rest_does_not_lift_the_arm_first(fake, monkeypatch):
         assert not any(ln.startswith("targets") for ln in _sent(fake))
     finally:
         jc.stop()
+
+
+def test_keep_hands_is_forwarded(ctl, fake):
+    """A planner folds the hand to go home and asks the release to leave it folded."""
+    session = ctl.take()[1]["session"]
+    assert ctl.op(session, "keep_hands")[0] == 200
+    assert "keep_hands" in fake[1].read_text().splitlines()

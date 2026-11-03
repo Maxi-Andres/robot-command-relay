@@ -54,6 +54,8 @@
 //      per hand_min_ms. ON RELEASE each hand goes back to where it was when control was taken,
 //      during the arms' hand-back ramp — the operator's call, 2026-10-15: "give the arms back"
 //      means the whole upper body, and a hand left closed after the page let go surprised them.
+//      `keep_hands` (2026-11-03) makes the hands' CURRENT targets their release pose instead: a
+//      planner that folded the hand to go home wants it to stay folded, not reopen at the end.
 //  11. HOLD THE ARM'S OWN WEIGHT (gravity feedforward, 2026-10-22). With only the kp spring, an
 //      arm sags until the spring pays for its weight: 8.5 N·m on a raised left shoulder at kp 60
 //      is ~8° below the target, centimetres at the hand — no grasp works like that. Each joint's
@@ -284,6 +286,15 @@ public:
             }
             begin_release("requested");
             return reply("ok release");
+        }
+        if (verb == "keep_hands") {                        // rule 10: release keeps them as now
+            if (state_ != State::Up && state_ != State::Active)
+                return reply("err not in control");
+            touch(now_ms);
+            for (int h = 0; h < 2; ++h)
+                if (hand_taken_[h])
+                    for (int f = 0; f < HAND_FINGERS; ++f) hand_origin_[h][f] = hand_goal_[h][f];
+            return reply("ok keep_hands");
         }
         if (verb == "hand") {
             std::string side;

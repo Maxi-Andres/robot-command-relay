@@ -1663,7 +1663,7 @@ class JointControl:
                         line += f" {round(thumb_flex)}"
                 if op == "grasp":
                     self.grasp[side] = {"state": "closing", "forces": None}
-            elif op in ("keepalive", "status", "release"):
+            elif op in ("keepalive", "status", "release", "keep_hands"):
                 line = op
             else:
                 return 400, {"ok": False, "error": f"unknown op {op!r}"}
@@ -1869,6 +1869,8 @@ class Handler(BaseHTTPRequestHandler):
                                                             (close until the fingertips confirm,
                                                              the thumb turned there first)
           {"op": "open", "session", "side"}
+          {"op": "keep_hands", "session"}                   (the release leaves the hands as they
+                                                             are now, not as they were at take)
           Every answer carries {"grasp": {"left"|"right": {state: closing | held | empty |
           uncertain, forces: [5 x N or null]} | null}} (rule 12 of joint_ctl_core.hpp).
           Every answer in a session with a trajectory carries {"trajectory": {state, reason,
