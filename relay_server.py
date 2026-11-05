@@ -166,6 +166,19 @@ WALK_SETTLE_S = 1.0          # after the stop, the robot finishes its step befor
 WALK_OK_POS = 0.15           # what counts as success once settled (else "uncertain")
 WALK_OK_YAW = math.radians(8)
 
+# ITS EYES (2026-11-05): the Mid-360's obstacle map, from g1_lidar_bridge (GET /lidar/stream).
+# The lidar sends to PC1 unless tools/livox_set_host.py pointed it at the bus broadcast; the bridge
+# levels the points with the lidar's own gravity and keeps what stands 10 cm..1.5 m over the floor.
+LIDAR_BRIDGE = os.environ.get("LIDAR_BRIDGE_BIN", "./g1_lidar_bridge")
+# With the bridge built, a walk needs FRESH lidar: no eyes, no walk. 0 = walk blind, as before.
+WALK_REQUIRE_LIDAR = os.environ.get("WALK_REQUIRE_LIDAR", "1").strip() != "0"
+WALK_STOP_M = float(os.environ.get("WALK_STOP_M", "0.5"))  # m from the torso, along the way
+WALK_HALF_WIDTH = 0.30       # m each side of the way: the shoulders (0.45 m) and a margin
+WALK_BLOCKED_WAIT_S = 3.0    # blocked this long (someone crossing?) and the walk gives up
+WALK_LIDAR_STALE_S = 1.0     # no obstacle map for this long = stop, failure
+LIDAR_VIEW_HZ = 2.0          # the page's copy: coarser and slower, it crosses the uplink
+LIDAR_VIEW_RES = 0.10
+
 JOINT_SENDER = os.environ.get("JOINT_SENDER_BIN", "./g1_joint_sender")
 # Its own budget, apart from /cmd's: a dragged slider sends ~10 targets a second plus keepalives,
 # and that must neither starve the drive pad nor be starved by it.
@@ -1811,6 +1824,48 @@ def walk_command(pose, goal, phase):
     return 0.0, 0.0, 0.0, "done"
 
 
+def parse_lidar(line):
+    """(cells as (x, y) metres in the odom frame, the line's dict) from a g1_lidar_bridge line,
+    or (None, dict) when it cannot be used: not fresh, or not in the odometry frame."""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None, {}
+    if d.get("age_ms", -1) < 0 or d["age_ms"] > 500 or not d.get("odom"):
+        return None, d
+    res = float(d.get("res", 0.05))
+    return [(ix * res, iy * res) for ix, iy in d.get("cells", ())], d
+
+
+def obstacle_ahead(pose, vx, vy, cells, reach=WALK_STOP_M, half=WALK_HALF_WIDTH):
+    """Metres to the nearest obstacle cell in the corridor the robot is about to walk into
+    (`reach` long, `half` each side, along the direction of vx, vy from `pose`), or None."""
+    if not cells or math.hypot(vx, vy) < 1e-6:
+        return None
+    h = pose["yaw"] + math.atan2(vy, vx)
+    c, s = math.cos(h), math.sin(h)
+    nearest = None
+    for x, y in cells:
+        px, py = x - pose["x"], y - pose["y"]
+        along = px * c + py * s
+        if 0 < along <= reach and abs(-px * s + py * c) <= half:
+            nearest = along if nearest is None else min(nearest, along)
+    return nearest
+
+
+def coarsen_lidar(line, res=LIDAR_VIEW_RES):
+    """The page's copy of a bridge line: the same, with its cells merged into `res` squares."""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    r = float(d.get("res", 0.05))
+    k = max(1, round(res / r))
+    d["cells"] = sorted({(ix // k, iy // k) for ix, iy in d.get("cells", ())})
+    d["res"] = r * k
+    return json.dumps(d, separators=(",", ":"))
+
+
 class Walk:
     """WALK TO A POINT, relative to where the robot stands (POST /walk/control). G1 only.
 
@@ -1824,9 +1879,13 @@ class Walk:
     """
 
     def __init__(self, sender, odom, joint_control=None, clock=time.monotonic,
-                 settle_s=WALK_SETTLE_S, hz=WALK_HZ):
+                 settle_s=WALK_SETTLE_S, hz=WALK_HZ, lidar=None, require_lidar=WALK_REQUIRE_LIDAR,
+                 blocked_wait_s=WALK_BLOCKED_WAIT_S):
         self.sender = sender
         self.odom = odom
+        self.lidar = lidar                  # JointStream of g1_lidar_bridge, or None (blind)
+        self.require_lidar = require_lidar and lidar is not None
+        self.blocked_wait_s = blocked_wait_s
         self.joint_control = joint_control
         self.clock = clock
         self.settle_s = settle_s
@@ -1873,7 +1932,8 @@ class Walk:
             self.state = {"id": self.seq, "state": "starting", "phase": "translate",
                           "request": {"dx": dx, "dy": dy, "dyaw": dyaw}, "reason": None,
                           "start": None, "goal": None, "pose": None, "error": None,
-                          "elapsed_s": 0.0}
+                          "elapsed_s": 0.0, "blocked": None,
+                          "eyes": "lidar" if self.lidar is not None else "none"}
             self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw),
                                            name="walk", daemon=True)
             self.thread.start()
@@ -1902,13 +1962,28 @@ class Walk:
         if not reply.startswith("ok"):
             raise RuntimeError(f"the robot refused '{line.split()[0]}': {reply}")
 
+    def _eyes(self, lidar_seen, cells, since):
+        """(seq, cells, time of the last fresh map) after a look at the lidar, never waiting."""
+        if self.lidar is None:
+            return lidar_seen, cells, since
+        seq, line = self.lidar.next_line(lidar_seen, 0)
+        if line is not None:
+            got, _d = parse_lidar(line)
+            if got is not None:
+                return seq, got, self.clock()
+        return seq, cells, since
+
     def _run(self, dx, dy, dyaw):
         if not self.odom.subscribe():
             self._set(state="failure", reason="the odometry stream has no room for one more")
             return
+        looking = self.lidar is not None and self.lidar.subscribe()
         t0 = self.clock()
         pose = goal = None
         try:
+            if self.require_lidar and not looking:
+                raise RuntimeError("the lidar stream has no room for one more")
+            lidar_seen, cells, seen_at = 0, None, None
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
@@ -1922,6 +1997,7 @@ class Walk:
                       goal={k: goal[k] for k in ("x", "y", "yaw")}, limit_s=round(limit, 1))
             phase = "translate" if dist >= 0.01 else "turn"
             last_send = -1.0
+            blocked_since, waited = None, 0.0
             while True:
                 if self.cancelled.is_set():
                     raise _WalkCancelled()
@@ -1930,13 +2006,37 @@ class Walk:
                     raise RuntimeError(f"odometry stopped for {WALK_ODOM_STALE_S:g} s")
                 pose = fresh
                 now = self.clock() - t0
-                if now > limit:
+                if now - waited - (now - blocked_since if blocked_since is not None else 0) > limit:
                     raise RuntimeError(f"not there after {limit:.0f} s")
+                lidar_seen, cells, seen_at = self._eyes(lidar_seen, cells, seen_at)
+                if self.require_lidar and ((seen_at is None and now > WALK_LIDAR_STALE_S * 2) or
+                                           (seen_at is not None and
+                                           self.clock() - seen_at > WALK_LIDAR_STALE_S)):
+                    raise RuntimeError("no obstacle map from the lidar (is it pointed at PC2? "
+                                       "tools/livox_set_host.py show)")
+                if self.require_lidar and seen_at is None:
+                    continue                    # the first map is on its way: do not move yet
                 vx, vy, vyaw, phase = walk_command(pose, goal, phase)
                 self._set(pose=dict(pose), phase=phase, elapsed_s=round(now, 1),
                           error=self._errors(pose, goal))
                 if phase == "done":
                     break
+                ahead = obstacle_ahead(pose, vx, vy, cells) if phase == "translate" else None
+                if ahead is not None:
+                    # Something in the way: stop, give it a moment to move off, then give up.
+                    if blocked_since is None:
+                        self._send("stop_move")
+                        blocked_since = now
+                        audit("-", "walk-blocked", f"{ahead:.2f} m ahead", "-")
+                    self._set(blocked={"dist_m": round(ahead, 2)})
+                    if now - blocked_since > self.blocked_wait_s:
+                        raise RuntimeError(f"blocked: something {ahead:.2f} m ahead did not move "
+                                           f"in {self.blocked_wait_s:g} s")
+                    continue
+                if blocked_since is not None:
+                    waited += now - blocked_since      # time spent waiting does not count
+                    blocked_since = None
+                    self._set(blocked=None)
                 if now - last_send >= 1.0 / self.hz:
                     self._send(f"move {vx:.3f} {vy:.3f} {vyaw:.3f}")
                     last_send = now
@@ -1968,6 +2068,8 @@ class Walk:
                          if pose and goal else {}))
         finally:
             self.odom.unsubscribe()
+            if looking:
+                self.lidar.unsubscribe()
             with self.lock:
                 st = dict(self.state)
             audit("-", "walk-end", f"id={st['id']} {st['state']}",
@@ -2094,7 +2196,14 @@ class Handler(BaseHTTPRequestHandler):
         per tick, the same way as the joints. Read-only."""
         return self._ndjson_stream(getattr(self.server, "odom", None), "odom")
 
-    def _ndjson_stream(self, joints, name):
+    def _lidar_stream(self):
+        """GET /lidar/stream — the obstacle map around the G1 (src/g1_lidar_bridge.cpp), for the
+        Navigation page: coarser (LIDAR_VIEW_RES) and slower (LIDAR_VIEW_HZ) than the walk's own
+        copy, because this one crosses the uplink. Read-only."""
+        return self._ndjson_stream(getattr(self.server, "lidar", None), "lidar",
+                                   shape=coarsen_lidar, min_interval=1.0 / LIDAR_VIEW_HZ)
+
+    def _ndjson_stream(self, joints, name, shape=None, min_interval=0.0):
         src = self.client_address[0]
         if not self._authorised():
             audit(src, f"{name}-stream", "-", "unauthorised")
@@ -2116,8 +2225,12 @@ class Handler(BaseHTTPRequestHandler):
             seen = 0
             while True:
                 seen, line = joints.next_line(seen, JOINT_HEARTBEAT_S)
+                if line is not None and shape is not None:
+                    line = shape(line)
                 self.wfile.write(((line or '{"stale":true}') + "\n").encode())
                 self.wfile.flush()
+                if min_interval:
+                    time.sleep(min_interval)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass                        # the caller hung up: the normal way this ends
         finally:
@@ -2248,6 +2361,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._joint_stream()
         if self.path.split("?")[0].rstrip("/") == "/odom/stream":
             return self._odom_stream()
+        if self.path.split("?")[0].rstrip("/") == "/lidar/stream":
+            return self._lidar_stream()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             if not self._authorised():
                 return self._json(401, {"error": "unauthorised"})
@@ -2293,6 +2408,9 @@ class Handler(BaseHTTPRequestHandler):
                                   else {"running": False, "available": False}),
                          "walk": (self.server.walk.status() if getattr(self.server, "walk", None)
                                   else {"state": "unavailable"}),
+                         "lidar": (self.server.lidar.status()
+                                   if getattr(self.server, "lidar", None)
+                                   else {"running": False, "available": False}),
                          "joint_control": (self.server.joint_control.status()
                                            if self.server.joint_control
                                            else {"active": False, "available": False}),
@@ -2600,11 +2718,15 @@ def main():
                          if ROBOT_MODEL == "g1" else None)
     srv.joint_limiter = RateLimiter(JOINT_CTL_MAX_PER_SEC)
     # The odometry and the walk to a point, only if the bridge was built (G1 only).
-    srv.odom = srv.walk = None
+    srv.odom = srv.walk = srv.lidar = None
     if ROBOT_MODEL == "g1":
+        if os.access(LIDAR_BRIDGE, os.X_OK):
+            srv.lidar = JointStream([LIDAR_BRIDGE], label="lidar bridge")
+        else:
+            log(f"no {LIDAR_BRIDGE}: /lidar is off and walks are blind until ./build.sh is run")
         if os.access(ODOM_BRIDGE, os.X_OK):
             srv.odom = JointStream([ODOM_BRIDGE], label="odom bridge")
-            srv.walk = Walk(srv.sender, srv.odom, srv.joint_control)
+            srv.walk = Walk(srv.sender, srv.odom, srv.joint_control, lidar=srv.lidar)
         else:
             log(f"no {ODOM_BRIDGE}: /odom and /walk are off until ./build.sh is run")
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
@@ -2650,6 +2772,8 @@ def main():
             srv.joints.stop()
         if srv.odom is not None:
             srv.odom.stop()
+        if srv.lidar is not None:
+            srv.lidar.stop()
         # EOF makes the audio sender leave megaphone mode before it exits.
         if srv.audio is not None and srv.audio.proc is not None:
             try:

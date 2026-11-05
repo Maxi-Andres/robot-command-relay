@@ -43,6 +43,10 @@ echo "built ./g1_joint_bridge ($ARCH)"
 # Read-only; run only while someone needs the pose. See src/g1_odom_bridge.cpp.
 g++ -O2 -std=c++17 src/g1_odom_bridge.cpp -o g1_odom_bridge "${INCS[@]}" "${LIBS[@]}"
 echo "built ./g1_odom_bridge ($ARCH)"
+# The lidar's obstacle map, for GET /lidar/stream and the walk's stop before an obstacle.
+# Read-only; needs the Mid-360 pointed at PC2 (tools/livox_set_host.py). See src/g1_lidar_bridge.cpp.
+g++ -O2 -std=c++17 src/g1_lidar_bridge.cpp -o g1_lidar_bridge "${INCS[@]}" "${LIBS[@]}"
+echo "built ./g1_lidar_bridge ($ARCH)"
 # ...and the one that MOVES single arm joints from that page, through rt/arm_sdk. Its rules live
 # in src/joint_ctl_core.hpp; the relay runs it only between "take control" and the release.
 g++ -O2 -std=c++17 src/g1_joint_sender.cpp -o g1_joint_sender "${INCS[@]}" "${LIBS[@]}"

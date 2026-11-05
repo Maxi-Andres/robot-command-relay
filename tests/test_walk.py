@@ -289,3 +289,92 @@ def test_http_a_keepalive_does_not_cancel_a_walk(server):
         time.sleep(0.001)
     call(srv, "/cmd", {"verb": "keepalive"})
     assert srv.walk.running()
+
+
+# --------------------------------------------------------------------------- #
+# Its eyes: the lidar's obstacle map (g1_lidar_bridge), and the stop before hitting something
+# --------------------------------------------------------------------------- #
+class FakeLidar:
+    """The bridge's newest line, made from obstacle points in the odometry frame."""
+
+    def __init__(self, robot, obstacles=(), silent=False):
+        self.robot = robot
+        self.obstacles = list(obstacles)
+        self.silent = silent
+        self.seq = 0
+        self.subscribers = 0
+
+    def subscribe(self):
+        self.subscribers += 1
+        return True
+
+    def unsubscribe(self):
+        self.subscribers -= 1
+
+    def next_line(self, seen, timeout):
+        if self.silent:
+            return seen, None
+        self.seq += 1
+        cells = [[round(x / 0.05), round(y / 0.05)] for x, y in self.obstacles]
+        return self.seq, json.dumps({"t": 0, "age_ms": 40, "odom": 1, "res": 0.05,
+                                     "pose": [self.robot.x, self.robot.y, self.robot.yaw],
+                                     "cells": cells})
+
+
+def seeing_walk(robot, lidar, wait=0.5):
+    return relay_server.Walk(robot, robot, None, clock=robot.clock, settle_s=0.5, lidar=lidar,
+                             require_lidar=True, blocked_wait_s=wait)
+
+
+def test_obstacle_ahead_measures_along_the_way_only():
+    pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+    assert relay_server.obstacle_ahead(pose, 0.3, 0, [(0.4, 0.1)]) == pytest.approx(0.4)
+    assert relay_server.obstacle_ahead(pose, 0.3, 0, [(0.4, 0.5)]) is None      # beside
+    assert relay_server.obstacle_ahead(pose, 0.3, 0, [(-0.3, 0.0)]) is None     # behind
+    assert relay_server.obstacle_ahead(pose, -0.3, 0, [(-0.3, 0.0)]) == pytest.approx(0.3)
+
+
+def test_it_stops_before_a_box_in_the_way_and_gives_up():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    box = [(1.2, dy) for dy in (-0.1, 0.0, 0.1)]
+    walk = seeing_walk(robot, FakeLidar(robot, box))
+    walk.start(2.0, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "blocked" in st["reason"]
+    assert robot.x < 1.2 - 0.35                    # it stopped short, it did not touch it
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_it_goes_on_when_the_way_clears():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    lidar = FakeLidar(robot, [(1.2, 0.0)])
+    walk = seeing_walk(robot, lidar, wait=30)
+    walk.start(2.0, 0, 0)
+    while not (walk.status().get("blocked")):
+        time.sleep(0.001)
+    lidar.obstacles = []                           # the person walked off
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert robot.x == pytest.approx(2.0, abs=0.08)
+
+
+def test_something_beside_the_way_does_not_stop_it():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, [(1.0, 0.6), (1.5, -0.6)]))
+    walk.start(2.0, 0, 0)
+    assert wait_done(walk)["state"] == "success"
+
+
+def test_no_eyes_no_walk():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, silent=True))
+    walk.start(1.0, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "lidar" in st["reason"]
+    assert moves(robot) == []                      # it never took a step
+
+
+def test_the_page_copy_is_coarser():
+    line = json.dumps({"age_ms": 1, "odom": 1, "res": 0.05, "cells": [[0, 0], [1, 1], [3, 0]]})
+    d = json.loads(relay_server.coarsen_lidar(line))
+    assert d["res"] == pytest.approx(0.1) and d["cells"] == [[0, 0], [1, 0]]

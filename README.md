@@ -125,6 +125,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `JOINT_BRIDGE_BIN` | `./g1_joint_bridge` | G1 only: the joint-state reader `GET /joints/stream` runs |
 | `ODOM_BRIDGE_BIN` | `./g1_odom_bridge` | G1 only: the odometry reader behind `GET /odom/stream` and `POST /walk/control`; without it both answer 404 |
 | `WALK_MAX_M` `WALK_VX` `WALK_VY` `WALK_VYAW` | `3.0` `0.3` `0.15` `0.4` | G1 only: the most one walk to a point may cover, and its top speeds (m, m/s, rad/s) |
+| `LIDAR_BRIDGE_BIN` | `./g1_lidar_bridge` | G1 only: the Mid-360 obstacle map behind `GET /lidar/stream`; with it built a walk needs fresh lidar (`WALK_REQUIRE_LIDAR=0` walks blind) and stops `WALK_STOP_M` (0.5 m) before an obstacle. Mount: `LIDAR_MOUNT_ROLL_DEG` (180, upside down), `LIDAR_MOUNT_YAW_DEG` (0) |
 | `JOINT_MAX_CLIENTS` | `4` | G1 only: joint viewers at once; one more gets 503 |
 | `JOINT_IDLE_S` | `10` | G1 only: the bridge keeps running this long after the last viewer leaves |
 | `JOINT_RATE_HZ` | `30` | Read by `g1_joint_bridge`: lines per second (clamped 1-60) |
@@ -153,6 +154,7 @@ RELAY_TOKEN=... ./relay_server.py              # spawns ./command_sender itself
 | `POST /joints/control` | **G1 only, MOVES the arms.** `{op: take}` → `{session, allowed, state, w}`; then `{op: target \| hand \| keepalive \| status \| release, session, joint?, q?, side?, finger?, pos?}` (`hand`: one finger, 0 open .. 1000 closed); `{op: trajectory, session, points}` and `{op: cancel, session}` (below). One session at a time. Same token |
 | `GET /odom/stream` | **G1 only, read-only.** Where the robot thinks it is: `rt/state_estimator/odom_torso` as one JSON line per tick (`{t, age_ms, x, y, z, yaw, vx, vy, wz}`, odom frame, origin where it booted; `src/g1_odom_bridge.cpp`), `{"stale": true}` when nothing new arrives within 1 s. Same token |
 | `POST /walk/control` | **G1 only, MOVES the robot.** `{op: goto, dx, dy, dyaw}` walks to a pose relative to where it stands (m forward, m left, rad left; at most `WALK_MAX_M` and half a turn), closing the loop on its odometry here on PC2: first straight to the point holding its heading, then a turn in place. `{op: cancel}`, `{op: status}`. The answer's `walk` follows the planner's contract: `state` success / uncertain / failure / cancelled, `reason`, `error {pos_m, yaw_deg}`, `start`, `goal`, `pose`. The moves go through `command_sender` (its clamp and dead-man hold); any `/cmd` or UDP command but `keepalive` cancels it (the operator wins), and it is refused while the Joints page holds an arm. **It has no eyes**: nothing sees an obstacle. Same token |
+| `GET /lidar/stream` | **G1 only, read-only.** The obstacle map around the robot from its Mid-360 (`src/g1_lidar_bridge.cpp`: `{t, age_ms, pts_s, floor, tilt_deg, odom, pose, res, cells}`, cells = occupied squares in the odom frame), at 2 Hz and 10 cm for the page; the walk reads the full 5 Hz / 5 cm one. Needs the lidar pointed at PC2: `tools/livox_set_host.py set 192.168.123.255`. Same token |
 
 ### The joint stream (G1)
 
