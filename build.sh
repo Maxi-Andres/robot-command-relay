@@ -39,6 +39,10 @@ done
 # it only while someone is watching. See src/g1_joint_bridge.cpp.
 g++ -O2 -std=c++17 src/g1_joint_bridge.cpp -o g1_joint_bridge "${INCS[@]}" "${LIBS[@]}"
 echo "built ./g1_joint_bridge ($ARCH)"
+# The G1's odometry, for GET /odom/stream and the relay's walk to a point (POST /walk/control).
+# Read-only; run only while someone needs the pose. See src/g1_odom_bridge.cpp.
+g++ -O2 -std=c++17 src/g1_odom_bridge.cpp -o g1_odom_bridge "${INCS[@]}" "${LIBS[@]}"
+echo "built ./g1_odom_bridge ($ARCH)"
 # ...and the one that MOVES single arm joints from that page, through rt/arm_sdk. Its rules live
 # in src/joint_ctl_core.hpp; the relay runs it only between "take control" and the release.
 g++ -O2 -std=c++17 src/g1_joint_sender.cpp -o g1_joint_sender "${INCS[@]}" "${LIBS[@]}"

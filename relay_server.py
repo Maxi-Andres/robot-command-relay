@@ -139,7 +139,33 @@ JOINT_IDLE_S = float(os.environ.get("JOINT_IDLE_S", "10"))
 # to tell "the robot is still" from "nothing is arriving".
 JOINT_HEARTBEAT_S = 1.0
 
-# Moving single arm joints from the Joints page (POST /joints/control, G1 only): see JointControl.
+# The G1's own odometry (GET /odom/stream, and what POST /walk/control steers by): see Walk.
+# rt/state_estimator/odom_torso, read by g1_odom_bridge at ODOM_RATE_HZ (its default 20 Hz).
+ODOM_BRIDGE = os.environ.get("ODOM_BRIDGE_BIN", "./g1_odom_bridge")
+
+# WALK TO A POINT (POST /walk/control, G1 only, 2026-11-05). The robot walks to a pose given
+# RELATIVE to where it stands, closing the loop on its own odometry, here on PC2: a dropped link
+# cannot leave it walking, because the moves go to command_sender like any other and its 1 s
+# dead-man still applies. Measured that day: 1.978 m reported for 2 m walked, 0 drift standing.
+# What it does NOT have: eyes. Nothing here sees an obstacle — the operator with the remote is
+# the obstacle detector until the lidar map exists (G1.md §6.2, phase 7b).
+WALK_MAX_M = float(os.environ.get("WALK_MAX_M", "3.0"))      # per request, straight-line
+WALK_MAX_TURN = math.pi                                     # per request, either way
+WALK_VX = float(os.environ.get("WALK_VX", "0.3"))           # m/s forward/back, at most
+WALK_VY = float(os.environ.get("WALK_VY", "0.15"))          # m/s sideways
+WALK_VYAW = float(os.environ.get("WALK_VYAW", "0.4"))       # rad/s
+WALK_MIN_V = 0.08            # slower than this the robot marks time instead of stepping
+WALK_MIN_W = 0.12
+WALK_GAIN = 1.0              # 1/s: speed = distance left x this, between the two above
+WALK_YAW_GAIN = 1.5
+WALK_POS_TOL = 0.06          # m: this close = arrived
+WALK_YAW_TOL = math.radians(3)
+WALK_HZ = 10.0               # moves sent per second
+WALK_ODOM_STALE_S = 0.5      # no odometry for this long = stop, failure
+WALK_SETTLE_S = 1.0          # after the stop, the robot finishes its step before measuring
+WALK_OK_POS = 0.15           # what counts as success once settled (else "uncertain")
+WALK_OK_YAW = math.radians(8)
+
 JOINT_SENDER = os.environ.get("JOINT_SENDER_BIN", "./g1_joint_sender")
 # Its own budget, apart from /cmd's: a dragged slider sends ~10 targets a second plus keepalives,
 # and that must neither starve the drive pad nor be starved by it.
@@ -911,8 +937,9 @@ class CommandOrder:
 class UdpControl:
     """Datagram in, at most one command to command_sender, at most one ack out."""
 
-    def __init__(self, key, sender, limiter, order, joint_control=None):
+    def __init__(self, key, sender, limiter, order, joint_control=None, walk=None):
         self.key = key
+        self.walk = walk
         self.sender = sender
         self.limiter = limiter
         self.order = order
@@ -927,6 +954,9 @@ class UdpControl:
         except ValueError as exc:
             self.stats[str(exc)] += 1
             return None
+        if self.walk is not None:            # the drive pad wins over a walk to a point
+            self.walk.cancel(f"udp {'stop' if kind == UDP_KIND_STOP else 'move'} from {src}",
+                             stop=kind == UDP_KIND_STOP)
         if kind == UDP_KIND_STOP:
             # Not rate limited: repeating a stop is harmless, refusing one is not.
             self.order.stop(ts, robot_now)
@@ -1049,8 +1079,10 @@ class JointStream:
     a new one. Its stdin is ours, so closing it is how it is told to exit.
     """
 
-    def __init__(self, argv, max_clients=JOINT_MAX_CLIENTS, idle_s=JOINT_IDLE_S):
+    def __init__(self, argv, max_clients=JOINT_MAX_CLIENTS, idle_s=JOINT_IDLE_S,
+                 label="joint bridge"):
         self.argv = argv
+        self.label = label
         self.max_clients = max_clients
         self.idle_s = idle_s
         self.cond = threading.Condition()
@@ -1067,8 +1099,8 @@ class JointStream:
         self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      text=True, bufsize=1)
         self.latest = None
-        log(f"joint bridge started (pid {self.proc.pid})")
-        threading.Thread(target=self._read, args=(self.proc,), name="joint-bridge",
+        log(f"{self.label} started (pid {self.proc.pid})")
+        threading.Thread(target=self._read, args=(self.proc,), name=self.label.replace(" ", "-"),
                          daemon=True).start()
 
     def _read(self, proc):
@@ -1086,7 +1118,7 @@ class JointStream:
                 self.proc = None
                 self.latest = None
             self.cond.notify_all()
-        log(f"joint bridge exited (code {proc.wait()})")
+        log(f"{self.label} exited (code {proc.wait()})")
 
     def subscribe(self):
         """Register a viewer. False when the viewer cap is reached."""
@@ -1721,6 +1753,237 @@ class JointControl:
                 "safe": self.safe is not None, "retreat": self.retreat}
 
 
+def wrap_angle(a):
+    """An angle in (-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def validate_goto(body):
+    """(dx, dy, dyaw) from a goto request, or raise ValueError with the reason."""
+    try:
+        dx, dy, dyaw = (float(body.get(k, 0) or 0) for k in ("dx", "dy", "dyaw"))
+    except (TypeError, ValueError):
+        raise ValueError("dx/dy/dyaw must be numbers") from None
+    if not all(math.isfinite(v) for v in (dx, dy, dyaw)):
+        raise ValueError("dx/dy/dyaw must be finite")
+    if math.hypot(dx, dy) > WALK_MAX_M:
+        raise ValueError(f"at most {WALK_MAX_M:g} m per request")
+    if abs(dyaw) > WALK_MAX_TURN + 1e-9:
+        raise ValueError("at most half a turn (pi rad) per request")
+    if math.hypot(dx, dy) < 0.01 and abs(dyaw) < math.radians(1):
+        raise ValueError("nothing to do: dx, dy and dyaw are all zero")
+    return dx, dy, dyaw
+
+
+def walk_command(pose, goal, phase):
+    """(vx, vy, vyaw, phase) toward `goal` from `pose`, both {x, y, yaw} in the odom frame.
+
+    Two phases, deterministic and easy to watch: TRANSLATE to the goal's position holding the
+    heading the walk started with (so "2 m forward" is a straight line, not an arc), then TURN in
+    place to the goal's heading. While turning the position is not chased: the torso sways ~10 cm
+    when a humanoid turns in place (seen 2026-11-05), and chasing that would make it shuffle.
+    `phase` "done" = arrived."""
+    yaw = pose["yaw"]
+    if phase == "translate":
+        ex_w, ey_w = goal["x"] - pose["x"], goal["y"] - pose["y"]
+        if math.hypot(ex_w, ey_w) > WALK_POS_TOL:
+            # The error in the robot's own frame: forward is x, left is y.
+            ex = math.cos(yaw) * ex_w + math.sin(yaw) * ey_w
+            ey = -math.sin(yaw) * ex_w + math.cos(yaw) * ey_w
+            vx, vy = WALK_GAIN * ex, WALK_GAIN * ey
+            # Both axes scaled together, so the robot heads AT the goal, not past it.
+            scale = min(1.0, WALK_VX / max(abs(vx), 1e-9), WALK_VY / max(abs(vy), 1e-9))
+            vx, vy = vx * scale, vy * scale
+            speed = math.hypot(vx, vy)
+            if speed < WALK_MIN_V:
+                vx, vy = vx * WALK_MIN_V / speed, vy * WALK_MIN_V / speed
+            hold = wrap_angle(goal["hold"] - yaw)
+            vyaw = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * hold))
+            return vx, vy, vyaw, "translate"
+        phase = "turn"
+    if phase == "turn":
+        err = wrap_angle(goal["yaw"] - yaw)
+        if abs(err) > WALK_YAW_TOL:
+            w = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * err))
+            if abs(w) < WALK_MIN_W:
+                w = math.copysign(WALK_MIN_W, err)
+            return 0.0, 0.0, w, "turn"
+    return 0.0, 0.0, 0.0, "done"
+
+
+class Walk:
+    """WALK TO A POINT, relative to where the robot stands (POST /walk/control). G1 only.
+
+    One goal at a time, on its own thread: read the odometry (OdomStream, g1_odom_bridge), send
+    `move` to the same command_sender the drive pad uses — its clamp and its 1 s dead-man still
+    hold — and end with a stop_move whatever happens. The result follows the planner's contract
+    (G1.md §6.9): success | uncertain | failure | cancelled, with the reason and the error left.
+
+    Who wins: the OPERATOR. A stop from anywhere, a drive-pad move, or the Joints page taking an
+    arm cancels the walk (the handlers call cancel()); a walk is refused while an arm is held.
+    """
+
+    def __init__(self, sender, odom, joint_control=None, clock=time.monotonic,
+                 settle_s=WALK_SETTLE_S, hz=WALK_HZ):
+        self.sender = sender
+        self.odom = odom
+        self.joint_control = joint_control
+        self.clock = clock
+        self.settle_s = settle_s
+        self.hz = hz
+        self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self.thread = None
+        self.state = None           # the last goal's snapshot: what status() reports
+        self.seq = 0
+
+    def running(self):
+        t = self.thread
+        return t is not None and t.is_alive()
+
+    def status(self):
+        with self.lock:
+            return dict(self.state) if self.state else {"state": "idle"}
+
+    def _set(self, **kw):
+        with self.lock:
+            self.state.update(kw)
+
+    def cancel(self, why, stop=True):
+        """End a running walk. `stop`=False when the operator's own command is taking over (a
+        drive-pad move): then the walk must not send a stop_move after it."""
+        if self.running():
+            self._set(cancel_reason=why, cancel_stops=stop)
+            self.cancelled.set()
+            audit("-", "walk-cancel", why, "-")
+            return True
+        return False
+
+    def start(self, dx, dy, dyaw):
+        """(http code, answer). Refused while an arm is held or another walk runs."""
+        if self.joint_control is not None and self.joint_control.busy():
+            return 409, {"ok": False, "error": "the Joints page holds the arms: release them "
+                                               "first"}
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                return 409, {"ok": False, "error": "a walk is already running",
+                             "walk": dict(self.state)}
+            self.seq += 1
+            self.cancelled.clear()
+            self.state = {"id": self.seq, "state": "starting", "phase": "translate",
+                          "request": {"dx": dx, "dy": dy, "dyaw": dyaw}, "reason": None,
+                          "start": None, "goal": None, "pose": None, "error": None,
+                          "elapsed_s": 0.0}
+            self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw),
+                                           name="walk", daemon=True)
+            self.thread.start()
+            return 200, {"ok": True, "walk": dict(self.state)}
+
+    # -- the loop -------------------------------------------------------- #
+    def _pose(self, seen, timeout):
+        """(seq, pose) of the next fresh odometry line, or (seq, None) if none arrived."""
+        seen, line = self.odom.next_line(seen, timeout)
+        if line is None:
+            return seen, None
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return seen, None
+        if d.get("age_ms", -1) < 0 or d["age_ms"] > WALK_ODOM_STALE_S * 1000:
+            return seen, None
+        return seen, {k: float(d[k]) for k in ("x", "y", "yaw")}
+
+    def _errors(self, pose, goal):
+        return {"pos_m": round(math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"]), 3),
+                "yaw_deg": round(math.degrees(wrap_angle(goal["yaw"] - pose["yaw"])), 1)}
+
+    def _send(self, line):
+        reply = self.sender.send(line)
+        if not reply.startswith("ok"):
+            raise RuntimeError(f"the robot refused '{line.split()[0]}': {reply}")
+
+    def _run(self, dx, dy, dyaw):
+        if not self.odom.subscribe():
+            self._set(state="failure", reason="the odometry stream has no room for one more")
+            return
+        t0 = self.clock()
+        pose = goal = None
+        try:
+            seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
+            if pose is None:
+                raise RuntimeError("no odometry from the robot")
+            c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+            goal = {"x": pose["x"] + c * dx - s * dy, "y": pose["y"] + s * dx + c * dy,
+                    "yaw": wrap_angle(pose["yaw"] + dyaw), "hold": pose["yaw"]}
+            dist = math.hypot(dx, dy)
+            # Generous: the slowest the robot goes, plus time to start and to stop.
+            limit = dist / WALK_MIN_V + abs(dyaw) / WALK_MIN_W + 10.0
+            self._set(state="running", start=dict(pose), pose=dict(pose),
+                      goal={k: goal[k] for k in ("x", "y", "yaw")}, limit_s=round(limit, 1))
+            phase = "translate" if dist >= 0.01 else "turn"
+            last_send = -1.0
+            while True:
+                if self.cancelled.is_set():
+                    raise _WalkCancelled()
+                seen, fresh = self._pose(seen, WALK_ODOM_STALE_S)
+                if fresh is None:
+                    raise RuntimeError(f"odometry stopped for {WALK_ODOM_STALE_S:g} s")
+                pose = fresh
+                now = self.clock() - t0
+                if now > limit:
+                    raise RuntimeError(f"not there after {limit:.0f} s")
+                vx, vy, vyaw, phase = walk_command(pose, goal, phase)
+                self._set(pose=dict(pose), phase=phase, elapsed_s=round(now, 1),
+                          error=self._errors(pose, goal))
+                if phase == "done":
+                    break
+                if now - last_send >= 1.0 / self.hz:
+                    self._send(f"move {vx:.3f} {vy:.3f} {vyaw:.3f}")
+                    last_send = now
+            self._send("stop_move")
+            # A biped finishes its step after the stop: measure where it ends, not where it was.
+            end = self.clock() + self.settle_s
+            while self.clock() < end:
+                seen, fresh = self._pose(seen, WALK_ODOM_STALE_S)
+                if fresh is not None:
+                    pose = fresh
+            err = self._errors(pose, goal)
+            ok = err["pos_m"] <= WALK_OK_POS and abs(math.radians(err["yaw_deg"])) <= WALK_OK_YAW
+            self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
+                      error=err, elapsed_s=round(self.clock() - t0, 1),
+                      reason=None if ok else "stopped further off than expected")
+        except _WalkCancelled:
+            with self.lock:
+                why = self.state.get("cancel_reason") or "cancelled"
+                stop = self.state.get("cancel_stops", True)
+            if stop:
+                self._stop_quietly()
+            self._set(state="cancelled", reason=why, elapsed_s=round(self.clock() - t0, 1),
+                      **({"pose": dict(pose), "error": self._errors(pose, goal)}
+                         if pose and goal else {}))
+        except Exception as exc:                  # every way out stops the robot
+            self._stop_quietly()
+            self._set(state="failure", reason=str(exc), elapsed_s=round(self.clock() - t0, 1),
+                      **({"pose": dict(pose), "error": self._errors(pose, goal)}
+                         if pose and goal else {}))
+        finally:
+            self.odom.unsubscribe()
+            with self.lock:
+                st = dict(self.state)
+            audit("-", "walk-end", f"id={st['id']} {st['state']}",
+                  f"{st.get('reason') or '-'} error={st.get('error')}")
+
+    def _stop_quietly(self):
+        try:
+            self.sender.send("stop_move")
+        except Exception as exc:                  # the sender's dead-man is the last line
+            log(f"walk: stop_move failed: {exc}")
+
+
+class _WalkCancelled(Exception):
+    pass
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "robot-relay"
@@ -1824,17 +2087,25 @@ class Handler(BaseHTTPRequestHandler):
         no new one arrives within JOINT_HEARTBEAT_S the caller gets {"stale": true} instead,
         which is also how a dead caller is noticed (the write fails).
         """
+        return self._ndjson_stream(self.server.joints, "joints")
+
+    def _odom_stream(self):
+        """GET /odom/stream — where the G1 thinks it is (src/g1_odom_bridge.cpp), one JSON line
+        per tick, the same way as the joints. Read-only."""
+        return self._ndjson_stream(getattr(self.server, "odom", None), "odom")
+
+    def _ndjson_stream(self, joints, name):
         src = self.client_address[0]
         if not self._authorised():
-            audit(src, "joints-stream", "-", "unauthorised")
+            audit(src, f"{name}-stream", "-", "unauthorised")
             return self._json(401, {"error": "unauthorised"})
-        joints = self.server.joints
         if joints is None:
-            return self._json(404, {"error": f"no joint stream on a {ROBOT_MODEL}"})
+            return self._json(404, {"error": f"no {name} stream on this {ROBOT_MODEL} (G1 only, "
+                                             f"and its bridge built by ./build.sh)"})
         if not joints.subscribe():
-            return self._json(503, {"error": "too many joint viewers",
+            return self._json(503, {"error": f"too many {name} viewers",
                                     "max_clients": joints.max_clients})
-        audit(src, "joints-stream", "-", "opened")
+        audit(src, f"{name}-stream", "-", "opened")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
@@ -1851,7 +2122,7 @@ class Handler(BaseHTTPRequestHandler):
             pass                        # the caller hung up: the normal way this ends
         finally:
             joints.unsubscribe()
-            audit(src, "joints-stream", "-", "closed")
+            audit(src, f"{name}-stream", "-", "closed")
 
     def _joint_control(self):
         """POST /joints/control — move single arm joints of the G1 from the Joints page.
@@ -1899,6 +2170,10 @@ class Handler(BaseHTTPRequestHandler):
         # A release is never rate limited, like a stop: refusing one is the dangerous answer.
         if op != "release" and not self.server.joint_limiter.allow():
             return self._json(429, {"error": "rate limited"})
+        if op == "take" and getattr(self.server, "walk", None) is not None and self.server.walk.running():
+            audit(src, "joints-control", "take", "rejected-walking")
+            return self._json(409, {"ok": False, "error": "the robot is walking to a point: "
+                                                         "cancel the walk first"})
         if op == "take":
             code, out = ctl.take(body.get("safe"))
             audit(src, "joints-control", "take", out.get("reply") or out.get("error", "-"))
@@ -1918,6 +2193,52 @@ class Handler(BaseHTTPRequestHandler):
                 audit(src, "joints-control", detail, out.get("reply") or out.get("error", "-"))
         return self._json(code, out)
 
+    def _walk_control(self):
+        """POST /walk/control — the G1 walks to a pose RELATIVE to where it stands (see Walk).
+
+          {"op": "goto", "dx": m forward, "dy": m left, "dyaw": rad left}  -> {ok, walk}
+          {"op": "cancel"}                                                    -> {ok, walk}
+          {"op": "status"}                                                    -> {ok, walk}
+
+        `walk` is {id, state: starting | running | success | uncertain | failure | cancelled,
+        phase: translate | turn | done, request, start, goal, pose (odom frame: x, y, yaw),
+        error: {pos_m, yaw_deg}, reason, elapsed_s, limit_s}.
+        """
+        src = self.client_address[0]
+        if not self._authorised():
+            audit(src, "walk-control", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        walk = getattr(self.server, "walk", None)
+        if walk is None:
+            return self._json(404, {"error": f"no walk control on this {ROBOT_MODEL} (G1 only, "
+                                             f"and g1_odom_bridge built by ./build.sh)"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "bad json"})
+        op = body.get("op")
+        if op == "status":
+            return self._json(200, {"ok": True, "walk": walk.status()})
+        if op == "cancel":
+            # Never rate limited, like a stop.
+            walk.cancel(f"cancel from {src}")
+            return self._json(200, {"ok": True, "walk": walk.status()})
+        if op != "goto":
+            return self._json(400, {"error": "op must be goto, cancel or status"})
+        if not self.server.limiter.allow():
+            return self._json(429, {"error": "rate limited"})
+        try:
+            dx, dy, dyaw = validate_goto(body)
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
+        code, out = walk.start(dx, dy, dyaw)
+        audit(src, "walk-goto", f"dx={dx:.2f} dy={dy:.2f} dyaw={dyaw:.2f}",
+              "started" if out.get("ok") else out.get("error", "-"))
+        return self._json(code, out)
+
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
             return self._audio("GET")
@@ -1925,6 +2246,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._depth()
         if self.path.split("?")[0].rstrip("/") == "/joints/stream":
             return self._joint_stream()
+        if self.path.split("?")[0].rstrip("/") == "/odom/stream":
+            return self._odom_stream()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             if not self._authorised():
                 return self._json(401, {"error": "unauthorised"})
@@ -1966,6 +2289,10 @@ class Handler(BaseHTTPRequestHandler):
                                  if self.server.udp else {"port": 0}),
                          "joints": (self.server.joints.status() if self.server.joints
                                     else {"running": False, "available": False}),
+                         "odom": (self.server.odom.status() if getattr(self.server, "odom", None)
+                                  else {"running": False, "available": False}),
+                         "walk": (self.server.walk.status() if getattr(self.server, "walk", None)
+                                  else {"state": "unavailable"}),
                          "joint_control": (self.server.joint_control.status()
                                            if self.server.joint_control
                                            else {"active": False, "available": False}),
@@ -2161,6 +2488,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._video_config()
         if self.path.split("?")[0].rstrip("/") == "/joints/control":
             return self._joint_control()
+        if self.path.split("?")[0].rstrip("/") == "/walk/control":
+            return self._walk_control()
         if self.path.split("?")[0] != "/cmd":
             return self._json(404, {"error": "not found"})
         if not self._authorised():
@@ -2187,6 +2516,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "ts must be a number"})
             if not math.isfinite(ts):
                 return self._json(400, {"error": "ts must be finite"})
+        # The operator wins over a walk to a point: a stop stops it, anything else takes over.
+        if getattr(self.server, "walk", None) is not None and verb not in ("", "keepalive"):
+            self.server.walk.cancel(f"{verb} from {src}", stop=verb == "stop_move")
         if verb == "stop_move":
             self.server.order.stop(ts, time.time())
             # A stop pressed anywhere also hands back an arm held from the Joints page.
@@ -2267,6 +2599,14 @@ def main():
     srv.joint_control = (JointControl([JOINT_SENDER], srv.sender, srv.order, stream=srv.joints)
                          if ROBOT_MODEL == "g1" else None)
     srv.joint_limiter = RateLimiter(JOINT_CTL_MAX_PER_SEC)
+    # The odometry and the walk to a point, only if the bridge was built (G1 only).
+    srv.odom = srv.walk = None
+    if ROBOT_MODEL == "g1":
+        if os.access(ODOM_BRIDGE, os.X_OK):
+            srv.odom = JointStream([ODOM_BRIDGE], label="odom bridge")
+            srv.walk = Walk(srv.sender, srv.odom, srv.joint_control)
+        else:
+            log(f"no {ODOM_BRIDGE}: /odom and /walk are off until ./build.sh is run")
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
     # it just has no /audio).
     srv.audio = None
@@ -2281,7 +2621,7 @@ def main():
     srv.udp = None
     if RELAY_UDP_PORT:
         srv.udp = UdpControl(token.encode(), srv.sender, srv.limiter, srv.order,
-                             srv.joint_control)
+                             srv.joint_control, srv.walk)
         usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         usock.bind((BIND, RELAY_UDP_PORT))
         threading.Thread(target=srv.udp.serve, args=(usock,), name="udp-control",
@@ -2293,6 +2633,8 @@ def main():
     except KeyboardInterrupt:
         log("interrupted")
     finally:
+        if srv.walk is not None:
+            srv.walk.cancel("relay shutting down")
         # The arms first: EOF makes the joint sender ramp its weight down to 0 before exiting,
         # so PC1 has the arms back before anything else goes away.
         if srv.joint_control is not None:
@@ -2306,6 +2648,8 @@ def main():
             pass
         if srv.joints is not None:
             srv.joints.stop()
+        if srv.odom is not None:
+            srv.odom.stop()
         # EOF makes the audio sender leave megaphone mode before it exits.
         if srv.audio is not None and srv.audio.proc is not None:
             try:

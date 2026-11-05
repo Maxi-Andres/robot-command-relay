@@ -10,3 +10,4 @@ go2_audio_sender
 g1_audio_sender
 g1_joint_sender
 /tools/g1_nav_probe
+g1_odom_bridge
