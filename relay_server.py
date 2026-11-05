@@ -1809,12 +1809,13 @@ def validate_goto(body):
     return dx, dy, dyaw
 
 
-def walk_command(pose, goal, phase, aim=None, face=None):
+def walk_command(pose, goal, phase, aim=None, face=None, lim=None):
     """(vx, vy, vyaw, phase) toward `goal` from `pose`, both {x, y, yaw} in the odom frame.
 
     With a planned path, `aim` (x, y) is the point on it to head for now — the speed still comes
     from how far the GOAL is — and `face` the heading to keep meanwhile (the way it walks round
-    an obstacle); without them, straight at the goal holding the start heading.
+    an obstacle); without them, straight at the goal holding the start heading. `lim` is the
+    walk's (vx, vy, vyaw) top speeds; the defaults when absent.
 
     Two phases, deterministic and easy to watch: TRANSLATE to the goal's position holding the
     heading the walk started with (so "2 m forward" is a straight line, not an arc), then TURN in
@@ -1822,6 +1823,7 @@ def walk_command(pose, goal, phase, aim=None, face=None):
     when a humanoid turns in place (seen 2026-11-05), and chasing that would make it shuffle.
     `phase` "done" = arrived."""
     yaw = pose["yaw"]
+    lvx, lvy, lvyaw = lim or (WALK_VX, WALK_VY, WALK_VYAW)
     if phase == "translate":
         ex_w, ey_w = goal["x"] - pose["x"], goal["y"] - pose["y"]
         left = math.hypot(ex_w, ey_w)
@@ -1836,19 +1838,19 @@ def walk_command(pose, goal, phase, aim=None, face=None):
             ey = -math.sin(yaw) * ex_w + math.cos(yaw) * ey_w
             vx, vy = WALK_GAIN * ex, WALK_GAIN * ey
             # Both axes scaled together, so the robot heads AT the goal, not past it.
-            scale = min(1.0, WALK_VX / max(abs(vx), 1e-9), WALK_VY / max(abs(vy), 1e-9))
+            scale = min(1.0, lvx / max(abs(vx), 1e-9), lvy / max(abs(vy), 1e-9))
             vx, vy = vx * scale, vy * scale
             speed = math.hypot(vx, vy)
             if speed < WALK_MIN_V:
                 vx, vy = vx * WALK_MIN_V / speed, vy * WALK_MIN_V / speed
             hold = wrap_angle((goal["hold"] if face is None else face) - yaw)
-            vyaw = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * hold))
+            vyaw = max(-lvyaw, min(lvyaw, WALK_YAW_GAIN * hold))
             return vx, vy, vyaw, "translate"
         phase = "turn"
     if phase == "turn":
         err = wrap_angle(goal["yaw"] - yaw)
         if abs(err) > WALK_YAW_TOL:
-            w = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * err))
+            w = max(-lvyaw, min(lvyaw, WALK_YAW_GAIN * err))
             if abs(w) < WALK_MIN_W:
                 w = math.copysign(WALK_MIN_W, err)
             return 0.0, 0.0, w, "turn"
@@ -1926,6 +1928,28 @@ class OdomTrail:
             self.cleared_at = time.time()
 
 
+def walk_options(body):
+    """(lim, mode) from a goto request: `speed` {vx, vy, vyaw} top speeds (each within WALK_CAPS,
+    defaults WALK_VX / WALK_VY / WALK_VYAW) and `mode` "walk" | "run" | None (keep the robot's).
+    ValueError with the reason."""
+    sp = body.get("speed") or {}
+    if not isinstance(sp, dict):
+        raise ValueError("speed must be {vx, vy, vyaw}")
+    lim = []
+    for k, default, cap in zip(("vx", "vy", "vyaw"), (WALK_VX, WALK_VY, WALK_VYAW), WALK_CAPS):
+        try:
+            v = float(sp.get(k, default))
+        except (TypeError, ValueError):
+            raise ValueError(f"speed.{k} must be a number") from None
+        if not (math.isfinite(v) and 0 < v <= cap + 1e-9):
+            raise ValueError(f"speed.{k} must be over 0 and at most {cap:g}")
+        lim.append(v)
+    mode = body.get("mode")
+    if mode not in (None, "walk", "run"):
+        raise ValueError("mode must be walk or run")
+    return tuple(lim), mode
+
+
 def parse_lidar(line):
     """(cells as (x, y) metres in the odom frame, the line's dict) from a g1_lidar_bridge line,
     or (None, dict) when it cannot be used: not fresh, or not in the odometry frame."""
@@ -1980,6 +2004,16 @@ WALK_BACKSTEP_M = 1.0
 WALK_ALIGN_RAD = math.radians(25)
 WALK_ALIGNED_RAD = math.radians(8)   # ...and turns until within this, so it sets off straight
 WALK_FREEZE_FACE_M = 0.35
+# SPEED AND MODE, chosen per walk on the page (2026-11-05), as on the drive pad: the walk's top
+# speeds come with the request, up to WALK_CAPS (the command sender clamps at the same 1.2 / 0.5 /
+# 1.2 anyway). Faster means stopping sooner: the stop distance grows WALK_STOP_PER_MS metres for
+# every m/s over 0.3, and the slow zone starts WALK_SLOW_EXTRA_M before it.
+WALK_CAPS = (1.2, 0.5, 1.2)
+WALK_STOP_PER_MS = 1.0
+WALK_SLOW_EXTRA_M = 0.7
+# The locomotion modes a walk may start from, and switch between (rt FSM ids, g1_commands.py).
+WALK_FSM = {500: "walk", 501: "walk", 801: "run", 802: "run"}
+MODE_SWITCH_S = 4.0
 WALK_SLOW_M = 1.2
 WALK_SLOW_HALF = 0.35
 WALK_SLOW_MIN = 0.35
@@ -2189,7 +2223,7 @@ class Walk:
             return True
         return False
 
-    def start(self, dx, dy, dyaw):
+    def start(self, dx, dy, dyaw, lim=None, mode=None):
         """(http code, answer). Refused while an arm is held or another walk runs."""
         if self.joint_control is not None and self.joint_control.busy():
             return 409, {"ok": False, "error": "the Joints page holds the arms: release them "
@@ -2205,7 +2239,9 @@ class Walk:
                           "start": None, "goal": None, "pose": None, "error": None,
                           "elapsed_s": 0.0, "blocked": None, "path": None,
                           "eyes": "lidar" if self.lidar is not None else "none"}
-            self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw),
+            self.state["speed"] = dict(zip(("vx", "vy", "vyaw"), lim or (WALK_VX, WALK_VY, WALK_VYAW)))
+            self.state["mode"] = mode
+            self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw, lim, mode),
                                            name="walk", daemon=True)
             self.thread.start()
             return 200, {"ok": True, "walk": dict(self.state)}
@@ -2265,7 +2301,9 @@ class Walk:
             return seen, None
         if d.get("age_ms", -1) < 0 or d["age_ms"] > WALK_ODOM_STALE_S * 1000:
             return seen, None
-        return seen, {k: float(d[k]) for k in ("x", "y", "yaw")}
+        out = {k: float(d[k]) for k in ("x", "y", "yaw")}
+        out["fsm"] = int(d.get("fsm", -1))
+        return seen, out
 
     def _errors(self, pose, goal):
         return {"pos_m": round(math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"]), 3),
@@ -2287,7 +2325,34 @@ class Walk:
                 return seq, got, self.clock()
         return seq, cells, since
 
-    def _run(self, dx, dy, dyaw):
+    def _switch_mode(self, seen, pose, mode):
+        """Put the robot in `mode` (walk | run) if it is in the other one; refuse if it is in
+        neither — this never stands a squatting or sitting robot up. -> (seen, pose)."""
+        fsm = pose.get("fsm", -1)
+        if fsm not in WALK_FSM:
+            raise RuntimeError(
+                f"the robot is not walking or running (mode {fsm}): stand it up in Walk first, "
+                f"from the remote or the drive pad" if fsm >= 0 else
+                "the robot's mode could not be read, so it was not switched")
+        if WALK_FSM[fsm] == mode:
+            return seen, pose
+        verb = {("walk", True): "start", ("walk", False): "walk_waist",
+                ("run", True): "run", ("run", False): "run_waist"}[(mode, G1_WAIST_LOCK)]
+        self._set(phase="mode")
+        audit("-", "walk-mode", f"{WALK_FSM[fsm]} -> {mode} ({verb})", "-")
+        self._send(verb)
+        end = self.clock() + MODE_SWITCH_S
+        while self.clock() < end:
+            if self.cancelled.is_set():
+                raise _WalkCancelled()
+            seen, fresh = self._pose(seen, WALK_ODOM_STALE_S)
+            if fresh is not None:
+                pose = fresh
+                if WALK_FSM.get(pose["fsm"]) == mode:
+                    return seen, pose
+        raise RuntimeError(f"it did not switch to {mode} in {MODE_SWITCH_S:g} s")
+
+    def _run(self, dx, dy, dyaw, lim=None, mode=None):
         if not self.odom.subscribe():
             self._set(state="failure", reason="the odometry stream has no room for one more")
             return
@@ -2303,6 +2368,11 @@ class Walk:
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
+            if mode is not None:
+                seen, pose = self._switch_mode(seen, pose, mode)
+            lim = lim or (WALK_VX, WALK_VY, WALK_VYAW)
+            stop_m = WALK_STOP_M + max(0.0, lim[0] - 0.3) * WALK_STOP_PER_MS
+            slow_m = stop_m + WALK_SLOW_EXTRA_M
             c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
             goal = {"x": pose["x"] + c * dx - s * dy, "y": pose["y"] + s * dx + c * dy,
                     "yaw": wrap_angle(pose["yaw"] + dyaw), "hold": pose["yaw"]}
@@ -2381,10 +2451,10 @@ class Walk:
                 if turn_first:
                     # Facing too far off the way: stop stepping and turn in place to it first.
                     err = wrap_angle(face - pose["yaw"])
-                    w = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * err))
+                    w = max(-lim[2], min(lim[2], WALK_YAW_GAIN * err))
                     vx, vy, vyaw = 0.0, 0.0, math.copysign(max(abs(w), WALK_MIN_W), err)
                 else:
-                    vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face)
+                    vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim)
                 self._set(pose=dict(pose), phase="align" if turn_first else phase,
                           elapsed_s=round(now, 1), error=self._errors(pose, goal))
                 if phase == "done":
@@ -2392,7 +2462,7 @@ class Walk:
                 # Only what lies before the goal can be in the way: a table the walk ends 30 cm
                 # from is where it is going, not something stepping in front.
                 left = math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"])
-                reach = min(WALK_STOP_M, left + WALK_GOAL_CLEARANCE - 0.05)
+                reach = min(stop_m, left + WALK_GOAL_CLEARANCE - 0.05)
                 ahead = (obstacle_ahead(pose, vx, vy, list(memory) if memory else cells, reach)
                          if phase == "translate" else None)
                 if ahead is not None:
@@ -2412,10 +2482,10 @@ class Walk:
                     self._set(blocked=None)
                 if phase == "translate":
                     near = obstacle_ahead(pose, vx, vy, list(memory) if memory else cells,
-                                          min(WALK_SLOW_M, left + WALK_GOAL_CLEARANCE),
+                                          min(slow_m, left + WALK_GOAL_CLEARANCE),
                                           WALK_SLOW_HALF)
                     if near is not None:
-                        f = (near - WALK_STOP_M) / max(WALK_SLOW_M - WALK_STOP_M, 1e-6)
+                        f = (near - stop_m) / max(slow_m - stop_m, 1e-6)
                         f = max(WALK_SLOW_MIN, min(1.0, f))
                         speed = math.hypot(vx, vy)
                         if speed * f < WALK_MIN_V:
@@ -2716,7 +2786,9 @@ class Handler(BaseHTTPRequestHandler):
     def _walk_control(self):
         """POST /walk/control — the G1 walks to a pose RELATIVE to where it stands (see Walk).
 
-          {"op": "goto", "dx": m forward, "dy": m left, "dyaw": rad left}  -> {ok, walk}
+          {"op": "goto", "dx": m forward, "dy": m left, "dyaw": rad left,
+           "speed"?: {vx, vy, vyaw} top speeds (<= 1.2 / 0.5 / 1.2), "mode"?: "walk" | "run"}
+                                                                              -> {ok, walk}
           {"op": "plan", same numbers} -> {ok, plan: {start, goal, path}}: the way it WOULD take,
                                           nothing moves (ok false + error when there is none)
           {"op": "cancel"}                                                    -> {ok, walk}
@@ -2754,13 +2826,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(429, {"error": "rate limited"})
         try:
             dx, dy, dyaw = validate_goto(body)
+            lim, mode = walk_options(body)
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
         if op == "plan":
             # Moves nothing: the page shows the way and the operator accepts it with a goto.
             return self._json(*walk.plan(dx, dy, dyaw))
-        code, out = walk.start(dx, dy, dyaw)
-        audit(src, "walk-goto", f"dx={dx:.2f} dy={dy:.2f} dyaw={dyaw:.2f}",
+        code, out = walk.start(dx, dy, dyaw, lim, mode)
+        audit(src, "walk-goto", f"dx={dx:.2f} dy={dy:.2f} dyaw={dyaw:.2f} vx<={lim[0]:g} "
+                                f"mode={mode or '-'}",
               "started" if out.get("ok") else out.get("error", "-"))
         return self._json(code, out)
 

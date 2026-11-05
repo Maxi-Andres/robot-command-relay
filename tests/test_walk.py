@@ -30,11 +30,16 @@ TOKEN = "test-token"  # noqa: S105  # a test fixture, not a secret
 DT = 0.05                       # the odometry bridge's 20 Hz
 
 
+# The mode verbs and the FSM each one lands in (g1_commands.py).
+MODES = {"start": 500, "walk_waist": 501, "run": 801, "run_waist": 802}
+
+
 class SimRobot:
     """The sender AND the odometry of a robot that walks exactly as told, with a lag."""
 
-    def __init__(self, x=1.0, y=-2.0, yaw=0.3, refuse_move=False, odom_dies_at=None):
+    def __init__(self, x=1.0, y=-2.0, yaw=0.3, refuse_move=False, odom_dies_at=None, fsm=501):
         self.x, self.y, self.yaw = x, y, yaw
+        self.fsm = fsm
         self.t = 0.0
         self.v = (0.0, 0.0, 0.0)
         self.lines = []
@@ -56,6 +61,8 @@ class SimRobot:
                 self.v = tuple(float(p) for p in parts[1:])
             elif parts[0] == "stop_move":
                 self.v = (0.0, 0.0, 0.0)
+            elif parts[0] in MODES:
+                self.fsm = MODES[parts[0]]
             return f"ok {parts[0]}"
 
     # -- the odometry (JointStream's interface) ------------------------- #
@@ -85,7 +92,7 @@ class SimRobot:
             self.t += DT
             self.seq += 1
             line = json.dumps({"t": self.t, "age_ms": 20, "x": self.x, "y": self.y,
-                               "yaw": self.yaw})
+                               "yaw": self.yaw, "fsm": self.fsm})
             return self.seq, line
 
 
@@ -601,3 +608,66 @@ def test_half_a_metre_back_backs_up_without_turning_round():
     assert st["state"] == "success", st
     assert all(abs(float(ln.split()[3])) < 0.2 for ln in moves(robot))    # no turning round
     assert relay_server.wrap_angle(robot.yaw - 1.0) == pytest.approx(0, abs=0.07)
+
+
+
+# --------------------------------------------------------------------------- #
+# Speed and mode, chosen per walk
+# --------------------------------------------------------------------------- #
+def test_walk_options_bounds():
+    assert relay_server.walk_options({}) == ((relay_server.WALK_VX, relay_server.WALK_VY,
+                                              relay_server.WALK_VYAW), None)
+    assert relay_server.walk_options({"speed": {"vx": 0.9, "vy": 0.4, "vyaw": 1.0},
+                                      "mode": "run"}) == ((0.9, 0.4, 1.0), "run")
+    for bad, why in (({"speed": {"vx": 2.0}}, "at most 1.2"), ({"speed": {"vx": 0}}, "over 0"),
+                     ({"mode": "fly"}, "walk or run"), ({"speed": 3}, "vx, vy, vyaw")):
+        with pytest.raises(ValueError, match=why):
+            relay_server.walk_options(bad)
+
+
+def test_a_faster_walk_goes_faster():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(2.5, 0, 0, lim=(0.9, 0.4, 1.0))
+    assert wait_done(walk)["state"] == "success"
+    assert max(float(ln.split()[1]) for ln in moves(robot)) == pytest.approx(0.9)
+
+
+def test_faster_means_stopping_further_from_someone():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    lidar = FakeLidar(robot, [])
+    walk = seeing_walk(robot, lidar, wait=0.3)
+    walk.start(3.0, 0, 0, lim=(1.2, 0.5, 1.2))
+    end = time.time() + 5
+    while robot.x < 0.3 and time.time() < end:
+        time.sleep(0.001)
+    wall = [(robot.x + 1.6, -2.0 + k * 0.05) for k in range(81)]   # 1.6 m ahead, all across
+    lidar.obstacles = wall
+    st = wait_done(walk)
+    assert st["state"] == "failure"
+    assert wall[0][0] - robot.x > 0.9                # at 1.2 m/s it kept ~1 m, not 0.5
+
+
+def test_it_switches_to_run_before_walking():
+    robot = SimRobot(x=0, y=0, yaw=0, fsm=501)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(1.0, 0, 0, mode="run")
+    assert wait_done(walk)["state"] == "success"
+    assert robot.lines[0] == "run_waist" and robot.fsm == 802     # waist free: 802
+
+
+def test_it_never_stands_a_squatting_robot_up():
+    robot = SimRobot(x=0, y=0, yaw=0, fsm=706)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(1.0, 0, 0, mode="walk")
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "not walking or running" in st["reason"]
+    assert [ln for ln in robot.lines if ln != "stop_move"] == []   # not a step, not a mode
+
+
+def test_the_same_mode_sends_no_switch():
+    robot = SimRobot(x=0, y=0, yaw=0, fsm=501)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(1.0, 0, 0, mode="walk")
+    assert wait_done(walk)["state"] == "success"
+    assert not any(ln.split()[0] in MODES for ln in robot.lines)

@@ -14,11 +14,11 @@
 //                                    of the room. ODOM_TOPIC=... reads another Odometry topic
 //                                    (odom_pelvis, or the lidar-fused fusion_odom once it talks).
 //
-// WHAT IT DOES NOT DO: move anything. There is no publisher in this file.
+// WHAT IT DOES NOT DO: move anything. Its only request is GetFsmId, a query.
 //
 // OUTPUT, one line per tick at ODOM_RATE_HZ (numbers only, no JSON string escaping needed):
 //   {"t":<unix s>,"age_ms":<ms since the last odometry, -1 = never>,
-//    "x":m,"y":m,"z":m,"yaw":rad,"vx":m/s,"vy":m/s,"wz":rad/s}
+//    "x":m,"y":m,"z":m,"yaw":rad,"vx":m/s,"vy":m/s,"wz":rad/s,"fsm":<locomotion mode, -1 unknown>}
 // x/y/z/yaw in the odom frame; vx/vy/wz as the message carries them (its twist).
 //
 // EOF ON STDIN EXITS: the relay holds our stdin, so if it dies we die with it.
@@ -26,6 +26,7 @@
 #include <unitree/idl/ros2/Odometry_.hpp>
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
+#include <unitree/robot/g1/loco/g1_loco_client.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,13 @@ struct Latest {
     Odometry odom;
     Clock::time_point at{};
     bool have = false;
+    // The locomotion mode, ASKED of the loco service every 500 ms (GetFsmId, the same RPC the
+    // joint sender trusts; rt/sportmodestate's fsm_id read 0 with the robot squatting,
+    // 2026-11-05): 500/501 walk, 801/802 run, 706 squat, 1 damp... -1 unknown. The relay's walk
+    // switches walk <-> run only from a locomotion mode, and never stands a squatting robot up.
+    // Asking moves nothing: GetFsmId is a query.
+    int fsm = -1;
+    Clock::time_point fsm_at{};
 };
 Latest g;
 
@@ -80,8 +88,23 @@ int main(int argc, char** argv) {
         g.at = Clock::now();
         g.have = true;
     }, 1);
+    // Built after Init, like every SDK client (a client built earlier segfaults).
+    auto loco = std::make_shared<g1::LocoClient>();
+    loco->SetTimeout(1.0f);
+    loco->Init();
 
     std::atomic<bool> done{false};
+    std::thread fsm_poll([&] {
+        while (!done) {
+            int fsm = -1;
+            if (loco->GetFsmId(fsm) == 0) {
+                std::lock_guard<std::mutex> lk(g.mu);
+                g.fsm = fsm;
+                g.fsm_at = Clock::now();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    });
     std::thread eof([&] {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -96,8 +119,12 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_until(next);
         Odometry o;
         long age = -1;
+        int fsm = -1;
         {
             std::lock_guard<std::mutex> lk(g.mu);
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.fsm_at)
+                    .count() < 2000)
+                fsm = g.fsm;
             if (g.have) {
                 o = g.odom;
                 age = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -113,12 +140,13 @@ int main(int argc, char** argv) {
             const double yaw = std::atan2(2 * (q.w() * q.z() + q.x() * q.y()),
                                           1 - 2 * (q.y() * q.y() + q.z() * q.z()));
             printf("{\"t\":%.3f,\"age_ms\":%ld,\"x\":%.4f,\"y\":%.4f,\"z\":%.4f,\"yaw\":%.5f,"
-                   "\"vx\":%.3f,\"vy\":%.3f,\"wz\":%.3f}\n",
+                   "\"vx\":%.3f,\"vy\":%.3f,\"wz\":%.3f,\"fsm\":%d}\n",
                    unix_s(), age, p.x(), p.y(), p.z(), yaw, v.x(), v.y(),
-                   o.twist().twist().angular().z());
+                   o.twist().twist().angular().z(), fsm);
         }
         fflush(stdout);
     }
     eof.join();
+    fsm_poll.join();
     return 0;
 }
