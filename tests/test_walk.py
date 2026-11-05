@@ -457,3 +457,32 @@ def test_the_page_copy_is_coarser():
     line = json.dumps({"age_ms": 1, "odom": 1, "res": 0.05, "cells": [[0, 0], [1, 1], [3, 0]]})
     d = json.loads(relay_server.coarsen_lidar(line))
     assert d["res"] == pytest.approx(0.1) and d["cells"] == [[0, 0], [1, 0]]
+
+
+
+# --------------------------------------------------------------------------- #
+# The trail, recorded on the robot whoever moves it
+# --------------------------------------------------------------------------- #
+def test_the_trail_keeps_a_point_every_few_cm_and_restarts_on_a_new_frame():
+    trail = relay_server.OdomTrail(None, step=0.03, cap=5)
+    for k in range(10):
+        trail.add([k * 0.01, 0.0, 0.0, k])           # 9 cm in 1 cm steps
+    assert [p[0] for p in trail.snapshot()["points"]] == [0.0, 0.03, 0.06, 0.09]
+    for k in range(10, 14):
+        trail.add([k * 0.05, 0.0, 0.0, k])
+    assert len(trail.snapshot()["points"]) == 5       # capped, the oldest went
+    trail.add([50.0, 50.0, 0.0, 99])                  # a reboot: a new origin
+    assert trail.snapshot()["points"] == [[50.0, 50.0, 0.0, 99]]
+    trail.clear()
+    assert len(trail.snapshot()["points"]) == 1 and trail.snapshot()["cleared_at"]
+
+
+def test_the_trail_records_from_the_odometry_stream():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    robot.v = (0.3, 0.0, 0.0)                          # someone drives it
+    trail = relay_server.OdomTrail(robot).start()
+    end = time.time() + 5
+    while robot.x < 1.0 and time.time() < end:
+        time.sleep(0.01)
+    pts = trail.snapshot()["points"]
+    assert len(pts) > 20 and pts[-1][0] > 0.9

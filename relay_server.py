@@ -1852,6 +1852,77 @@ def walk_command(pose, goal, phase, aim=None, face=None):
     return 0.0, 0.0, 0.0, "done"
 
 
+TRAIL_STEP_M = 0.03       # a new trail point once the robot moved this far
+TRAIL_MAX = 6000          # ~180 m of walking at 3 cm; the oldest go first
+
+
+class OdomTrail:
+    """Where the robot has walked, recorded HERE, all the time — whoever moves it (the drive pad,
+    the remote, a walk to a point, the agent) and whether or not a page is watching. The page
+    asks for it on opening (GET /odom/trail) and draws the rest live; it used to keep the trail
+    itself, and lost it on every tab change (2026-11-05).
+
+    It holds the odometry bridge open for good (one 51 Hz DDS reader on PC2: nothing), and keeps a
+    point every TRAIL_STEP_M. The odometry's origin is where the robot booted, so a reboot starts
+    a new frame: a jump of more than TRAIL_JUMP_M between two readings starts the trail again."""
+
+    TRAIL_JUMP_M = 1.0
+
+    def __init__(self, odom, step=TRAIL_STEP_M, cap=TRAIL_MAX):
+        self.odom = odom
+        self.step, self.cap = step, cap
+        self.lock = threading.Lock()
+        self.points = []                  # [x, y, yaw, unix t]
+        self.cleared_at = None
+        self.thread = None
+
+    def start(self):
+        if not self.odom.subscribe():
+            log("trail: no room on the odometry stream")
+            return self
+        self.thread = threading.Thread(target=self._run, name="odom-trail", daemon=True)
+        self.thread.start()
+        return self
+
+    def _run(self):
+        seen = 0
+        while True:
+            seen, line = self.odom.next_line(seen, 5.0)
+            if line is None:
+                continue
+            try:
+                d = json.loads(line)
+                p = [round(float(d["x"]), 3), round(float(d["y"]), 3), round(float(d["yaw"]), 3),
+                     round(float(d["t"]), 1)]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if d.get("age_ms", -1) < 0:
+                continue
+            self.add(p)
+
+    def add(self, p):
+        with self.lock:
+            last = self.points[-1] if self.points else None
+            if last is not None:
+                moved = math.hypot(p[0] - last[0], p[1] - last[1])
+                if moved > self.TRAIL_JUMP_M:
+                    self.points = []          # a new odometry frame (the robot rebooted)
+                elif moved < self.step:
+                    return
+            self.points.append(p)
+            if len(self.points) > self.cap:
+                del self.points[:len(self.points) - self.cap]
+
+    def snapshot(self):
+        with self.lock:
+            return {"points": list(self.points), "cleared_at": self.cleared_at}
+
+    def clear(self):
+        with self.lock:
+            self.points = self.points[-1:]
+            self.cleared_at = time.time()
+
+
 def parse_lidar(line):
     """(cells as (x, y) metres in the odom frame, the line's dict) from a g1_lidar_bridge line,
     or (None, dict) when it cannot be used: not fresh, or not in the odometry frame."""
@@ -2381,6 +2452,22 @@ class Handler(BaseHTTPRequestHandler):
         return self._ndjson_stream(getattr(self.server, "lidar", None), "lidar",
                                    shape=coarsen_lidar, min_interval=1.0 / LIDAR_VIEW_HZ)
 
+    def _odom_trail(self, method):
+        """GET /odom/trail -> {ok, points: [[x, y, yaw, t], ...], cleared_at}: where the robot
+        walked since it booted (or since the last clear). POST {"op": "clear"} starts it again."""
+        src = self.client_address[0]
+        if not self._authorised():
+            audit(src, "odom-trail", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        trail = getattr(self.server, "trail", None)
+        if trail is None:
+            return self._json(404, {"error": f"no trail on this {ROBOT_MODEL} (G1 only, and its "
+                                             f"odometry bridge built by ./build.sh)"})
+        if method == "POST":
+            trail.clear()
+            audit(src, "odom-trail", "clear", "-")
+        return self._json(200, {"ok": True, **trail.snapshot()})
+
     def _lidar_cloud(self):
         """GET /lidar/cloud — the 3D point cloud around the G1 for the page's 3D view (the lidar
         bridge's "cloud" lines: base64 int16 centimetres, ~1 Hz, 8 cm cubes). Read-only."""
@@ -2550,6 +2637,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._lidar_stream()
         if self.path.split("?")[0].rstrip("/") == "/lidar/cloud":
             return self._lidar_cloud()
+        if self.path.split("?")[0].rstrip("/") == "/odom/trail":
+            return self._odom_trail("GET")
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             if not self._authorised():
                 return self._json(401, {"error": "unauthorised"})
@@ -2795,6 +2884,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._joint_control()
         if self.path.split("?")[0].rstrip("/") == "/walk/control":
             return self._walk_control()
+        if self.path.split("?")[0].rstrip("/") == "/odom/trail":
+            return self._odom_trail("POST")
         if self.path.split("?")[0] != "/cmd":
             return self._json(404, {"error": "not found"})
         if not self._authorised():
@@ -2905,7 +2996,7 @@ def main():
                          if ROBOT_MODEL == "g1" else None)
     srv.joint_limiter = RateLimiter(JOINT_CTL_MAX_PER_SEC)
     # The odometry and the walk to a point, only if the bridge was built (G1 only).
-    srv.odom = srv.walk = srv.lidar = None
+    srv.odom = srv.walk = srv.lidar = srv.trail = None
     if ROBOT_MODEL == "g1":
         if os.access(LIDAR_BRIDGE, os.X_OK):
             srv.lidar = JointStream([LIDAR_BRIDGE], label="lidar bridge",
@@ -2915,6 +3006,7 @@ def main():
         if os.access(ODOM_BRIDGE, os.X_OK):
             srv.odom = JointStream([ODOM_BRIDGE], label="odom bridge")
             srv.walk = Walk(srv.sender, srv.odom, srv.joint_control, lidar=srv.lidar)
+            srv.trail = OdomTrail(srv.odom).start()
         else:
             log(f"no {ODOM_BRIDGE}: /odom and /walk are off until ./build.sh is run")
     # The speaker, only if its binary was built (a relay pulled but not rebuilt keeps working,
