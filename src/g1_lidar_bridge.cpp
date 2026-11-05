@@ -33,12 +33,14 @@
 // cells: occupied 5 cm squares in the odometry frame (x = ix*res), within LIDAR_RANGE_M of the
 // robot. Without odometry ("odom":0) they are in the robot's own levelled frame and pose is 0.
 //
-// THE CLOUD, for the page's 3D view, on lines of their own every LIDAR_CLOUD_MS (1000):
+// THE CLOUD, for the page's 3D view, on lines of their own every LIDAR_CLOUD_MS (500):
 //   {"kind":"cloud","t":..,"pose":[x,y,yaw],"res":0.08,"n":N,"xyz":"<base64>"}
 // xyz: N x 3 little-endian int16 in CENTIMETRES — x, y in the odometry frame, z over the floor —
-// one point per LIDAR_CLOUD_RES (8 cm) cube seen in the last LIDAR_CLOUD_KEEP_MS (1500), floor
-// included, up to 2.3 m. ~15 000 points ~ 120 KB a line: it crosses the robot's uplink, so it is
-// coarse and slow on purpose. At most LIDAR_CLOUD_MAX points (every other one dropped past it).
+// one point per LIDAR_CLOUD_RES (8 cm) cube seen in the last LIDAR_CLOUD_KEEP_MS (700), floor
+// included, up to 2.3 m. It crosses the robot's uplink, so it is coarse on purpose; what the page
+// shows is ~0.5-1 s old (was 1-2.5 s at 1 s / 1.5 s, 2026-11-05: a hand moved in front showed up
+// late). The walk does NOT see through this: it reads the 5 Hz, 300 ms obstacle map above.
+// At most LIDAR_CLOUD_MAX points (every other one dropped past it).
 //
 // EOF ON STDIN EXITS, like every bridge the relay runs.
 
@@ -201,8 +203,8 @@ int main(int argc, char** argv) {
     double hz = env_d("LIDAR_RATE_HZ", 5);
     if (!(hz >= 1 && hz <= 20)) hz = 5;
     const double cloud_res = env_d("LIDAR_CLOUD_RES", 0.08);
-    const long long cloud_ms = (long long)env_d("LIDAR_CLOUD_MS", 1000);
-    const long long cloud_keep_ms = (long long)env_d("LIDAR_CLOUD_KEEP_MS", 1500);
+    const long long cloud_ms = (long long)env_d("LIDAR_CLOUD_MS", 500);
+    const long long cloud_keep_ms = (long long)env_d("LIDAR_CLOUD_KEEP_MS", 700);
     const size_t cloud_max = (size_t)env_d("LIDAR_CLOUD_MAX", 20000);
     const Mat R0 = mul(rot_z(env_d("LIDAR_MOUNT_YAW_DEG", 0) * M_PI / 180),
                        rot_x(env_d("LIDAR_MOUNT_ROLL_DEG", 180) * M_PI / 180));

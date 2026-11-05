@@ -2513,7 +2513,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _lidar_cloud(self):
         """GET /lidar/cloud — the 3D point cloud around the G1 for the page's 3D view (the lidar
-        bridge's "cloud" lines: base64 int16 centimetres, ~1 Hz, 8 cm cubes). Read-only."""
+        bridge's "cloud" lines: base64 int16 centimetres, ~2 Hz, 8 cm cubes). Read-only."""
         return self._ndjson_stream(getattr(self.server, "lidar", None), "lidar-cloud",
                                    side=True, heartbeat=3.0)
 
