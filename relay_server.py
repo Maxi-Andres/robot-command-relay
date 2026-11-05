@@ -173,7 +173,10 @@ LIDAR_BRIDGE = os.environ.get("LIDAR_BRIDGE_BIN", "./g1_lidar_bridge")
 # With the bridge built, a walk needs FRESH lidar: no eyes, no walk. 0 = walk blind, as before.
 WALK_REQUIRE_LIDAR = os.environ.get("WALK_REQUIRE_LIDAR", "1").strip() != "0"
 WALK_STOP_M = float(os.environ.get("WALK_STOP_M", "0.5"))  # m from the torso, along the way
-WALK_HALF_WIDTH = 0.30       # m each side of the way: the shoulders (0.45 m) and a margin
+# m each side of the way: the shoulders (0.45 m) and a little. NARROWER than the planner's
+# clearance (WALK_CLEARANCE) on purpose: a planned way grazes its 0.35 m margin, and a stop corridor
+# as wide as that stopped the robot on its own path (2026-11-05). This is for what steps INTO it.
+WALK_HALF_WIDTH = 0.25
 WALK_BLOCKED_WAIT_S = 3.0    # blocked this long (someone crossing?) and the walk gives up
 WALK_LIDAR_STALE_S = 1.0     # no obstacle map for this long = stop, failure
 LIDAR_VIEW_HZ = 2.0          # the page's copy: coarser and slower, it crosses the uplink
@@ -1958,7 +1961,7 @@ WALK_CLEARANCE = 0.35         # m kept between the robot's centre and anything t
 # the torso is ~0.3 m from the edge (2026-11-03). The body is ~0.45 m across the shoulders.
 WALK_GOAL_CLEARANCE = float(os.environ.get("WALK_GOAL_CLEARANCE", "0.25"))
 WALK_PLAN_MARGIN = 1.5        # m of room around start and goal to go round things
-WALK_LOOKAHEAD = 0.5          # m along the path: the point it heads for
+WALK_LOOKAHEAD = 0.3          # m along the path: the point it heads for (0.5 cut the corners: 0.29 m from a box planned at 0.42)
 WALK_MEMORY_S = 2.0           # an obstacle stays on the map this long after it was last seen
 
 
@@ -1999,6 +2002,9 @@ def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
         return out
 
     blocked = inflate(clearance)
+    # The straight legs of string pulling are checked against a margin half a cell wider: a line
+    # between cell centres can pass that much closer than the cells it crosses.
+    line_blocked = inflate(clearance + res / 2)
     s, g = cell(start), cell(goal)
     if goal_clearance < clearance:
         # Within `clearance` of the goal, only the tighter margin counts: the last stretch may
@@ -2012,10 +2018,12 @@ def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
             for i in range(-rr, rr + 1):
                 for j in range(-rr, rr + 1):
                     c = (end[0] + i, end[1] + j)
-                    if i * i + j * j <= rr * rr and c in blocked and c not in tight:
+                    if i * i + j * j <= rr * rr and c not in tight:
                         blocked.discard(c)
-    blocked.discard(s)
-    blocked.discard(g)
+                        line_blocked.discard(c)
+    for c in (s, g):
+        blocked.discard(c)
+        line_blocked.discard(c)
     octile = math.sqrt(2) - 2
 
     def heur(c):
@@ -2044,12 +2052,29 @@ def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
     while came[path[-1]] is not None:
         path.append(came[path[-1]])
     path.reverse()
-    # Merge the straight stretches: keep only the cells where the direction changes.
-    keep = [path[0]]
-    for a, b, c in zip(path, path[1:], path[2:]):
-        if (b[0] - a[0], b[1] - a[1]) != (c[0] - b[0], c[1] - b[1]):
-            keep.append(b)
-    keep.append(path[-1])
+
+    def clear_line(a, b):
+        """True if the straight segment a -> b (grid cells) crosses no blocked cell."""
+        n = max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2 + 1
+        for k in range(n + 1):
+            u = k / n
+            c = (round(a[0] + u * (b[0] - a[0])), round(a[1] + u * (b[1] - a[1])))
+            if c in line_blocked:
+                return False
+        return True
+
+    # STRING PULLING: A* on a grid only moves in 8 directions, so a line at any other angle
+    # comes out as a staircase — and every step looked like a turn round something (seen on the
+    # robot 2026-11-05: 1 m forward and 0.5 m right with nothing in the way "went round something",
+    # 1.2 m of zigzag). From each kept point, jump to the farthest later cell it sees in a
+    # straight line that stays clear: with nothing in the way the path is one segment.
+    keep, k = [path[0]], 0
+    while k < len(path) - 1:
+        far = len(path) - 1
+        while far > k + 1 and not clear_line(path[k], path[far]):
+            far -= 1
+        keep.append(path[far])
+        k = far
     pts = [(x0 + i * res, y0 + j * res) for i, j in keep]
     pts[0], pts[-1] = tuple(start), tuple(goal)
     return pts

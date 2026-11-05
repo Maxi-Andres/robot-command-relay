@@ -509,3 +509,18 @@ def test_a_plan_with_no_way_says_why():
     code, out = walk.plan(1.0, 0, 0)               # into the box
     assert code == 200 and not out["ok"] and "cm from something" in out["error"]
     assert robot.lines == []
+
+
+
+def test_a_way_at_an_angle_with_nothing_in_it_is_one_straight_segment():
+    # Seen on the robot: 1 m forward, 0.5 m right, nothing there -> a 1.2 m zigzag "round
+    # something". It is one segment of 1.12 m.
+    for goal in ((1.0, -0.5), (2.3, 0.7), (-0.4, 1.9)):
+        assert relay_server.plan_path((0.0, 0.0), goal, []) == [(0.0, 0.0), goal]
+    # ...and with something really in the way it still bends, every leg of it clear.
+    path = relay_server.plan_path((0.0, 0.0), (2.0, -1.0), box(1.0, -0.5))
+    assert len(path) > 2
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        for k in range(21):
+            px, py = ax + (bx - ax) * k / 20, ay + (by - ay) * k / 20
+            assert min(math.hypot(px - x, py - y) for x, y in box(1.0, -0.5)) > 0.3
