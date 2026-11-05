@@ -1788,8 +1788,12 @@ def validate_goto(body):
     return dx, dy, dyaw
 
 
-def walk_command(pose, goal, phase):
+def walk_command(pose, goal, phase, aim=None, face=None):
     """(vx, vy, vyaw, phase) toward `goal` from `pose`, both {x, y, yaw} in the odom frame.
+
+    With a planned path, `aim` (x, y) is the point on it to head for now — the speed still comes
+    from how far the GOAL is — and `face` the heading to keep meanwhile (the way it walks round
+    an obstacle); without them, straight at the goal holding the start heading.
 
     Two phases, deterministic and easy to watch: TRANSLATE to the goal's position holding the
     heading the walk started with (so "2 m forward" is a straight line, not an arc), then TURN in
@@ -1799,7 +1803,13 @@ def walk_command(pose, goal, phase):
     yaw = pose["yaw"]
     if phase == "translate":
         ex_w, ey_w = goal["x"] - pose["x"], goal["y"] - pose["y"]
-        if math.hypot(ex_w, ey_w) > WALK_POS_TOL:
+        left = math.hypot(ex_w, ey_w)
+        if left > WALK_POS_TOL:
+            if aim is not None:
+                ax, ay = aim[0] - pose["x"], aim[1] - pose["y"]
+                d = math.hypot(ax, ay)
+                if d > 1e-6:
+                    ex_w, ey_w = ax / d * left, ay / d * left
             # The error in the robot's own frame: forward is x, left is y.
             ex = math.cos(yaw) * ex_w + math.sin(yaw) * ey_w
             ey = -math.sin(yaw) * ex_w + math.cos(yaw) * ey_w
@@ -1810,7 +1820,7 @@ def walk_command(pose, goal, phase):
             speed = math.hypot(vx, vy)
             if speed < WALK_MIN_V:
                 vx, vy = vx * WALK_MIN_V / speed, vy * WALK_MIN_V / speed
-            hold = wrap_angle(goal["hold"] - yaw)
+            hold = wrap_angle((goal["hold"] if face is None else face) - yaw)
             vyaw = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * hold))
             return vx, vy, vyaw, "translate"
         phase = "turn"
@@ -1851,6 +1861,103 @@ def obstacle_ahead(pose, vx, vy, cells, reach=WALK_STOP_M, half=WALK_HALF_WIDTH)
         if 0 < along <= reach and abs(-px * s + py * c) <= half:
             nearest = along if nearest is None else min(nearest, along)
     return nearest
+
+
+WALK_PLAN_RES = 0.10          # m: the planner's grid
+WALK_CLEARANCE = 0.35         # m kept between the robot's centre and anything the lidar saw
+WALK_PLAN_MARGIN = 1.5        # m of room around start and goal to go round things
+WALK_LOOKAHEAD = 0.5          # m along the path: the point it heads for
+WALK_MEMORY_S = 2.0           # an obstacle stays on the map this long after it was last seen
+
+
+def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
+              margin=WALK_PLAN_MARGIN):
+    """A* on a grid round start and goal (x, y in metres, odom frame): the shortest way that keeps
+    `clearance` from every obstacle cell, as a list of points from start to goal with the straight
+    stretches merged. None if there is none. The start's own cell is always free (the robot is
+    there), so a robot already too close to something can still walk away from it."""
+    import heapq
+    x0 = min(start[0], goal[0]) - margin
+    y0 = min(start[1], goal[1]) - margin
+    w = int((max(start[0], goal[0]) + margin - x0) / res) + 1
+    h = int((max(start[1], goal[1]) + margin - y0) / res) + 1
+
+    def cell(p):
+        return round((p[0] - x0) / res), round((p[1] - y0) / res)
+
+    blocked = set()
+    r = math.ceil(clearance / res)
+    disk = [(i, j) for i in range(-r, r + 1) for j in range(-r, r + 1) if i * i + j * j <= r * r]
+    for p in cells:
+        ci, cj = cell(p)
+        if -r <= ci < w + r and -r <= cj < h + r:
+            for i, j in disk:
+                blocked.add((ci + i, cj + j))
+    s, g = cell(start), cell(goal)
+    blocked.discard(s)
+    if g in blocked:
+        return None
+    octile = math.sqrt(2) - 2
+
+    def heur(c):
+        dx, dy = abs(c[0] - g[0]), abs(c[1] - g[1])
+        return dx + dy + octile * min(dx, dy)
+
+    steps = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, math.sqrt(2)),
+             (1, -1, math.sqrt(2)), (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2))]
+    came, cost = {s: None}, {s: 0.0}
+    frontier = [(heur(s), s)]
+    while frontier:
+        _f, c = heapq.heappop(frontier)
+        if c == g:
+            break
+        for di, dj, k in steps:
+            n = (c[0] + di, c[1] + dj)
+            if not (0 <= n[0] < w and 0 <= n[1] < h) or n in blocked:
+                continue
+            nc = cost[c] + k
+            if nc < cost.get(n, math.inf):
+                cost[n], came[n] = nc, c
+                heapq.heappush(frontier, (nc + heur(n), n))
+    if g not in came:
+        return None
+    path = [g]
+    while came[path[-1]] is not None:
+        path.append(came[path[-1]])
+    path.reverse()
+    # Merge the straight stretches: keep only the cells where the direction changes.
+    keep = [path[0]]
+    for a, b, c in zip(path, path[1:], path[2:]):
+        if (b[0] - a[0], b[1] - a[1]) != (c[0] - b[0], c[1] - b[1]):
+            keep.append(b)
+    keep.append(path[-1])
+    pts = [(x0 + i * res, y0 + j * res) for i, j in keep]
+    pts[0], pts[-1] = tuple(start), tuple(goal)
+    return pts
+
+
+def lookahead(path, pose, dist=WALK_LOOKAHEAD):
+    """The point `dist` metres along `path` past the point of it nearest to `pose`."""
+    best, at = math.inf, (0, 0.0)
+    for k, (a, b) in enumerate(zip(path, path[1:])):
+        sx, sy = b[0] - a[0], b[1] - a[1]
+        L2 = sx * sx + sy * sy or 1e-9
+        u = max(0.0, min(1.0, ((pose["x"] - a[0]) * sx + (pose["y"] - a[1]) * sy) / L2))
+        d = math.hypot(a[0] + u * sx - pose["x"], a[1] + u * sy - pose["y"])
+        if d < best:
+            best, at = d, (k, u)
+    k, u = at
+    left = dist
+    while k < len(path) - 1:
+        a, b = path[k], path[k + 1]
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        rest = seg * (1 - u)
+        if rest >= left and seg > 0:
+            t = u + left / seg
+            return a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])
+        left -= rest
+        k, u = k + 1, 0.0
+    return path[-1]
 
 
 def coarsen_lidar(line, res=LIDAR_VIEW_RES):
@@ -1932,7 +2039,7 @@ class Walk:
             self.state = {"id": self.seq, "state": "starting", "phase": "translate",
                           "request": {"dx": dx, "dy": dy, "dyaw": dyaw}, "reason": None,
                           "start": None, "goal": None, "pose": None, "error": None,
-                          "elapsed_s": 0.0, "blocked": None,
+                          "elapsed_s": 0.0, "blocked": None, "path": None,
                           "eyes": "lidar" if self.lidar is not None else "none"}
             self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw),
                                            name="walk", daemon=True)
@@ -1984,6 +2091,8 @@ class Walk:
             if self.require_lidar and not looking:
                 raise RuntimeError("the lidar stream has no room for one more")
             lidar_seen, cells, seen_at = 0, None, None
+            memory = {}                         # obstacle (x, y) -> when it was last seen
+            plan, planned_at = None, None
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
@@ -2016,12 +2125,33 @@ class Walk:
                                        "tools/livox_set_host.py show)")
                 if self.require_lidar and seen_at is None:
                     continue                    # the first map is on its way: do not move yet
-                vx, vy, vyaw, phase = walk_command(pose, goal, phase)
+                aim = face = None
+                if cells is not None and phase == "translate":
+                    if seen_at != planned_at:   # a new map: remember it, plan again
+                        t_seen = self.clock()
+                        for c in cells:
+                            memory[c] = t_seen
+                        for c in [c for c, at in memory.items() if t_seen - at > WALK_MEMORY_S]:
+                            del memory[c]
+                        plan = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]),
+                                         list(memory))
+                        planned_at = seen_at
+                        self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan]
+                                  if plan else None)
+                        if plan is None:
+                            raise RuntimeError("no way to the point: it is boxed in, or the "
+                                               "point itself is too close to something")
+                    if plan is not None and len(plan) > 2:
+                        # Going round something: head for the path, facing the way it goes.
+                        aim = lookahead(plan, pose)
+                        face = math.atan2(aim[1] - pose["y"], aim[0] - pose["x"])
+                vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face)
                 self._set(pose=dict(pose), phase=phase, elapsed_s=round(now, 1),
                           error=self._errors(pose, goal))
                 if phase == "done":
                     break
-                ahead = obstacle_ahead(pose, vx, vy, cells) if phase == "translate" else None
+                ahead = (obstacle_ahead(pose, vx, vy, list(memory) if memory else cells)
+                         if phase == "translate" else None)
                 if ahead is not None:
                     # Something in the way: stop, give it a moment to move off, then give up.
                     if blocked_since is None:

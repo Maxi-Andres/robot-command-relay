@@ -334,28 +334,86 @@ def test_obstacle_ahead_measures_along_the_way_only():
     assert relay_server.obstacle_ahead(pose, -0.3, 0, [(-0.3, 0.0)]) == pytest.approx(0.3)
 
 
-def test_it_stops_before_a_box_in_the_way_and_gives_up():
+class Track:
+    """Records how close the simulated robot ever got to some points, as it walks."""
+
+    def __init__(self, robot, points):
+        self.robot, self.points, self.closest, self.widest = robot, points, math.inf, 0.0
+        inner = robot.next_line
+
+        def next_line(seen, timeout):
+            out = inner(seen, timeout)
+            self.widest = max(self.widest, abs(robot.y))
+            for x, y in self.points:
+                self.closest = min(self.closest, math.hypot(robot.x - x, robot.y - y))
+            return out
+        robot.next_line = next_line
+
+
+def box(cx, cy, half=0.2):
+    """The outline of a square box, as the lidar's 5 cm cells would show it."""
+    k = round(2 * half / 0.05)
+    side = [-half + i * 0.05 for i in range(k + 1)]
+    return ([(cx + d, cy - half) for d in side] + [(cx + d, cy + half) for d in side]
+            + [(cx - half, cy + d) for d in side] + [(cx + half, cy + d) for d in side])
+
+
+def test_it_goes_round_a_box_in_the_way():
     robot = SimRobot(x=0, y=0, yaw=0)
-    box = [(1.2, dy) for dy in (-0.1, 0.0, 0.1)]
-    walk = seeing_walk(robot, FakeLidar(robot, box))
+    obstacle = box(1.0, 0.0)
+    track = Track(robot, obstacle)
+    walk = seeing_walk(robot, FakeLidar(robot, obstacle))
     walk.start(2.0, 0, 0)
     st = wait_done(walk)
-    assert st["state"] == "failure" and "blocked" in st["reason"]
-    assert robot.x < 1.2 - 0.35                    # it stopped short, it did not touch it
+    assert st["state"] == "success", st
+    assert robot.x == pytest.approx(2.0, abs=0.1) and robot.y == pytest.approx(0.0, abs=0.1)
+    assert track.closest > 0.3                     # never brushed it
+    assert relay_server.wrap_angle(robot.yaw) == pytest.approx(0.0, abs=0.07)   # faces as asked
+    assert track.widest > 0.4                      # it left the straight line to go round
+
+
+def test_a_wall_across_the_way_is_a_failure_without_a_step_into_it():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    wall = [(1.0, -3.0 + k * 0.05) for k in range(121)]          # 6 m wide, past the margin
+    walk = seeing_walk(robot, FakeLidar(robot, wall))
+    walk.start(2.0, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "no way" in st["reason"]
+    assert robot.x < 1.0 - 0.3
     assert robot.lines[-1] == "stop_move"
 
 
-def test_it_goes_on_when_the_way_clears():
+def test_someone_stepping_in_front_is_never_walked_into():
     robot = SimRobot(x=0, y=0, yaw=0)
-    lidar = FakeLidar(robot, [(1.2, 0.0)])
+    lidar = FakeLidar(robot, [])
     walk = seeing_walk(robot, lidar, wait=30)
-    walk.start(2.0, 0, 0)
-    while not (walk.status().get("blocked")):
+    walk.start(3.0, 0, 0)
+    end = time.time() + 5
+    while robot.x < 0.8 and time.time() < end:
         time.sleep(0.001)
-    lidar.obstacles = []                           # the person walked off
+    person = [(robot.x + 0.45, robot.y + dy) for dy in (-0.1, -0.05, 0.0, 0.05, 0.1)]
+    track = Track(robot, person)
+    lidar.obstacles = person                       # right in front, out of nowhere
+    end = time.time() + 5
+    while time.time() < end and walk.running() and track.closest > 0.6:
+        time.sleep(0.01)
+    time.sleep(0.2)
+    closest = track.closest                        # while the person stood there
+    track.points = []
+    lidar.obstacles = []                           # and gone again
     st = wait_done(walk)
+    assert closest > 0.25, closest
     assert st["state"] == "success", st
-    assert robot.x == pytest.approx(2.0, abs=0.08)
+
+
+def test_the_planner_alone():
+    straight = relay_server.plan_path((0, 0), (2, 0), [])
+    assert straight == [(0, 0), (2, 0)]
+    round_it = relay_server.plan_path((0, 0), (2, 0), box(1.0, 0.0))
+    assert len(round_it) > 2
+    assert all(min(math.hypot(px - x, py - y) for x, y in box(1.0, 0.0)) >= 0.3
+               for px, py in round_it)
+    assert relay_server.plan_path((0, 0), (1.0, 0.0), box(1.0, 0.0)) is None   # goal inside
 
 
 def test_something_beside_the_way_does_not_stop_it():
