@@ -671,3 +671,21 @@ def test_the_same_mode_sends_no_switch():
     walk.start(1.0, 0, 0, mode="walk")
     assert wait_done(walk)["state"] == "success"
     assert not any(ln.split()[0] in MODES for ln in robot.lines)
+
+
+
+def test_auto_speed_is_fast_in_the_open_and_slow_near_things():
+    assert relay_server.walk_options({"speed": "auto"}) == (None, None)
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(2.8, 0, 0, auto=True)
+    assert wait_done(walk)["state"] == "success"
+    open_top = max(float(ln.split()[1]) for ln in moves(robot))
+    assert open_top == pytest.approx(relay_server.WALK_AUTO_CAP[0])
+
+    robot = SimRobot(x=0, y=0, yaw=0)
+    near = [(0.5 + k * 0.1, 0.45) for k in range(30)]    # a wall along the way, 45 cm to the side
+    walk = seeing_walk(robot, FakeLidar(robot, near))
+    walk.start(2.8, 0, 0, auto=True)
+    assert wait_done(walk)["state"] == "success"
+    assert max(float(ln.split()[1]) for ln in moves(robot)) < open_top * 0.6
