@@ -11,6 +11,7 @@
 // (the SDK's static library and its Cyclone), adds the network side, and saves a report. The
 // binary alone:
 //   tools/g1_nav_probe eth0 [discover_s=5] [measure_s=10]
+//   tools/g1_nav_probe eth0 odom [seconds=60]     (section 3 below)
 //
 // 1. DISCOVERY: every topic some writer on the bus publishes, with its type, how many writers,
 //    and their reliability (a RELIABLE 200 KB point cloud over WiFi is a retransmit storm).
@@ -275,15 +276,77 @@ const std::map<std::string, Factory>& known_types() {
     return m;
 }
 
+// ---------------------------------------------------------------------------------------------
+// 3. "odom" mode: how far the robot's own odometry drifts. Walk a known path with the remote
+//    (2 m straight, a 90 degree turn, back to the start mark) while this logs the pose; the
+//    difference between the path walked and the one reported is the drift a map has to fix.
+// ---------------------------------------------------------------------------------------------
+const char* ODOM_TOPIC = "rt/state_estimator/odom_torso";  // seen 51.6 Hz, frame odom, 2026-11-05
+
+double yaw_rad(const geometry_msgs::msg::dds_::Quaternion_& q) {
+    return std::atan2(2 * (q.w() * q.z() + q.x() * q.y()), 1 - 2 * (q.y() * q.y() + q.z() * q.z()));
+}
+
+int odom_log(double seconds) {
+    dds::domain::DomainParticipant dp(0);
+    dds::topic::Topic<nav_msgs::msg::dds_::Odometry_> topic(dp, ODOM_TOPIC);
+    dds::sub::Subscriber sub(dp);
+    dds::sub::qos::DataReaderQos q = sub.default_datareader_qos();
+    q << dds::core::policy::Reliability::BestEffort() << dds::core::policy::History::KeepLast(8);
+    dds::sub::DataReader<nav_msgs::msg::dds_::Odometry_> rd(sub, topic, q);
+
+    printf("== odometry from %s for %.0f s: walk the path now\n", ODOM_TOPIC, seconds);
+    printf("%7s %8s %8s %8s %8s %7s\n", "t s", "x m", "y m", "z m", "yaw deg", "path m");
+    fflush(stdout);
+    bool have = false;
+    double x0 = 0, y0 = 0, yaw0 = 0, px = 0, py = 0, path = 0, x = 0, y = 0, z = 0, yaw = 0;
+    long n = 0;
+    const double start = now_s(), end = start + seconds;
+    double next_print = start;
+    while (now_s() < end) {
+        for (const auto& s : rd.take()) {
+            if (!s.info().valid()) continue;
+            const auto& p = s.data().pose().pose().position();
+            x = p.x(), y = p.y(), z = p.z();
+            yaw = yaw_rad(s.data().pose().pose().orientation());
+            if (!have) {
+                x0 = px = x, y0 = py = y, yaw0 = yaw, have = true;
+            }
+            path += std::hypot(x - px, y - py);
+            px = x, py = y;
+            n++;
+        }
+        if (now_s() >= next_print && have) {
+            printf("%7.1f %8.3f %8.3f %8.3f %8.1f %7.2f\n", now_s() - start, x, y, z,
+                   yaw * 57.2958, path);
+            fflush(stdout);
+            next_print += 0.5;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!have) {
+        printf("NOTHING ARRIVED on %s\n", ODOM_TOPIC);
+        return 1;
+    }
+    double turn = (yaw - yaw0) * 57.2958;
+    turn = std::fmod(turn + 540.0, 360.0) - 180.0;
+    printf("\n%ld poses, %.1f Hz\nstart %.3f %.3f  end %.3f %.3f  -> net %.3f m, path %.2f m, "
+           "turned %.1f deg\n",
+           n, n / seconds, x0, y0, x, y, std::hypot(x - x0, y - y0), path, turn);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string iface = argc > 1 ? argv[1] : "eth0";
-    const double discover_s = argc > 2 ? atof(argv[2]) : 5.0;
-    const double measure_s = argc > 3 ? atof(argv[3]) : 10.0;
     // Binding Cyclone to the interface is not optional (g1_telemetry_reader learnt it): without
     // it nothing arrives. Everything below attaches to this same domain.
     unitree::robot::ChannelFactory::Instance()->Init(0, iface);
+    if (argc > 2 && std::string(argv[2]) == "odom")
+        return odom_log(argc > 3 ? atof(argv[3]) : 60.0);
+    const double discover_s = argc > 2 ? atof(argv[2]) : 5.0;
+    const double measure_s = argc > 3 ? atof(argv[3]) : 10.0;
 
     printf("== DDS discovery on %s, %.0f s\n", iface.c_str(), discover_s);
     fflush(stdout);

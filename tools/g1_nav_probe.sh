@@ -3,9 +3,10 @@
 # moves, nothing is installed, nothing is left running.
 #
 #   cd ~/robot-command-relay && git pull && tools/g1_nav_probe.sh [iface=eth0]
+#   tools/g1_nav_probe.sh eth0 odom [seconds=60]    the odometry's drift, walking a known path
 #
-# With the robot standing or sitting, anything. It asks for sudo once (only tcpdump needs it).
-# The whole output also lands in ~/nav_probe_<date>.txt, to bring back to the PC.
+# With the robot standing or sitting, anything. It asks for sudo once (only the lidar listen of
+# section 2 needs it). The output also lands in ~/nav_probe_<date>.txt, to bring back to the PC.
 #
 # Sections:
 #   1. the network: is the Mid-360 (192.168.123.120) there, who on PC2 listens on Livox's
@@ -18,6 +19,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 IFACE="${1:-eth0}"
+MODE="${2:-}"
 LIDAR=192.168.123.120
 SDK="${UNITREE_SDK2_DIR:-$HOME/unitree_sdk2}"
 ARCH="$(uname -m)"
@@ -38,7 +40,15 @@ if [ ! -x "$BIN" ] || [ tools/g1_nav_probe.cpp -nt "$BIN" ]; then
   sync
 fi
 
-echo "sudo is only for tcpdump (section 2):"
+if [ "$MODE" = odom ]; then
+  # Mark the start on the floor, then walk with the remote: 2 m straight, turn 90 degrees,
+  # back to the mark. What it reports against what was walked is the drift.
+  "$BIN" "$IFACE" odom "${3:-60}" 2>&1 | grep -v 'not multicast-capable' \
+    | tee "$HOME/nav_odom_$(date +%Y%m%d-%H%M%S).txt"
+  exit
+fi
+
+echo "sudo is only for the lidar listen (section 2):"
 sudo -v || echo "(no sudo: section 2 will be skipped)"
 
 {
@@ -63,17 +73,10 @@ sudo -v || echo "(no sudo: section 2 will be skipped)"
   docker ps --format '{{.Names}}  {{.Image}}  {{.Status}}' 2>/dev/null || echo "(no docker access)"
 
   section "2. UDP from the lidar that reaches PC2 ($IFACE, 5 s)"
-  if ! command -v tcpdump >/dev/null; then
-    echo "tcpdump not installed"
-  elif ! sudo -n true 2>/dev/null; then
-    echo "skipped: no sudo"
+  if sudo -n true 2>/dev/null; then
+    sudo -n python3 tools/udp_from_host.py "$IFACE" "$LIDAR" 5
   else
-    sudo -n timeout 5 tcpdump -n -q -i "$IFACE" udp and src host "$LIDAR" 2>/dev/null \
-      | awk 'match($0, / > [0-9.]+:/) { dst = substr($0, RSTART + 3, RLENGTH - 4) }
-             match($0, /length [0-9]+/) { if (!(dst in n)) seen++; n[dst]++; b[dst] += substr($0, RSTART + 7, RLENGTH - 7) }
-             END { if (!seen) print "no packets from the lidar reached PC2 in 5 s";
-                   for (d in n) printf "%-28s %7d pkts  %8.2f pkt/s  %7.2f MB/s\n",
-                                       d, n[d], n[d] / 5, b[d] / 5 / 1048576 }'
+    echo "skipped: no sudo"
   fi
 
   section "3. DDS"
