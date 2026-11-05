@@ -1865,18 +1865,30 @@ def obstacle_ahead(pose, vx, vy, cells, reach=WALK_STOP_M, half=WALK_HALF_WIDTH)
 
 WALK_PLAN_RES = 0.10          # m: the planner's grid
 WALK_CLEARANCE = 0.35         # m kept between the robot's centre and anything the lidar saw
+# ...except at the END of the walk, where it may stand closer: at a table to pick something up
+# the torso is ~0.3 m from the edge (2026-11-03). The body is ~0.45 m across the shoulders.
+WALK_GOAL_CLEARANCE = float(os.environ.get("WALK_GOAL_CLEARANCE", "0.25"))
 WALK_PLAN_MARGIN = 1.5        # m of room around start and goal to go round things
 WALK_LOOKAHEAD = 0.5          # m along the path: the point it heads for
 WALK_MEMORY_S = 2.0           # an obstacle stays on the map this long after it was last seen
 
 
+class NoWay(RuntimeError):
+    """No path: the message says why, in words for the operator and the agent."""
+
+
 def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
-              margin=WALK_PLAN_MARGIN):
+              margin=WALK_PLAN_MARGIN, goal_clearance=WALK_GOAL_CLEARANCE):
     """A* on a grid round start and goal (x, y in metres, odom frame): the shortest way that keeps
-    `clearance` from every obstacle cell, as a list of points from start to goal with the straight
-    stretches merged. None if there is none. The start's own cell is always free (the robot is
+    `clearance` from every obstacle cell — `goal_clearance` near the goal, where it may stand
+    closer — as a list of points from start to goal with the straight stretches merged. Raises
+    NoWay saying why when there is none. The start's own cell is always free (the robot is
     there), so a robot already too close to something can still walk away from it."""
     import heapq
+    near_goal = min((math.hypot(x - goal[0], y - goal[1]) for x, y in cells), default=math.inf)
+    if near_goal < goal_clearance:
+        raise NoWay(f"the point is {near_goal * 100:.0f} cm from something: it needs "
+                    f"{goal_clearance * 100:.0f} cm to stand there")
     x0 = min(start[0], goal[0]) - margin
     y0 = min(start[1], goal[1]) - margin
     w = int((max(start[0], goal[0]) + margin - x0) / res) + 1
@@ -1885,18 +1897,36 @@ def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
     def cell(p):
         return round((p[0] - x0) / res), round((p[1] - y0) / res)
 
-    blocked = set()
-    r = math.ceil(clearance / res)
-    disk = [(i, j) for i in range(-r, r + 1) for j in range(-r, r + 1) if i * i + j * j <= r * r]
-    for p in cells:
-        ci, cj = cell(p)
-        if -r <= ci < w + r and -r <= cj < h + r:
-            for i, j in disk:
-                blocked.add((ci + i, cj + j))
+    def inflate(radius):
+        out = set()
+        r = math.ceil(radius / res)
+        disk = [(i, j) for i in range(-r, r + 1) for j in range(-r, r + 1)
+                if i * i + j * j <= r * r]
+        for p in cells:
+            ci, cj = cell(p)
+            if -r <= ci < w + r and -r <= cj < h + r:
+                for i, j in disk:
+                    out.add((ci + i, cj + j))
+        return out
+
+    blocked = inflate(clearance)
     s, g = cell(start), cell(goal)
+    if goal_clearance < clearance:
+        # Within `clearance` of the goal, only the tighter margin counts: the last stretch may
+        # come in closer to things, so that it can stand where it was asked.
+        # The same round the START, but only when the robot already stands that close (at a
+        # table, after a grasp): it must be able to step back. Never while it walks past things,
+        # or every replan would let it shave a little closer.
+        tight = inflate(goal_clearance)
+        rr = math.ceil(clearance / res)
+        for end in (g, s) if s in blocked else (g,):
+            for i in range(-rr, rr + 1):
+                for j in range(-rr, rr + 1):
+                    c = (end[0] + i, end[1] + j)
+                    if i * i + j * j <= rr * rr and c in blocked and c not in tight:
+                        blocked.discard(c)
     blocked.discard(s)
-    if g in blocked:
-        return None
+    blocked.discard(g)
     octile = math.sqrt(2) - 2
 
     def heur(c):
@@ -1920,7 +1950,7 @@ def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
                 cost[n], came[n] = nc, c
                 heapq.heappush(frontier, (nc + heur(n), n))
     if g not in came:
-        return None
+        raise NoWay("no way to the point: something blocks every way round it")
     path = [g]
     while came[path[-1]] is not None:
         path.append(came[path[-1]])
@@ -2136,11 +2166,7 @@ class Walk:
                         plan = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]),
                                          list(memory))
                         planned_at = seen_at
-                        self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan]
-                                  if plan else None)
-                        if plan is None:
-                            raise RuntimeError("no way to the point: it is boxed in, or the "
-                                               "point itself is too close to something")
+                        self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan])
                     if plan is not None and len(plan) > 2:
                         # Going round something: head for the path, facing the way it goes.
                         aim = lookahead(plan, pose)
@@ -2150,7 +2176,11 @@ class Walk:
                           error=self._errors(pose, goal))
                 if phase == "done":
                     break
-                ahead = (obstacle_ahead(pose, vx, vy, list(memory) if memory else cells)
+                # Only what lies before the goal can be in the way: a table the walk ends 30 cm
+                # from is where it is going, not something stepping in front.
+                left = math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"])
+                reach = min(WALK_STOP_M, left + WALK_GOAL_CLEARANCE - 0.05)
+                ahead = (obstacle_ahead(pose, vx, vy, list(memory) if memory else cells, reach)
                          if phase == "translate" else None)
                 if ahead is not None:
                     # Something in the way: stop, give it a moment to move off, then give up.

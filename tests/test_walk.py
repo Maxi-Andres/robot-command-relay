@@ -378,7 +378,7 @@ def test_a_wall_across_the_way_is_a_failure_without_a_step_into_it():
     walk = seeing_walk(robot, FakeLidar(robot, wall))
     walk.start(2.0, 0, 0)
     st = wait_done(walk)
-    assert st["state"] == "failure" and "no way" in st["reason"]
+    assert st["state"] == "failure" and "every way round" in st["reason"]
     assert robot.x < 1.0 - 0.3
     assert robot.lines[-1] == "stop_move"
 
@@ -413,7 +413,28 @@ def test_the_planner_alone():
     assert len(round_it) > 2
     assert all(min(math.hypot(px - x, py - y) for x, y in box(1.0, 0.0)) >= 0.3
                for px, py in round_it)
-    assert relay_server.plan_path((0, 0), (1.0, 0.0), box(1.0, 0.0)) is None   # goal inside
+    with pytest.raises(relay_server.NoWay, match="cm from something"):
+        relay_server.plan_path((0, 0), (1.0, 0.0), box(1.0, 0.0))                # goal inside
+
+
+def test_it_walks_up_to_a_table_and_back_away_from_it():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    table = [(1.0, -1.0 + k * 0.05) for k in range(41)]
+    walk = seeing_walk(robot, FakeLidar(robot, table))
+    walk.start(0.7, 0, 0)                          # to 30 cm from the edge, as for a grasp
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert robot.x == pytest.approx(0.7, abs=0.08)
+    walk.start(-0.5, 0, 0)                         # and from there, back off
+    assert wait_done(walk)["state"] == "success"
+
+
+def test_it_may_end_closer_to_things_than_it_passes_them():
+    table = [(1.0, -1.0 + k * 0.05) for k in range(41)]           # a table edge 1 m ahead
+    path = relay_server.plan_path((0, 0), (0.7, 0.0), table)       # stand 30 cm from it
+    assert path[-1] == (0.7, 0.0)
+    with pytest.raises(relay_server.NoWay, match="20 cm from something"):
+        relay_server.plan_path((0, 0), (0.8, 0.0), table)
 
 
 def test_something_beside_the_way_does_not_stop_it():
