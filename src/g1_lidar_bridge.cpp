@@ -33,6 +33,13 @@
 // cells: occupied 5 cm squares in the odometry frame (x = ix*res), within LIDAR_RANGE_M of the
 // robot. Without odometry ("odom":0) they are in the robot's own levelled frame and pose is 0.
 //
+// THE CLOUD, for the page's 3D view, on lines of their own every LIDAR_CLOUD_MS (1000):
+//   {"kind":"cloud","t":..,"pose":[x,y,yaw],"res":0.08,"n":N,"xyz":"<base64>"}
+// xyz: N x 3 little-endian int16 in CENTIMETRES — x, y in the odometry frame, z over the floor —
+// one point per LIDAR_CLOUD_RES (8 cm) cube seen in the last LIDAR_CLOUD_KEEP_MS (1500), floor
+// included, up to 2.3 m. ~15 000 points ~ 120 KB a line: it crosses the robot's uplink, so it is
+// coarse and slow on purpose. At most LIDAR_CLOUD_MAX points (every other one dropped past it).
+//
 // EOF ON STDIN EXITS, like every bridge the relay runs.
 
 #include <unitree/idl/ros2/Odometry_.hpp>
@@ -129,10 +136,42 @@ struct State {
     double floor = -1.2;                         // m under the lidar, until measured
     // cell key -> last time seen (ms)
     std::unordered_map<long long, long long> cells;
+    // cloud cube key -> last time seen (ms)
+    std::unordered_map<unsigned long long, long long> cloud;
 };
 State g;
 
 long long key(int ix, int iy) { return ((long long)ix << 32) ^ (unsigned int)iy; }
+
+// A cube's key: three 21-bit indices, each offset to be positive (±10 km at 1 cm: plenty).
+constexpr long long OFF = 1 << 20;
+unsigned long long key3(long long ix, long long iy, long long iz) {
+    return ((unsigned long long)(ix + OFF) << 42) | ((unsigned long long)(iy + OFF) << 21) |
+           (unsigned long long)(iz + OFF);
+}
+void unkey3(unsigned long long k, long long& ix, long long& iy, long long& iz) {
+    ix = (long long)(k >> 42) - OFF;
+    iy = (long long)((k >> 21) & 0x1fffff) - OFF;
+    iz = (long long)(k & 0x1fffff) - OFF;
+}
+
+std::string base64(const std::vector<uint8_t>& in) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const unsigned v = (in[i] << 16) | (in[i + 1] << 8) | in[i + 2];
+        out += T[v >> 18], out += T[(v >> 12) & 63], out += T[(v >> 6) & 63], out += T[v & 63];
+    }
+    if (i < in.size()) {
+        const unsigned v = (in[i] << 16) | (i + 1 < in.size() ? in[i + 1] << 8 : 0);
+        out += T[v >> 18], out += T[(v >> 12) & 63];
+        out += i + 1 < in.size() ? T[(v >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
 
 int open_udp(int port) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -161,6 +200,10 @@ int main(int argc, char** argv) {
     const long long window_ms = (long long)env_d("LIDAR_WINDOW_MS", 300);
     double hz = env_d("LIDAR_RATE_HZ", 5);
     if (!(hz >= 1 && hz <= 20)) hz = 5;
+    const double cloud_res = env_d("LIDAR_CLOUD_RES", 0.08);
+    const long long cloud_ms = (long long)env_d("LIDAR_CLOUD_MS", 1000);
+    const long long cloud_keep_ms = (long long)env_d("LIDAR_CLOUD_KEEP_MS", 1500);
+    const size_t cloud_max = (size_t)env_d("LIDAR_CLOUD_MAX", 20000);
     const Mat R0 = mul(rot_z(env_d("LIDAR_MOUNT_YAW_DEG", 0) * M_PI / 180),
                        rot_x(env_d("LIDAR_MOUNT_ROLL_DEG", 180) * M_PI / 180));
     std::cerr << "[lidar-bridge] iface=" << iface << " obstacles " << min_h << ".." << max_h
@@ -238,6 +281,8 @@ int main(int argc, char** argv) {
                 const long long now = mono_ms();
                 std::vector<long long> hit;
                 hit.reserve(dots);
+                std::vector<unsigned long long> seen3;
+                seen3.reserve(dots);
                 for (int k = 0; k < dots; k++) {
                     const uint8_t* p = buf.data() + 36 + k * step;
                     double x, y, z;
@@ -258,9 +303,14 @@ int main(int argc, char** argv) {
                         hist[std::min(124, (int)((q[2] + 2.5) / 0.02))]++;
                         hist_n++;
                     }
-                    if (q[2] < floor + min_h || q[2] > floor + max_h) continue;
                     const double wx = pose.x + c * q[0] - s * q[1];
                     const double wy = pose.y + s * q[0] + c * q[1];
+                    const double hz = q[2] - floor;      // height over the floor
+                    if (hz > -0.10 && hz < 2.3)
+                        seen3.push_back(key3(std::llround(wx / cloud_res),
+                                             std::llround(wy / cloud_res),
+                                             std::llround(hz / cloud_res)));
+                    if (q[2] < floor + min_h || q[2] > floor + max_h) continue;
                     hit.push_back(key((int)std::lround(wx / res), (int)std::lround(wy / res)));
                 }
                 // About one lidar frame (10 000 points): place the floor at the densest low layer.
@@ -276,6 +326,7 @@ int main(int argc, char** argv) {
                 }
                 std::lock_guard<std::mutex> lk(g.mu);
                 for (long long k : hit) g.cells[k] = now;
+                for (unsigned long long k : seen3) g.cloud[k] = now;
             }
         }
     });
@@ -284,6 +335,7 @@ int main(int argc, char** argv) {
     auto next = Clock::now();
     long long last_points = 0;
     auto last_count = Clock::now();
+    long long next_cloud = mono_ms() + cloud_ms;
     while (!done) {
         next += std::chrono::duration_cast<Clock::duration>(period);
         std::this_thread::sleep_until(next);
@@ -326,6 +378,40 @@ int main(int argc, char** argv) {
                "\"odom\":%d,\"pose\":[%.4f,%.4f,%.5f],\"res\":%.2f,\"cells\":[%s]}\n",
                unix_s(), age, pts, floor, tilt, pose.valid ? 1 : 0, pose.x, pose.y, pose.yaw,
                res, cells.c_str());
+        fflush(stdout);
+
+        if (mono_ms() < next_cloud) continue;
+        next_cloud = mono_ms() + cloud_ms;
+        std::vector<uint8_t> raw;
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(g.mu);
+            const long long now = mono_ms();
+            for (auto it = g.cloud.begin(); it != g.cloud.end();) {
+                if (now - it->second > cloud_keep_ms) it = g.cloud.erase(it);
+                else ++it;
+            }
+            const size_t every = g.cloud.size() > cloud_max ? (g.cloud.size() + cloud_max - 1) / cloud_max : 1;
+            raw.reserve(std::min(g.cloud.size(), cloud_max) * 6);
+            size_t k = 0;
+            for (const auto& kv : g.cloud) {
+                if (k++ % every) continue;
+                long long ix, iy, iz;
+                unkey3(kv.first, ix, iy, iz);
+                const long long v[3] = {std::llround(ix * cloud_res * 100),
+                                        std::llround(iy * cloud_res * 100),
+                                        std::llround(iz * cloud_res * 100)};
+                for (long long x : v) {
+                    const int16_t c16 = (int16_t)std::max(-32768LL, std::min(32767LL, x));
+                    raw.push_back((uint8_t)(c16 & 0xff));
+                    raw.push_back((uint8_t)((c16 >> 8) & 0xff));
+                }
+                n++;
+            }
+        }
+        printf("{\"kind\":\"cloud\",\"t\":%.3f,\"pose\":[%.4f,%.4f,%.5f],\"res\":%.2f,\"n\":%zu,"
+               "\"xyz\":\"%s\"}\n",
+               unix_s(), pose.x, pose.y, pose.yaw, cloud_res, n, base64(raw).c_str());
         fflush(stdout);
     }
     rx.join();

@@ -180,3 +180,27 @@ def test_no_stream_on_a_go2(server):
     conn, r = _get(server)
     assert r.status == 404
     conn.close()
+
+
+# Two kinds of line from one child: the lidar bridge's obstacle map and its 3D cloud.
+TWO_KINDS_BRIDGE = textwrap.dedent("""
+    import sys, time
+    for n in range(1, 4):
+        print('{"n": %d}' % n, flush=True)
+        print('{"kind":"cloud","c": %d}' % n, flush=True)
+        time.sleep(0.02)
+    sys.stdin.read()
+""")
+
+
+def test_a_side_stream_is_kept_apart(tmp_path):
+    hub = relay_server.JointStream(_script(tmp_path, TWO_KINDS_BRIDGE), label="lidar bridge",
+                                   side_prefix='{"kind":"cloud"')
+    assert hub.subscribe()
+    try:
+        _wait(lambda: hub.seq >= 3 and hub.side_seq >= 3)
+        assert json.loads(hub.next_line(0, 1)[1]) == {"n": 3}
+        assert json.loads(hub.next_side(0, 1)[1]) == {"kind": "cloud", "c": 3}
+    finally:
+        hub.unsubscribe()
+        hub.stop()

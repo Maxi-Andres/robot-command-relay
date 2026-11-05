@@ -1093,9 +1093,14 @@ class JointStream:
     """
 
     def __init__(self, argv, max_clients=JOINT_MAX_CLIENTS, idle_s=JOINT_IDLE_S,
-                 label="joint bridge"):
+                 label="joint bridge", side_prefix=None):
         self.argv = argv
         self.label = label
+        # Lines starting with `side_prefix` are a second stream from the same child (the lidar
+        # bridge's 3D cloud): kept apart, newest wins too, so neither crowds out the other.
+        self.side_prefix = side_prefix
+        self.side_latest = None
+        self.side_seq = 0
         self.max_clients = max_clients
         self.idle_s = idle_s
         self.cond = threading.Condition()
@@ -1123,8 +1128,12 @@ class JointStream:
             if not (line.startswith("{") and line.endswith("}")):
                 continue
             with self.cond:
-                self.latest = line
-                self.seq += 1
+                if self.side_prefix and line.startswith(self.side_prefix):
+                    self.side_latest = line
+                    self.side_seq += 1
+                else:
+                    self.latest = line
+                    self.seq += 1
                 self.cond.notify_all()
         with self.cond:
             if self.proc is proc:
@@ -1168,6 +1177,15 @@ class JointStream:
             self.cond.wait_for(lambda: self.seq != seen and self.latest is not None, timeout)
             if self.seq != seen and self.latest is not None:
                 return self.seq, self.latest
+            return seen, None
+
+    def next_side(self, seen, timeout):
+        """The same for the side stream (lines starting with `side_prefix`)."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.side_seq != seen and self.side_latest is not None,
+                               timeout)
+            if self.side_seq != seen and self.side_latest is not None:
+                return self.side_seq, self.side_latest
             return seen, None
 
     @staticmethod
@@ -2363,7 +2381,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._ndjson_stream(getattr(self.server, "lidar", None), "lidar",
                                    shape=coarsen_lidar, min_interval=1.0 / LIDAR_VIEW_HZ)
 
-    def _ndjson_stream(self, joints, name, shape=None, min_interval=0.0):
+    def _lidar_cloud(self):
+        """GET /lidar/cloud — the 3D point cloud around the G1 for the page's 3D view (the lidar
+        bridge's "cloud" lines: base64 int16 centimetres, ~1 Hz, 8 cm cubes). Read-only."""
+        return self._ndjson_stream(getattr(self.server, "lidar", None), "lidar-cloud",
+                                   side=True, heartbeat=3.0)
+
+    def _ndjson_stream(self, joints, name, shape=None, min_interval=0.0, side=False,
+                       heartbeat=JOINT_HEARTBEAT_S):
         src = self.client_address[0]
         if not self._authorised():
             audit(src, f"{name}-stream", "-", "unauthorised")
@@ -2384,7 +2409,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             seen = 0
             while True:
-                seen, line = joints.next_line(seen, JOINT_HEARTBEAT_S)
+                seen, line = (joints.next_side if side else joints.next_line)(seen, heartbeat)
                 if line is not None and shape is not None:
                     line = shape(line)
                 self.wfile.write(((line or '{"stale":true}') + "\n").encode())
@@ -2523,6 +2548,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._odom_stream()
         if self.path.split("?")[0].rstrip("/") == "/lidar/stream":
             return self._lidar_stream()
+        if self.path.split("?")[0].rstrip("/") == "/lidar/cloud":
+            return self._lidar_cloud()
         if self.path.split("?")[0].rstrip("/") == "/video-config":
             if not self._authorised():
                 return self._json(401, {"error": "unauthorised"})
@@ -2881,7 +2908,8 @@ def main():
     srv.odom = srv.walk = srv.lidar = None
     if ROBOT_MODEL == "g1":
         if os.access(LIDAR_BRIDGE, os.X_OK):
-            srv.lidar = JointStream([LIDAR_BRIDGE], label="lidar bridge")
+            srv.lidar = JointStream([LIDAR_BRIDGE], label="lidar bridge",
+                                    side_prefix='{"kind":"cloud"')
         else:
             log(f"no {LIDAR_BRIDGE}: /lidar is off and walks are blind until ./build.sh is run")
         if os.access(ODOM_BRIDGE, os.X_OK):
