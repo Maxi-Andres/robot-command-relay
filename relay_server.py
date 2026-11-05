@@ -1969,6 +1969,17 @@ WALK_MEMORY_S = 1.0
 # SLOW DOWN NEAR THINGS: with something within WALK_SLOW_M ahead (in a corridor WALK_SLOW_HALF
 # each side), the speed falls in proportion, to WALK_SLOW_MIN of it at the stop distance — so it
 # comes up to a person or a table gently and stops short, instead of at full speed then all at once.
+# FACE THE WAY IT WALKS (2026-11-05: it crabbed 1.9 m sideways at 0.15 m/s and timed out). A walk
+# turns to face its path, walks forward, and turns to the final heading at the end. Short moves keep
+# the heading instead: a side step up to WALK_SIDESTEP_M, a step back up to WALK_BACKSTEP_M ("50 cm
+# back" means backing up, not turning round). More than WALK_ALIGN_RAD off the path's direction =
+# stop and turn first; within WALK_FREEZE_FACE_M of the goal the heading is held, or it would spin
+# chasing a point under its own feet.
+WALK_SIDESTEP_M = 0.4
+WALK_BACKSTEP_M = 1.0
+WALK_ALIGN_RAD = math.radians(25)
+WALK_ALIGNED_RAD = math.radians(8)   # ...and turns until within this, so it sets off straight
+WALK_FREEZE_FACE_M = 0.35
 WALK_SLOW_M = 1.2
 WALK_SLOW_HALF = 0.35
 WALK_SLOW_MIN = 0.35
@@ -2297,7 +2308,12 @@ class Walk:
                     "yaw": wrap_angle(pose["yaw"] + dyaw), "hold": pose["yaw"]}
             dist = math.hypot(dx, dy)
             # Generous: the slowest the robot goes, plus time to start and to stop.
-            limit = dist / WALK_MIN_V + abs(dyaw) / WALK_MIN_W + 10.0
+            # Room for turning to face the way (up to half a turn) as well as the final turn.
+            limit = dist / WALK_MIN_V + (abs(dyaw) + math.pi) / WALK_MIN_W + 10.0
+            facing = not (dist <= WALK_SIDESTEP_M or
+                          (dx < 0 and abs(dy) <= 0.3 and dist <= WALK_BACKSTEP_M))
+            last_face = None
+            aligning = False
             self._set(state="running", start=dict(pose), pose=dict(pose),
                       goal={k: goal[k] for k in ("x", "y", "yaw")}, limit_s=round(limit, 1))
             phase = "translate" if dist >= 0.01 else "turn"
@@ -2340,10 +2356,15 @@ class Walk:
                             # something in front, and give up only if it stays (2026-11-05: a
                             # walk ended at once on "the point is 11 cm from something").
                             plan, no_way = None, str(exc)
-                    if plan is not None and len(plan) > 2:
-                        # Going round something: head for the path, facing the way it goes.
+                    if plan is not None and (facing or len(plan) > 2):
                         aim = lookahead(plan, pose)
-                        face = math.atan2(aim[1] - pose["y"], aim[0] - pose["x"])
+                        if not facing:          # a short step round something: hold heading
+                            face = math.atan2(aim[1] - pose["y"], aim[0] - pose["x"])
+                if facing and phase == "translate":
+                    target = aim if aim is not None else (goal["x"], goal["y"])
+                    if math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"]) > WALK_FREEZE_FACE_M:
+                        last_face = math.atan2(target[1] - pose["y"], target[0] - pose["x"])
+                    face = last_face
                 if no_way is not None and phase == "translate":
                     if blocked_since is None:
                         self._send("stop_move")
@@ -2353,9 +2374,19 @@ class Walk:
                     if now - blocked_since > self.blocked_wait_s:
                         raise NoWay(no_way)
                     continue
-                vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face)
-                self._set(pose=dict(pose), phase=phase, elapsed_s=round(now, 1),
-                          error=self._errors(pose, goal))
+                off = abs(wrap_angle(face - pose["yaw"])) if face is not None else 0.0
+                aligning = (facing and phase == "translate" and face is not None
+                            and off > (WALK_ALIGNED_RAD if aligning else WALK_ALIGN_RAD))
+                turn_first = aligning
+                if turn_first:
+                    # Facing too far off the way: stop stepping and turn in place to it first.
+                    err = wrap_angle(face - pose["yaw"])
+                    w = max(-WALK_VYAW, min(WALK_VYAW, WALK_YAW_GAIN * err))
+                    vx, vy, vyaw = 0.0, 0.0, math.copysign(max(abs(w), WALK_MIN_W), err)
+                else:
+                    vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face)
+                self._set(pose=dict(pose), phase="align" if turn_first else phase,
+                          elapsed_s=round(now, 1), error=self._errors(pose, goal))
                 if phase == "done":
                     break
                 # Only what lies before the goal can be in the way: a table the walk ends 30 cm

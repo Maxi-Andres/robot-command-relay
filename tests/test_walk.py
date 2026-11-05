@@ -573,3 +573,31 @@ def test_it_slows_down_coming_up_to_something():
     assert max(speeds) == pytest.approx(relay_server.WALK_VX)       # full speed when clear
     # Within the slow zone (the last stretch) it never ran at full speed.
     assert max(speeds[-5:]) < relay_server.WALK_VX * 0.8
+
+
+def test_a_walk_to_the_side_turns_and_walks_forward_not_like_a_crab():
+    # Seen on the robot: 0.7 m forward and 1.8 m right, done sideways at 0.15 m/s -> timed out.
+    robot = SimRobot(x=0, y=0, yaw=0.4)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(0.7, -1.8, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    steps = [tuple(float(v) for v in ln.split()[1:]) for ln in moves(robot)]
+    walking = [s for s in steps if math.hypot(s[0], s[1]) > 0.05]
+    assert walking and max(abs(vy) for _vx, vy, _w in walking) < 0.08      # forward, not sideways
+    assert max(vx for vx, _vy, _w in walking) > 0.25                        # at walking speed
+    # It ends where asked, facing as it started (dyaw 0): it turned back at the end.
+    c, s = math.cos(0.4), math.sin(0.4)
+    assert robot.x == pytest.approx(c * 0.7 + s * 1.8, abs=0.1)
+    assert robot.y == pytest.approx(s * 0.7 - c * 1.8, abs=0.1)
+    assert relay_server.wrap_angle(robot.yaw - 0.4) == pytest.approx(0, abs=0.07)
+
+
+def test_half_a_metre_back_backs_up_without_turning_round():
+    robot = SimRobot(x=0, y=0, yaw=1.0)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(-0.5, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert all(abs(float(ln.split()[3])) < 0.2 for ln in moves(robot))    # no turning round
+    assert relay_server.wrap_angle(robot.yaw - 1.0) == pytest.approx(0, abs=0.07)
