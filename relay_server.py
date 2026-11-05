@@ -2279,7 +2279,7 @@ class Walk:
                 raise RuntimeError("the lidar stream has no room for one more")
             lidar_seen, cells, seen_at = 0, None, None
             memory = {}                         # obstacle (x, y) -> when it was last seen
-            plan, planned_at = None, None
+            plan, planned_at, no_way = None, None, None
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
@@ -2320,14 +2320,30 @@ class Walk:
                             memory[c] = t_seen
                         for c in [c for c, at in memory.items() if t_seen - at > WALK_MEMORY_S]:
                             del memory[c]
-                        plan = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]),
-                                         list(memory))
                         planned_at = seen_at
-                        self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan])
+                        try:
+                            plan = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]),
+                                             list(memory))
+                            no_way = None
+                            self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan])
+                        except NoWay as exc:
+                            # Maybe someone stands there for a moment: stop and wait, like for
+                            # something in front, and give up only if it stays (2026-11-05: a
+                            # walk ended at once on "the point is 11 cm from something").
+                            plan, no_way = None, str(exc)
                     if plan is not None and len(plan) > 2:
                         # Going round something: head for the path, facing the way it goes.
                         aim = lookahead(plan, pose)
                         face = math.atan2(aim[1] - pose["y"], aim[0] - pose["x"])
+                if no_way is not None and phase == "translate":
+                    if blocked_since is None:
+                        self._send("stop_move")
+                        blocked_since = now
+                        audit("-", "walk-blocked", no_way, "-")
+                    self._set(blocked={"dist_m": 0.0, "reason": no_way})
+                    if now - blocked_since > self.blocked_wait_s:
+                        raise NoWay(no_way)
+                    continue
                 vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face)
                 self._set(pose=dict(pose), phase=phase, elapsed_s=round(now, 1),
                           error=self._errors(pose, goal))

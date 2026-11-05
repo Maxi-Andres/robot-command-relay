@@ -524,3 +524,38 @@ def test_a_way_at_an_angle_with_nothing_in_it_is_one_straight_segment():
         for k in range(21):
             px, py = ax + (bx - ax) * k / 20, ay + (by - ay) * k / 20
             assert min(math.hypot(px - x, py - y) for x, y in box(1.0, -0.5)) > 0.3
+
+
+
+def test_someone_standing_on_the_goal_for_a_moment_does_not_end_the_walk():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    lidar = FakeLidar(robot, [])
+    walk = seeing_walk(robot, lidar, wait=30)
+    walk.start(2.0, 0, 0)
+    end = time.time() + 5
+    while robot.x < 0.5 and time.time() < end:
+        time.sleep(0.001)
+    lidar.obstacles = [(2.05, 0.0)]                # someone right on the goal
+    end = time.time() + 5
+    while not (walk.status().get("blocked") or {}).get("reason") and time.time() < end:
+        time.sleep(0.005)
+    assert "cm from something" in walk.status()["blocked"]["reason"]
+    assert walk.running()
+    lidar.obstacles = []                           # and they step away
+    memory_s = relay_server.WALK_MEMORY_S
+    st = wait_done(walk, timeout=10 + memory_s)
+    assert st["state"] == "success", st
+
+
+def test_a_goal_that_stays_blocked_ends_the_walk_saying_why():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    lidar = FakeLidar(robot, [])
+    walk = seeing_walk(robot, lidar, wait=0.5)
+    walk.start(2.0, 0, 0)
+    end = time.time() + 5
+    while robot.x < 0.5 and time.time() < end:
+        time.sleep(0.001)
+    lidar.obstacles = [(2.05, 0.0)]
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "cm from something" in st["reason"]
+    assert robot.lines[-1] == "stop_move"

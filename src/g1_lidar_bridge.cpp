@@ -21,7 +21,8 @@
 // Then the points are placed in the odometry frame with the pose of rt/state_estimator/odom_torso
 // at the moment they arrive, so a turning robot does not smear its own map.
 //
-// WHAT IS AN OBSTACLE: a point between FLOOR + LIDAR_MIN_H (10 cm) and FLOOR + LIDAR_MAX_H
+// WHAT IS AN OBSTACLE: a point between FLOOR + LIDAR_MIN_H (10 cm, plus r * tan(2°) at r metres:
+// LIDAR_TILT_TOL_DEG) and FLOOR + LIDAR_MAX_H
 // (1.5 m, the robot is 1.32 m), from LIDAR_SELF_M (0.35 m, its own arms and body) to
 // LIDAR_RANGE_M (6 m) away. The floor is found in the points themselves: the densest low layer.
 // Kept for LIDAR_WINDOW_MS (300 ms = 3 lidar frames): something that moves away is gone soon.
@@ -129,8 +130,9 @@ struct Pose {
 
 struct State {
     std::mutex mu;
-    Vec acc_lp{0, 0, 0};
+    Vec acc_lp{0, 0, 0};          // "up" in the lidar's frame, unit (see the IMU handling)
     bool have_acc = false;
+    long long imu_ms = 0;
     Pose pose;
     long long pose_ms = 0;
     long long last_pkt_ms = -1;
@@ -198,6 +200,9 @@ int main(int argc, char** argv) {
     const std::string iface = argc > 1 ? argv[1] : (getenv("DDS_IFACE") ? getenv("DDS_IFACE") : "eth0");
     const double res = 0.05;
     const double min_h = env_d("LIDAR_MIN_H", 0.10), max_h = env_d("LIDAR_MAX_H", 1.50);
+    // The floor's band grows with distance: a residual tilt of this many degrees lifts the floor
+    // r*tan(tilt) at r metres, so far away a little more height is needed to call it an obstacle.
+    const double tilt_tol = std::tan(env_d("LIDAR_TILT_TOL_DEG", 2.0) * M_PI / 180);
     const double self_m = env_d("LIDAR_SELF_M", 0.35), range_m = env_d("LIDAR_RANGE_M", 6.0);
     const long long window_ms = (long long)env_d("LIDAR_WINDOW_MS", 300);
     double hz = env_d("LIDAR_RATE_HZ", 5);
@@ -250,13 +255,38 @@ int main(int argc, char** argv) {
                 if (n < 36) continue;
                 const uint16_t dots = buf[5] | (buf[6] << 8);
                 const uint8_t type = buf[10];
-                if (type == 0 && n >= 36 + 24) {            // IMU: acc in g at 24..36
-                    float a[3];
+                if (type == 0 && n >= 36 + 24) {            // IMU: gyro rad/s, then acc in g
+                    float w[3], a[3];
+                    memcpy(w, buf.data() + 36, 12);
                     memcpy(a, buf.data() + 36 + 12, 12);
+                    const long long now = mono_ms();
                     std::lock_guard<std::mutex> lk(g.mu);
-                    for (int i = 0; i < 3; i++)
-                        g.acc_lp[i] = g.have_acc ? 0.98 * g.acc_lp[i] + 0.02 * a[i] : a[i];
-                    g.have_acc = true;
+                    if (!g.have_acc) {
+                        g.acc_lp = {a[0], a[1], a[2]};
+                        g.have_acc = true;
+                        g.imu_ms = now;
+                        continue;
+                    }
+                    // A COMPLEMENTARY FILTER for "which way is up", in the lidar's own frame.
+                    // The gyro turns the estimate with the body (an up vector fixed in the world
+                    // moves as -w x up in a turning frame): fast, and blind to accelerations. The
+                    // accelerometer pulls it back slowly, and only when it reads ~1 g. Gravity alone,
+                    // low-passed, lagged the sway of a walking biped: a few degrees off made the
+                    // floor 1 m away rise 10 cm into "obstacles" (2026-11-05, a walk refused).
+                    const double dt = std::min(0.05, std::max(0.0, (now - g.imu_ms) / 1000.0));
+                    g.imu_ms = now;
+                    Vec& u = g.acc_lp;
+                    const Vec cr = {w[1] * u[2] - w[2] * u[1], w[2] * u[0] - w[0] * u[2],
+                                    w[0] * u[1] - w[1] * u[0]};
+                    for (int i = 0; i < 3; i++) u[i] -= cr[i] * dt;
+                    const double am = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+                    double um = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                    for (int i = 0; i < 3; i++) u[i] /= um;
+                    if (std::fabs(am - 1.0) < 0.15) {
+                        for (int i = 0; i < 3; i++) u[i] = 0.99 * u[i] + 0.01 * a[i] / am;
+                        um = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                        for (int i = 0; i < 3; i++) u[i] /= um;
+                    }
                     continue;
                 }
                 if (type != 1 && type != 2) continue;
@@ -312,7 +342,7 @@ int main(int argc, char** argv) {
                         seen3.push_back(key3(std::llround(wx / cloud_res),
                                              std::llround(wy / cloud_res),
                                              std::llround(hz / cloud_res)));
-                    if (q[2] < floor + min_h || q[2] > floor + max_h) continue;
+                    if (q[2] < floor + min_h + r * tilt_tol || q[2] > floor + max_h) continue;
                     hit.push_back(key((int)std::lround(wx / res), (int)std::lround(wy / res)));
                 }
                 // About one lidar frame (10 000 points): place the floor at the densest low layer.
