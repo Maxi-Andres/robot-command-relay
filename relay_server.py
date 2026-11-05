@@ -1962,7 +1962,16 @@ WALK_CLEARANCE = 0.35         # m kept between the robot's centre and anything t
 WALK_GOAL_CLEARANCE = float(os.environ.get("WALK_GOAL_CLEARANCE", "0.25"))
 WALK_PLAN_MARGIN = 1.5        # m of room around start and goal to go round things
 WALK_LOOKAHEAD = 0.3          # m along the path: the point it heads for (0.5 cut the corners: 0.29 m from a box planned at 0.42)
-WALK_MEMORY_S = 2.0           # an obstacle stays on the map this long after it was last seen
+# An obstacle stays on the map this long after it was last seen: long enough to cover the
+# lidar's blind ring round the robot (0.35 m), short enough that a person who walked past does not
+# leave a wake that blocks ways already free (2 s did, 2026-11-05).
+WALK_MEMORY_S = 1.0
+# SLOW DOWN NEAR THINGS: with something within WALK_SLOW_M ahead (in a corridor WALK_SLOW_HALF
+# each side), the speed falls in proportion, to WALK_SLOW_MIN of it at the stop distance — so it
+# comes up to a person or a table gently and stops short, instead of at full speed then all at once.
+WALK_SLOW_M = 1.2
+WALK_SLOW_HALF = 0.35
+WALK_SLOW_MIN = 0.35
 
 
 class NoWay(RuntimeError):
@@ -2370,6 +2379,17 @@ class Walk:
                     waited += now - blocked_since      # time spent waiting does not count
                     blocked_since = None
                     self._set(blocked=None)
+                if phase == "translate":
+                    near = obstacle_ahead(pose, vx, vy, list(memory) if memory else cells,
+                                          min(WALK_SLOW_M, left + WALK_GOAL_CLEARANCE),
+                                          WALK_SLOW_HALF)
+                    if near is not None:
+                        f = (near - WALK_STOP_M) / max(WALK_SLOW_M - WALK_STOP_M, 1e-6)
+                        f = max(WALK_SLOW_MIN, min(1.0, f))
+                        speed = math.hypot(vx, vy)
+                        if speed * f < WALK_MIN_V:
+                            f = WALK_MIN_V / max(speed, 1e-6)
+                        vx, vy = vx * min(1.0, f), vy * min(1.0, f)
                 if now - last_send >= 1.0 / self.hz:
                     self._send(f"move {vx:.3f} {vy:.3f} {vyaw:.3f}")
                     last_send = now

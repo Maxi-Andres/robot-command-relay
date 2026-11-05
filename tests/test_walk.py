@@ -559,3 +559,17 @@ def test_a_goal_that_stays_blocked_ends_the_walk_saying_why():
     st = wait_done(walk)
     assert st["state"] == "failure" and "cm from something" in st["reason"]
     assert robot.lines[-1] == "stop_move"
+
+
+
+def test_it_slows_down_coming_up_to_something():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    table = [(1.6, -1.0 + k * 0.05) for k in range(41)]
+    walk = seeing_walk(robot, FakeLidar(robot, table))
+    walk.start(1.3, 0, 0)                           # to 30 cm from a table edge
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    speeds = [float(ln.split()[1]) for ln in moves(robot)]
+    assert max(speeds) == pytest.approx(relay_server.WALK_VX)       # full speed when clear
+    # Within the slow zone (the last stretch) it never ran at full speed.
+    assert max(speeds[-5:]) < relay_server.WALK_VX * 0.8
