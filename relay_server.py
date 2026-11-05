@@ -2165,6 +2165,49 @@ class Walk:
             self.thread.start()
             return 200, {"ok": True, "walk": dict(self.state)}
 
+    def plan(self, dx, dy, dyaw, wait_s=1.5):
+        """(http code, answer) for a walk NOT taken: where it would go and the way it would take,
+        from where the robot stands now and what the lidar sees now. Nothing moves. The page
+        shows it and the operator accepts it (a goto), which plans again as it walks."""
+        if not self.odom.subscribe():
+            return 503, {"ok": False, "error": "the odometry stream has no room for one more"}
+        looking = self.lidar is not None and self.lidar.subscribe()
+        try:
+            _seen, pose = self._pose(0, wait_s)
+            if pose is None:
+                return 503, {"ok": False, "error": "no odometry from the robot"}
+            c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+            goal = {"x": pose["x"] + c * dx - s * dy, "y": pose["y"] + s * dx + c * dy,
+                    "yaw": wrap_angle(pose["yaw"] + dyaw)}
+            out = {"start": pose, "goal": goal, "request": {"dx": dx, "dy": dy, "dyaw": dyaw}}
+            cells = None
+            if looking:
+                end = self.clock() + wait_s
+                seen = 0
+                while cells is None and self.clock() < end:
+                    seen, line = self.lidar.next_line(seen, 0.3)
+                    if line is not None:
+                        cells, _d = parse_lidar(line)
+            if cells is None:
+                if self.require_lidar:
+                    return 503, {"ok": False, **out, "error": "no obstacle map from the lidar"}
+                return 200, {"ok": True, "plan": {**out, "path": [[pose["x"], pose["y"]],
+                                                                   [goal["x"], goal["y"]]],
+                                                  "eyes": "none"}}
+            if math.hypot(dx, dy) < 0.01:
+                path = [(pose["x"], pose["y"])]          # a turn in place: no way to plan
+            else:
+                try:
+                    path = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]), cells)
+                except NoWay as exc:
+                    return 200, {"ok": False, "plan": {**out, "path": None}, "error": str(exc)}
+            return 200, {"ok": True, "plan": {**out, "eyes": "lidar", "path": [
+                [round(x, 3), round(y, 3)] for x, y in path]}}
+        finally:
+            self.odom.unsubscribe()
+            if looking:
+                self.lidar.unsubscribe()
+
     # -- the loop -------------------------------------------------------- #
     def _pose(self, seen, timeout):
         """(seq, pose) of the next fresh odometry line, or (seq, None) if none arrived."""
@@ -2582,6 +2625,8 @@ class Handler(BaseHTTPRequestHandler):
         """POST /walk/control — the G1 walks to a pose RELATIVE to where it stands (see Walk).
 
           {"op": "goto", "dx": m forward, "dy": m left, "dyaw": rad left}  -> {ok, walk}
+          {"op": "plan", same numbers} -> {ok, plan: {start, goal, path}}: the way it WOULD take,
+                                          nothing moves (ok false + error when there is none)
           {"op": "cancel"}                                                    -> {ok, walk}
           {"op": "status"}                                                    -> {ok, walk}
 
@@ -2611,14 +2656,17 @@ class Handler(BaseHTTPRequestHandler):
             # Never rate limited, like a stop.
             walk.cancel(f"cancel from {src}")
             return self._json(200, {"ok": True, "walk": walk.status()})
-        if op != "goto":
-            return self._json(400, {"error": "op must be goto, cancel or status"})
+        if op not in ("goto", "plan"):
+            return self._json(400, {"error": "op must be goto, plan, cancel or status"})
         if not self.server.limiter.allow():
             return self._json(429, {"error": "rate limited"})
         try:
             dx, dy, dyaw = validate_goto(body)
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
+        if op == "plan":
+            # Moves nothing: the page shows the way and the operator accepts it with a goto.
+            return self._json(*walk.plan(dx, dy, dyaw))
         code, out = walk.start(dx, dy, dyaw)
         audit(src, "walk-goto", f"dx={dx:.2f} dy={dy:.2f} dyaw={dyaw:.2f}",
               "started" if out.get("ok") else out.get("error", "-"))

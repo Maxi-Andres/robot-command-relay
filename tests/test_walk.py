@@ -486,3 +486,26 @@ def test_the_trail_records_from_the_odometry_stream():
         time.sleep(0.01)
     pts = trail.snapshot()["points"]
     assert len(pts) > 20 and pts[-1][0] > 0.9
+
+
+
+# --------------------------------------------------------------------------- #
+# Plan first, walk after the operator accepts
+# --------------------------------------------------------------------------- #
+def test_a_plan_shows_the_way_round_and_moves_nothing():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, box(1.0, 0.0)))
+    code, out = walk.plan(2.0, 0, 0)
+    assert code == 200 and out["ok"]
+    path = out["plan"]["path"]
+    assert len(path) > 2 and path[-1] == [2.0, 0.0]
+    assert out["plan"]["goal"]["x"] == pytest.approx(2.0)
+    assert robot.lines == []                       # not a single command
+
+
+def test_a_plan_with_no_way_says_why():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, box(1.0, 0.0)))
+    code, out = walk.plan(1.0, 0, 0)               # into the box
+    assert code == 200 and not out["ok"] and "cm from something" in out["error"]
+    assert robot.lines == []
