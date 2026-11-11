@@ -2104,6 +2104,62 @@ def free_goal(goal, cells, clearance=WALK_GOAL_CLEARANCE, within=WALK_GOAL_SNAP_
     return best[1] if best else None
 
 
+# NAV2 DOES THE WALK when it runs on PC2 (2026-11-11, unitree_ros2 g1_nav/nav.sh): a goto with a
+# distance is handed to Nav2 through g1_nav's relay_bridge (WALK_NAV2_URL, its small HTTP API on
+# this machine), and the app — the Navigation page, the agent — keeps using /walk/control as
+# before. The bridge moves the robot only through POST /walk/move, which this relay accepts
+# only while such a walk runs: Nav2 can never move the robot on its own. The operator still
+# wins (any command or stop cancels the walk, and with it Nav2's goal). Turns in place and a
+# relay without Nav2 keep the walk below.
+WALK_NAV2_URL = os.environ.get("WALK_NAV2_URL", "").rstrip("/")
+NAV2_POLL_S = 0.25
+NAV2_LIMIT_BASE_S = 150.0     # its own tree waits up to ~1.5 min for a blocked way
+NAV2_LIMIT_S_PER_M = 15.0
+NAV2_SILENT_S = 2.0           # the bridge not answering this long = cancel, failure
+NAV2_OK_POS = 0.3             # Nav2 arrives within 0.25 m (g1_nav config/nav2_g1.yaml)
+NAV2_OK_YAW = math.radians(25)
+
+
+class Nav2Client:
+    """g1_nav relay_bridge's HTTP API on this machine: GET /status, POST /goto | /plan | /cancel.
+    Every call answers (http code, dict); a bridge that is not there answers (0, {error})."""
+
+    def __init__(self, url, token, timeout=2.0):
+        self.url, self.token, self.timeout = url, token, timeout
+
+    def _call(self, method, path, body=None, timeout=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method,
+                                     headers={"Authorization": "Bearer " + self.token,
+                                              "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read() or b"{}")
+            except ValueError:
+                return exc.code, {"error": f"HTTP {exc.code}"}
+        except Exception as exc:
+            return 0, {"error": f"Nav2 bridge unreachable: {exc}"}
+
+    def available(self):
+        code, out = self._call("GET", "/status", timeout=0.5)
+        return code == 200 and bool(out.get("ready"))
+
+    def status(self):
+        return self._call("GET", "/status", timeout=1.0)
+
+    def goto(self, dx, dy, dyaw):
+        return self._call("POST", "/goto", {"dx": dx, "dy": dy, "dyaw": dyaw})
+
+    def plan(self, dx, dy, dyaw):
+        return self._call("POST", "/plan", {"dx": dx, "dy": dy, "dyaw": dyaw}, timeout=6.0)
+
+    def cancel(self):
+        return self._call("POST", "/cancel", {})
+
+
 class NoWay(RuntimeError):
     """No path: the message says why, in words for the operator and the agent."""
 
@@ -2270,10 +2326,13 @@ class Walk:
 
     def __init__(self, sender, odom, joint_control=None, clock=time.monotonic,
                  settle_s=WALK_SETTLE_S, hz=WALK_HZ, lidar=None, require_lidar=WALK_REQUIRE_LIDAR,
-                 blocked_wait_s=WALK_BLOCKED_WAIT_S):
+                 blocked_wait_s=WALK_BLOCKED_WAIT_S, nav2=None, nav2_poll_s=NAV2_POLL_S):
         self.sender = sender
         self.odom = odom
         self.lidar = lidar                  # JointStream of g1_lidar_bridge, or None (blind)
+        self.nav2 = nav2                    # Nav2Client (g1_nav), or None: the walk below does it
+        self.nav2_active = False            # a walk handed to Nav2 runs: /walk/move is accepted
+        self.nav2_poll_s = nav2_poll_s
         self.require_lidar = require_lidar and lidar is not None
         self.blocked_wait_s = blocked_wait_s
         self.joint_control = joint_control
@@ -2313,6 +2372,10 @@ class Walk:
         if self.joint_control is not None and self.joint_control.busy():
             return 409, {"ok": False, "error": "the Joints page holds the arms: release them "
                                                "first"}
+        # Asked before taking the lock (it is an HTTP call): a goto that goes somewhere is
+        # Nav2's whenever it is up; a turn in place stays below.
+        use_nav2 = (self.nav2 is not None and math.hypot(dx, dy) >= 0.01
+                    and self.nav2.available())
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 return 409, {"ok": False, "error": "a walk is already running",
@@ -2323,12 +2386,18 @@ class Walk:
                           "request": {"dx": dx, "dy": dy, "dyaw": dyaw}, "reason": None,
                           "start": None, "goal": None, "pose": None, "error": None,
                           "elapsed_s": 0.0, "blocked": None, "path": None,
-                          "eyes": "lidar" if self.lidar is not None else "none"}
-            self.state["speed"] = "auto" if auto else dict(
+                          "eyes": "nav2" if use_nav2 else
+                                  "lidar" if self.lidar is not None else "none"}
+            self.state["speed"] = "nav2" if use_nav2 else "auto" if auto else dict(
                 zip(("vx", "vy", "vyaw"), lim or (WALK_VX, WALK_VY, WALK_VYAW)))
             self.state["mode"] = mode
-            self.thread = threading.Thread(target=self._run, args=(dx, dy, dyaw, lim, mode, auto),
-                                           name="walk", daemon=True)
+            if use_nav2:
+                self.thread = threading.Thread(target=self._run_nav2, args=(dx, dy, dyaw, mode),
+                                               name="walk-nav2", daemon=True)
+            else:
+                self.thread = threading.Thread(target=self._run,
+                                               args=(dx, dy, dyaw, lim, mode, auto),
+                                               name="walk", daemon=True)
             self.thread.start()
             return 200, {"ok": True, "walk": dict(self.state)}
 
@@ -2336,6 +2405,8 @@ class Walk:
         """(http code, answer) for a walk NOT taken: where it would go and the way it would take,
         from where the robot stands now and what the lidar sees now. Nothing moves. The page
         shows it and the operator accepts it (a goto), which plans again as it walks."""
+        if (self.nav2 is not None and math.hypot(dx, dy) >= 0.01 and self.nav2.available()):
+            return self._plan_nav2(dx, dy, dyaw)
         if not self.odom.subscribe(internal=True):
             return 503, {"ok": False, "error": "the odometry stream has no room for one more"}
         looking = self.lidar is not None and self.lidar.subscribe(internal=True)
@@ -2693,6 +2764,138 @@ class Walk:
             audit("-", "walk-end", f"id={st['id']} {st['state']}",
                   f"{st.get('reason') or '-'} error={st.get('error')}")
 
+    def _plan_nav2(self, dx, dy, dyaw):
+        """plan() by Nav2's planner, in the same answer shape (start, goal, path in odom)."""
+        code, out = self.nav2.plan(dx, dy, dyaw)
+        req = {"dx": dx, "dy": dy, "dyaw": dyaw}
+        if code != 200 or not out.get("ok"):
+            return (503 if code in (0, 503) else 200), {
+                "ok": False, "plan": {"request": req, "path": None, "eyes": "nav2"},
+                "error": out.get("error") or f"Nav2 planner: HTTP {code}"}
+        return 200, {"ok": True, "plan": {"start": out.get("start"), "goal": out.get("goal"),
+                                          "request": req, "path": out.get("path"),
+                                          "eyes": "nav2"}}
+
+    def nav2_move(self, body):
+        """(http code, answer) for POST /walk/move, the bridge's velocity for a walk handed to
+        Nav2. Refused unless such a walk runs: Nav2 never moves the robot on its own."""
+        with self.lock:
+            active = self.nav2_active
+        if not active or not self.running():
+            return 409, {"ok": False, "error": "no Nav2 walk is running: Nav2 moves the robot only "
+                                               "during a walk asked for on /walk/control"}
+        verb = body.get("verb")
+        if verb == "stop_move":
+            self._send("stop_move")
+            return 200, {"ok": True}
+        if verb != "move":
+            return 400, {"ok": False, "error": "verb must be move or stop_move"}
+        try:
+            v = [float(body.get(k, 0) or 0) for k in ("vx", "vy", "vyaw")]
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": "vx/vy/vyaw must be numbers"}
+        if not all(math.isfinite(x) for x in v):
+            return 400, {"ok": False, "error": "vx/vy/vyaw must be finite"}
+        v = [max(-c, min(c, x)) for x, c in zip(v, WALK_CAPS)]
+        self._send(f"move {v[0]:.3f} {v[1]:.3f} {v[2]:.3f}")
+        return 200, {"ok": True}
+
+    def _run_nav2(self, dx, dy, dyaw, mode=None):
+        """The walk, by Nav2 (see WALK_NAV2_URL): this thread hands it the goal, follows it, and
+        reports in the same shape as _run; the robot's moves come in on nav2_move()."""
+        if not self.odom.subscribe(internal=True):
+            self._set(state="failure", reason="the odometry stream has no room for one more")
+            return
+        t0 = self.clock()
+        pose = goal = None
+        try:
+            seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
+            if pose is None:
+                raise RuntimeError("no odometry from the robot")
+            if mode is not None:
+                seen, pose = self._switch_mode(seen, pose, mode)
+            c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+            goal = {"x": pose["x"] + c * dx - s * dy, "y": pose["y"] + s * dx + c * dy,
+                    "yaw": wrap_angle(pose["yaw"] + dyaw)}
+            limit = NAV2_LIMIT_BASE_S + math.hypot(dx, dy) * NAV2_LIMIT_S_PER_M
+            with self.lock:
+                self.nav2_active = True
+            code, out = self.nav2.goto(dx, dy, dyaw)
+            if code != 200 or not out.get("ok"):
+                raise RuntimeError(f"Nav2 did not take the goal: {out.get('error') or code}")
+            self._set(state="running", start=dict(pose), pose=dict(pose), goal=dict(goal),
+                      limit_s=round(limit, 1), phase="translate")
+            silent_since = None
+            while True:
+                if self.cancelled.is_set():
+                    self.nav2.cancel()
+                    raise _WalkCancelled()
+                seen, fresh = self._pose(seen, WALK_ODOM_STALE_S)
+                if fresh is None:
+                    self.nav2.cancel()
+                    raise RuntimeError(f"odometry stopped for {WALK_ODOM_STALE_S:g} s")
+                pose = fresh
+                now = self.clock() - t0
+                if now > limit:
+                    self.nav2.cancel()
+                    raise RuntimeError(f"not there after {limit:.0f} s")
+                code, st = self.nav2.status()
+                if code != 200:
+                    silent_since = silent_since if silent_since is not None else now
+                    if now - silent_since > NAV2_SILENT_S:
+                        self.nav2.cancel()
+                        raise RuntimeError(f"the Nav2 bridge stopped answering: {st.get('error')}")
+                    continue
+                silent_since = None
+                blocked = ({"dist_m": 0.0, "reason": "something is in the way: waiting for it "
+                                                     "to clear"} if st.get("blocked") else None)
+                self._set(pose=dict(pose), elapsed_s=round(now, 1), blocked=blocked,
+                          error=self._errors(pose, goal),
+                          **({"path": st["path"]} if st.get("path") else {}))
+                if st.get("state") == "succeeded":
+                    break
+                if st.get("state") in ("aborted", "canceled"):
+                    raise NoWay(f"Nav2 gave up: {st.get('reason') or st.get('state')}")
+                self.cancelled.wait(self.nav2_poll_s)
+            with self.lock:
+                self.nav2_active = False
+            self._send("stop_move")
+            end = self.clock() + self.settle_s
+            while self.clock() < end:
+                seen, fresh = self._pose(seen, WALK_ODOM_STALE_S)
+                if fresh is not None:
+                    pose = fresh
+            err = self._errors(pose, goal)
+            ok = err["pos_m"] <= NAV2_OK_POS and abs(math.radians(err["yaw_deg"])) <= NAV2_OK_YAW
+            self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
+                      error=err, blocked=None, elapsed_s=round(self.clock() - t0, 1),
+                      reason=None if ok else "Nav2 arrived further off than expected")
+        except _WalkCancelled:
+            with self.lock:
+                self.nav2_active = False
+                why = self.state.get("cancel_reason") or "cancelled"
+                stop = self.state.get("cancel_stops", True)
+            if stop:
+                self._stop_quietly()
+            self._set(state="cancelled", reason=why, elapsed_s=round(self.clock() - t0, 1),
+                      **({"pose": dict(pose), "error": self._errors(pose, goal)}
+                         if pose and goal else {}))
+        except Exception as exc:                  # every way out stops the robot
+            with self.lock:
+                self.nav2_active = False
+            self._stop_quietly()
+            self._set(state="failure", reason=str(exc), elapsed_s=round(self.clock() - t0, 1),
+                      **({"pose": dict(pose), "error": self._errors(pose, goal)}
+                         if pose and goal else {}))
+        finally:
+            with self.lock:
+                self.nav2_active = False
+            self.odom.unsubscribe(internal=True)
+            with self.lock:
+                st = dict(self.state)
+            audit("-", "walk-end", f"id={st['id']} {st['state']} nav2",
+                  f"{st.get('reason') or '-'} error={st.get('error')}")
+
     def _stop_quietly(self):
         try:
             self.sender.send("stop_move")
@@ -3005,6 +3208,28 @@ class Handler(BaseHTTPRequestHandler):
               "started" if out.get("ok") else out.get("error", "-"))
         return self._json(code, out)
 
+    def _walk_move(self):
+        """POST /walk/move {verb: move, vx, vy, vyaw} | {verb: stop_move} — g1_nav's bridge
+        driving a walk handed to Nav2 (Walk.nav2_move). Unlike /cmd it does not cancel that
+        walk, and it is refused when there is none."""
+        if not self._authorised():
+            audit(self.client_address[0], "walk-move", "-", "unauthorised")
+            return self._json(401, {"error": "unauthorised"})
+        walk = getattr(self.server, "walk", None)
+        if walk is None:
+            return self._json(404, {"error": "no walk control on this robot"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "bad json"})
+        try:
+            return self._json(*walk.nav2_move(body))
+        except RuntimeError as exc:               # the sender refused it
+            return self._json(502, {"ok": False, "error": str(exc)})
+
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/").startswith("/audio/"):
             return self._audio("GET")
@@ -3265,6 +3490,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._joint_control()
         if self.path.split("?")[0].rstrip("/") == "/walk/control":
             return self._walk_control()
+        if self.path.split("?")[0].rstrip("/") == "/walk/move":
+            return self._walk_move()
         if self.path.split("?")[0].rstrip("/") == "/odom/trail":
             return self._odom_trail("POST")
         if self.path.split("?")[0] != "/cmd":
@@ -3386,7 +3613,8 @@ def main():
             log(f"no {LIDAR_BRIDGE}: /lidar is off and walks are blind until ./build.sh is run")
         if os.access(ODOM_BRIDGE, os.X_OK):
             srv.odom = JointStream([ODOM_BRIDGE], label="odom bridge")
-            srv.walk = Walk(srv.sender, srv.odom, srv.joint_control, lidar=srv.lidar)
+            srv.walk = Walk(srv.sender, srv.odom, srv.joint_control, lidar=srv.lidar,
+                            nav2=Nav2Client(WALK_NAV2_URL, token) if WALK_NAV2_URL else None)
             srv.trail = OdomTrail(srv.odom).start()
         else:
             log(f"no {ODOM_BRIDGE}: /odom and /walk are off until ./build.sh is run")

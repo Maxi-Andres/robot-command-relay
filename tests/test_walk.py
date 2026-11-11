@@ -820,3 +820,146 @@ def test_a_goal_against_a_wall_moves_to_where_it_can_stand():
     st = wait_done(walk)
     assert st["state"] == "success", st
     assert st["goal_moved_cm"] >= 10 and robot.x <= 1.0 - 0.2
+
+
+# --------------------------------------------------------------------------- #
+# Nav2 does the walk (WALK_NAV2_URL, g1_nav's relay_bridge), 2026-11-11
+# --------------------------------------------------------------------------- #
+class FakeNav2:
+    """Nav2 through relay_bridge, as the relay sees it: it takes a goal, and while it runs it
+    drives the robot through the relay's own /walk/move (walk.nav2_move), like the bridge."""
+
+    def __init__(self, robot, up=True, blocked_polls=0, gives_up=False):
+        self.robot, self.up, self.walk = robot, up, None
+        self.blocked_polls, self.gives_up = blocked_polls, gives_up
+        self.goal, self.state, self.calls, self.refused = None, "idle", [], []
+
+    def available(self):
+        return self.up
+
+    def goto(self, dx, dy, dyaw):
+        self.calls.append(("goto", dx, dy, dyaw))
+        r = self.robot
+        c, s = math.cos(r.yaw), math.sin(r.yaw)
+        self.goal = (r.x + c * dx - s * dy, r.y + s * dx + c * dy)
+        self.state = "running"
+        return 200, {"ok": True}
+
+    def cancel(self):
+        self.calls.append(("cancel",))
+        self.state = "canceled"
+        return 200, {"ok": True}
+
+    def plan(self, dx, dy, dyaw):
+        self.calls.append(("plan", dx, dy, dyaw))
+        return 200, {"ok": True, "start": {"x": 0, "y": 0, "yaw": 0}, "goal": {"x": dx, "y": dy},
+                     "path": [[0, 0], [dx, dy]]}
+
+    def drive(self, body):
+        code, out = self.walk.nav2_move(body)
+        if code != 200:
+            self.refused.append((code, out))
+
+    def status(self):
+        if self.state == "running":
+            if self.gives_up:
+                self.state = "aborted"
+            elif self.blocked_polls > 0:
+                self.blocked_polls -= 1
+                self.drive({"verb": "stop_move"})
+                return 200, {"state": "running", "blocked": True, "path": [[0, 0], [1, 0]]}
+            else:
+                r = self.robot
+                dx, dy = self.goal[0] - r.x, self.goal[1] - r.y
+                if math.hypot(dx, dy) < 0.05:
+                    self.drive({"verb": "stop_move"})
+                    self.state = "succeeded"
+                else:
+                    c, s = math.cos(r.yaw), math.sin(r.yaw)
+                    fx, fy = c * dx + s * dy, -s * dx + c * dy
+                    k = 0.3 / math.hypot(fx, fy)
+                    self.drive({"verb": "move", "vx": fx * k, "vy": fy * k, "vyaw": 0})
+        return 200, {"state": self.state, "blocked": False, "path": [[0, 0], [1, 0]],
+                     "reason": "the way stayed blocked" if self.state == "aborted" else None}
+
+
+def nav2_walk(robot, nav2):
+    walk = relay_server.Walk(robot, robot, None, clock=robot.clock, settle_s=0.3, nav2=nav2,
+                             nav2_poll_s=0.0)
+    nav2.walk = walk
+    return walk
+
+
+def test_a_goto_is_handed_to_nav2_which_moves_the_robot_through_the_relay():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, blocked_polls=3)
+    walk = nav2_walk(robot, nav2)
+    code, out = walk.start(1.0, 0.0, 0.0)
+    assert code == 200 and out["walk"]["eyes"] == "nav2" and out["walk"]["speed"] == "nav2"
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert nav2.calls[0] == ("goto", 1.0, 0.0, 0.0)
+    assert robot.x == pytest.approx(1.0, abs=0.1)
+    assert not nav2.refused, nav2.refused
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_nav2_never_moves_the_robot_without_a_walk():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = nav2_walk(robot, FakeNav2(robot))
+    code, out = walk.nav2_move({"verb": "move", "vx": 0.3, "vy": 0, "vyaw": 0})
+    assert code == 409 and "only" in out["error"]
+    assert not moves(robot)
+
+
+def test_the_operator_cancels_a_nav2_walk_and_nav2_with_it():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, blocked_polls=10_000)      # stays waiting for a blocked way
+    walk = nav2_walk(robot, nav2)
+    walk.start(2.0, 0.0, 0.0)
+    end = time.time() + 3
+    while walk.status().get("blocked") is None and time.time() < end:
+        time.sleep(0.01)
+    assert walk.status()["blocked"]["reason"].startswith("something is in the way")
+    walk.cancel("stop from the page")
+    st = wait_done(walk)
+    assert st["state"] == "cancelled" and ("cancel",) in nav2.calls
+    assert walk.nav2_move({"verb": "move", "vx": 0.3})[0] == 409     # and it moves no more
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_when_nav2_gives_up_the_walk_fails_saying_why():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = nav2_walk(robot, FakeNav2(robot, gives_up=True))
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "Nav2 gave up" in st["reason"], st
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_without_nav2_or_for_a_turn_in_place_the_relay_walks_itself():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    down = FakeNav2(robot, up=False)
+    walk = nav2_walk(robot, down)
+    assert walk.start(1.0, 0.0, 0.0)[1]["walk"]["eyes"] != "nav2"
+    assert wait_done(walk)["state"] == "success" and not down.calls
+    up = FakeNav2(robot)
+    walk = nav2_walk(robot, up)
+    walk.start(0.0, 0.0, 1.0)                          # a turn in place: not Nav2's
+    assert wait_done(walk)["state"] == "success" and not up.calls
+
+
+def test_a_plan_comes_from_nav2_in_the_same_shape():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = nav2_walk(robot, FakeNav2(robot))
+    code, out = walk.plan(1.0, 0.5, 0.0)
+    assert code == 200 and out["ok"] and out["plan"]["eyes"] == "nav2"
+    assert out["plan"]["path"] == [[0, 0], [1.0, 0.5]]
+
+
+def test_http_walk_move_needs_the_token_and_a_nav2_walk(server):
+    srv, robot = server
+    assert call(srv, "/walk/move", {"verb": "move", "vx": 0.3}, token=None)[0] == 401
+    code, out = call(srv, "/walk/move", {"verb": "move", "vx": 0.3})
+    assert code == 409 and "only" in out["error"]
+    assert not moves(robot)
