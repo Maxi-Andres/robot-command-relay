@@ -66,11 +66,11 @@ class SimRobot:
             return f"ok {parts[0]}"
 
     # -- the odometry (JointStream's interface) ------------------------- #
-    def subscribe(self):
+    def subscribe(self, internal=False):
         self.subscribers += 1
         return True
 
-    def unsubscribe(self):
+    def unsubscribe(self, internal=False):
         self.subscribers -= 1
 
     def clock(self):
@@ -117,7 +117,8 @@ def moves(robot):
 # --------------------------------------------------------------------------- #
 def test_validate_goto_bounds():
     assert relay_server.validate_goto({"dx": 2}) == (2.0, 0.0, 0.0)
-    for bad, why in (({"dx": 5}, "at most"), ({"dyaw": 4}, "half a turn"),
+    assert relay_server.validate_goto({"dx": 8}) == (8.0, 0.0, 0.0)     # 3 m was the old cap
+    for bad, why in (({"dx": relay_server.WALK_MAX_M + 1}, "at most"), ({"dyaw": 4}, "half a turn"),
                      ({}, "nothing to do"), ({"dx": "a"}, "numbers"),
                      ({"dx": float("nan")}, "finite")):
         with pytest.raises(ValueError, match=why):
@@ -272,7 +273,7 @@ def call(srv, path, body=None, token=TOKEN):
 def test_http_needs_the_token_and_checks_the_numbers(server):
     srv, _robot = server
     assert call(srv, "/walk/control", {"op": "status"}, token=None)[0] == 401
-    code, out = call(srv, "/walk/control", {"op": "goto", "dx": 9})
+    code, out = call(srv, "/walk/control", {"op": "goto", "dx": relay_server.WALK_MAX_M + 1})
     assert code == 400 and "at most" in out["error"]
     assert call(srv, "/walk/control", {"op": "dance"})[0] == 400
 
@@ -311,11 +312,11 @@ class FakeLidar:
         self.seq = 0
         self.subscribers = 0
 
-    def subscribe(self):
+    def subscribe(self, internal=False):
         self.subscribers += 1
         return True
 
-    def unsubscribe(self):
+    def unsubscribe(self, internal=False):
         self.subscribers -= 1
 
     def next_line(self, seen, timeout):
@@ -689,3 +690,58 @@ def test_auto_speed_is_fast_in_the_open_and_slow_near_things():
     walk.start(2.8, 0, 0, auto=True)
     assert wait_done(walk)["state"] == "success"
     assert max(float(ln.split()[1]) for ln in moves(robot)) < open_top * 0.6
+
+
+# --------------------------------------------------------------------------- #
+# 2026-11-11, on the robot: it rocked and never got anywhere
+# --------------------------------------------------------------------------- #
+class FlickerLidar(FakeLidar):
+    """An obstacle in front that shows in one map out of every `every` (its own swinging hand,
+    the floor while it sways), the rest empty."""
+
+    def __init__(self, robot, spot, every=3):
+        super().__init__(robot, [])
+        self.spot, self.every = spot, every
+
+    def next_line(self, seen, timeout):
+        self.obstacles = [self.robot_rel(self.spot)] if (self.seq + 1) % self.every == 0 else []
+        return super().next_line(seen, timeout)
+
+    def robot_rel(self, spot):
+        c, s = math.cos(self.robot.yaw), math.sin(self.robot.yaw)
+        return (self.robot.x + c * spot[0] - s * spot[1], self.robot.y + s * spot[0] + c * spot[1])
+
+
+def test_one_map_with_something_in_front_does_not_stop_it():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FlickerLidar(robot, (0.7, 0.0)))
+    walk.start(1.5, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert "stop_move" not in robot.lines[:-1], "a one-map obstacle must not stop it"
+
+
+def test_walked_past_the_point_is_arrival_not_a_step_back():
+    goal = {"x": 1.0, "y": 0.0, "yaw": 0.0, "hold": 0.0}
+    # Its last step took it 8 cm past (finer than WALK_POS_TOL is more than a G1 step).
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = walk_for(robot)
+    walk.start(1.0, 0, 0)
+    end = time.time() + 5
+    while robot.x < 0.9 and time.time() < end:
+        time.sleep(0.001)
+    with robot.lock:
+        robot.x = 1.08                               # the step overshoots
+    st = wait_done(walk)
+    backs = [ln for ln in moves(robot) if float(ln.split()[1]) < 0]
+    assert not backs, backs
+    assert st["state"] == "success", st              # within WALK_OK_POS
+    assert goal                                      # (the goal the walk was given)
+
+
+def test_it_sets_off_within_15_degrees_instead_of_turning_for_good():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = walk_for(robot)
+    walk.start(2.0, 0.6, 0)                          # 17° left of where it faces
+    st = wait_done(walk)
+    assert st["state"] == "success", st

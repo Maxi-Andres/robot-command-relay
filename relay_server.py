@@ -149,7 +149,9 @@ ODOM_BRIDGE = os.environ.get("ODOM_BRIDGE_BIN", "./g1_odom_bridge")
 # dead-man still applies. Measured that day: 1.978 m reported for 2 m walked, 0 drift standing.
 # What it does NOT have: eyes. Nothing here sees an obstacle — the operator with the remote is
 # the obstacle detector until the lidar map exists (G1.md §6.2, phase 7b).
-WALK_MAX_M = float(os.environ.get("WALK_MAX_M", "3.0"))      # per request, straight-line
+# 2026-11-11: 3 m was a first-day caution; the odometry drifts ~1 % (1.978 m for 2 m) and the
+# lidar replans every frame, so a walk across a room is fine. The planner's grid grows with it.
+WALK_MAX_M = float(os.environ.get("WALK_MAX_M", "10.0"))     # per request, straight-line
 WALK_MAX_TURN = math.pi                                     # per request, either way
 WALK_VX = float(os.environ.get("WALK_VX", "0.3"))           # m/s forward/back, at most
 WALK_VY = float(os.environ.get("WALK_VY", "0.15"))          # m/s sideways
@@ -159,6 +161,11 @@ WALK_MIN_W = 0.12
 WALK_GAIN = 1.0              # 1/s: speed = distance left x this, between the two above
 WALK_YAW_GAIN = 1.5
 WALK_POS_TOL = 0.06          # m: this close = arrived
+# ...or this: once within WALK_NEAR_M of the goal, the goal falling BEHIND the way it came in =
+# it walked past the point, and that is arrival too. A G1 step is longer than WALK_POS_TOL: on the
+# robot (2026-11-11) it walked past, stepped back past, and again, for good. WALK_OK_POS still
+# judges success.
+WALK_NEAR_M = 0.25
 WALK_YAW_TOL = math.radians(3)
 WALK_HZ = 10.0               # moves sent per second
 WALK_ODOM_STALE_S = 0.5      # no odometry for this long = stop, failure
@@ -1111,6 +1118,7 @@ class JointStream:
         self.latest = None
         self.seq = 0
         self.clients = 0
+        self.internal = 0                   # of them, the relay's own readers (uncapped)
         self._idle_timer = None
 
     def _ensure_running(self):
@@ -1145,21 +1153,27 @@ class JointStream:
             self.cond.notify_all()
         log(f"{self.label} exited (code {proc.wait()})")
 
-    def subscribe(self):
-        """Register a viewer. False when the viewer cap is reached."""
+    def subscribe(self, internal=False):
+        """Register a viewer. False when the viewer cap is reached. `internal` = the relay's own
+        reader (a walk, its plan, the trail): never refused and not counted against the cap —
+        on 2026-11-11 two open Navigation pages took all 4 places and a plan failed with "no
+        obstacle map from the lidar" while the lidar was fine."""
         with self.cond:
-            if self.clients >= self.max_clients:
+            if not internal and self.clients - self.internal >= self.max_clients:
                 return False
             self.clients += 1
+            self.internal += 1 if internal else 0
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
                 self._idle_timer = None
             self._ensure_running()
             return True
 
-    def unsubscribe(self):
+    def unsubscribe(self, internal=False):
         with self.cond:
             self.clients = max(0, self.clients - 1)
+            if internal:
+                self.internal = max(0, self.internal - 1)
             if self.clients == 0 and self._idle_timer is None:
                 self._idle_timer = threading.Timer(self.idle_s, self._stop_if_idle)
                 self._idle_timer.daemon = True
@@ -1210,7 +1224,8 @@ class JointStream:
     def status(self):
         with self.cond:
             return {"running": self.proc is not None and self.proc.poll() is None,
-                    "clients": self.clients, "max_clients": self.max_clients}
+                    "clients": self.clients - self.internal, "internal": self.internal,
+                    "max_clients": self.max_clients}
 
 
 def validate_trajectory(points, allowed, start=None, max_vel=None):
@@ -1882,7 +1897,7 @@ class OdomTrail:
         self.thread = None
 
     def start(self):
-        if not self.odom.subscribe():
+        if not self.odom.subscribe(internal=True):
             log("trail: no room on the odometry stream")
             return self
         self.thread = threading.Thread(target=self._run, name="odom-trail", daemon=True)
@@ -1982,16 +1997,29 @@ def obstacle_ahead(pose, vx, vy, cells, reach=WALK_STOP_M, half=WALK_HALF_WIDTH)
 
 
 WALK_PLAN_RES = 0.10          # m: the planner's grid
-WALK_CLEARANCE = 0.35         # m kept between the robot's centre and anything the lidar saw
+# m kept between the robot's centre and anything the lidar saw. The body is 0.45 m across the
+# shoulders (0.225 each side); 0.35 closed a 0.8 m passage in the office (2026-11-11, "no way" with
+# room to spare).
+WALK_CLEARANCE = float(os.environ.get("WALK_CLEARANCE", "0.30"))
 # ...except at the END of the walk, where it may stand closer: at a table to pick something up
 # the torso is ~0.3 m from the edge (2026-11-03). The body is ~0.45 m across the shoulders.
-WALK_GOAL_CLEARANCE = float(os.environ.get("WALK_GOAL_CLEARANCE", "0.25"))
+WALK_GOAL_CLEARANCE = float(os.environ.get("WALK_GOAL_CLEARANCE", "0.22"))
 WALK_PLAN_MARGIN = 1.5        # m of room around start and goal to go round things
 WALK_LOOKAHEAD = 0.3          # m along the path: the point it heads for (0.5 cut the corners: 0.29 m from a box planned at 0.42)
 # An obstacle stays on the map this long after it was last seen: long enough to cover the
-# lidar's blind ring round the robot (0.35 m), short enough that a person who walked past does not
+# lidar's blind ring round the robot (LIDAR_SELF_M), short enough that a person who walked past does not
 # leave a wake that blocks ways already free (2 s did, 2026-11-05).
 WALK_MEMORY_S = 1.0
+WALK_BLIND_M = 0.55          # the bridge's LIDAR_SELF_M (0.45) and a margin: remembered inside only
+# ONE MAP IS NOT ENOUGH TO STOP. On the robot (2026-11-11) an obstacle or a "no way" that showed in
+# one map and was gone in the next (its own swinging hand, the floor while it sways) made it stop,
+# start, stop: a stop_move makes a biped settle back a little, so it rocked and never got anywhere.
+# Something in the way must show in WALK_BLOCK_MAPS maps in a row (0.4 s at 5 Hz) before it
+# stops — unless it is already within WALK_BLOCK_NOW_M, then at once. A plan that fails keeps the
+# last good one for WALK_NOWAY_GRACE_S, the same idea.
+WALK_BLOCK_MAPS = 2
+WALK_BLOCK_NOW_M = 0.35
+WALK_NOWAY_GRACE_S = 0.6
 # SLOW DOWN NEAR THINGS: with something within WALK_SLOW_M ahead (in a corridor WALK_SLOW_HALF
 # each side), the speed falls in proportion, to WALK_SLOW_MIN of it at the stop distance — so it
 # comes up to a person or a table gently and stops short, instead of at full speed then all at once.
@@ -2003,8 +2031,11 @@ WALK_MEMORY_S = 1.0
 # chasing a point under its own feet.
 WALK_SIDESTEP_M = 0.4
 WALK_BACKSTEP_M = 1.0
-WALK_ALIGN_RAD = math.radians(25)
-WALK_ALIGNED_RAD = math.radians(8)   # ...and turns until within this, so it sets off straight
+WALK_ALIGN_RAD = math.radians(35)
+# ...and turns until within this, then sets off and corrects the rest while walking. 8° was finer
+# than a G1 turning in place can settle (its torso sways more): on the robot (2026-11-11) it stood
+# "turning to face the way, 9° off" for good.
+WALK_ALIGNED_RAD = math.radians(15)
 WALK_FREEZE_FACE_M = 0.35
 # SPEED AND MODE, chosen per walk on the page (2026-11-05), as on the drive pad: the walk's top
 # speeds come with the request, up to WALK_CAPS (the command sender clamps at the same 1.2 / 0.5 /
@@ -2261,9 +2292,9 @@ class Walk:
         """(http code, answer) for a walk NOT taken: where it would go and the way it would take,
         from where the robot stands now and what the lidar sees now. Nothing moves. The page
         shows it and the operator accepts it (a goto), which plans again as it walks."""
-        if not self.odom.subscribe():
+        if not self.odom.subscribe(internal=True):
             return 503, {"ok": False, "error": "the odometry stream has no room for one more"}
-        looking = self.lidar is not None and self.lidar.subscribe()
+        looking = self.lidar is not None and self.lidar.subscribe(internal=True)
         try:
             _seen, pose = self._pose(0, wait_s)
             if pose is None:
@@ -2296,9 +2327,9 @@ class Walk:
             return 200, {"ok": True, "plan": {**out, "eyes": "lidar", "path": [
                 [round(x, 3), round(y, 3)] for x, y in path]}}
         finally:
-            self.odom.unsubscribe()
+            self.odom.unsubscribe(internal=True)
             if looking:
-                self.lidar.unsubscribe()
+                self.lidar.unsubscribe(internal=True)
 
     # -- the loop -------------------------------------------------------- #
     def _pose(self, seen, timeout):
@@ -2364,10 +2395,10 @@ class Walk:
         raise RuntimeError(f"it did not switch to {mode} in {MODE_SWITCH_S:g} s")
 
     def _run(self, dx, dy, dyaw, lim=None, mode=None, auto=False):
-        if not self.odom.subscribe():
+        if not self.odom.subscribe(internal=True):
             self._set(state="failure", reason="the odometry stream has no room for one more")
             return
-        looking = self.lidar is not None and self.lidar.subscribe()
+        looking = self.lidar is not None and self.lidar.subscribe(internal=True)
         t0 = self.clock()
         pose = goal = None
         try:
@@ -2376,6 +2407,9 @@ class Walk:
             lidar_seen, cells, seen_at = 0, None, None
             memory = {}                         # obstacle (x, y) -> when it was last seen
             plan, planned_at, no_way = None, None, None
+            planned_ok = -math.inf              # when the last plan was found
+            block_maps, block_seen = 0, None    # maps in a row with something in the way
+            came_in = None                      # the way it came within WALK_NEAR_M (unit x, y)
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
@@ -2430,19 +2464,30 @@ class Walk:
                         t_seen = self.clock()
                         for c in cells:
                             memory[c] = t_seen
-                        for c in [c for c, at in memory.items() if t_seen - at > WALK_MEMORY_S]:
+                        # Remembered only where the lidar cannot look (its blind ring): what it
+                        # can see and no longer sees is gone. Remembering everything 1 s left a
+                        # trail of its own swinging hand ahead of it, which it then walked into
+                        # ("an obstacle 14 cm ahead", 2026-11-11).
+                        for c in [c for c, at in memory.items()
+                                  if t_seen - at > WALK_MEMORY_S or (
+                                      at != t_seen and math.hypot(c[0] - pose["x"], c[1] - pose["y"])
+                                      > WALK_BLIND_M)]:
                             del memory[c]
                         planned_at = seen_at
                         try:
                             plan = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]),
                                              list(memory))
-                            no_way = None
+                            no_way, planned_ok = None, t_seen
                             self._set(path=[[round(x, 2), round(y, 2)] for x, y in plan])
                         except NoWay as exc:
                             # Maybe someone stands there for a moment: stop and wait, like for
                             # something in front, and give up only if it stays (2026-11-05: a
-                            # walk ended at once on "the point is 11 cm from something").
-                            plan, no_way = None, str(exc)
+                            # walk ended at once on "the point is 11 cm from something"). A
+                            # single bad map keeps the last good plan (WALK_NOWAY_GRACE_S).
+                            if plan is not None and t_seen - planned_ok <= WALK_NOWAY_GRACE_S:
+                                no_way = None
+                            else:
+                                plan, no_way = None, str(exc)
                     if plan is not None and (facing or len(plan) > 2):
                         aim = lookahead(plan, pose)
                         if not facing:          # a short step round something: hold heading
@@ -2484,6 +2529,13 @@ class Walk:
                         lim = (top, min(cap[1], max(WALK_VY, top / 2)), cap[2])
                         stop_m, slow_m = margins(top)
                         self._set(speed_now=round(top, 2))
+                    if phase == "translate":
+                        gx, gy = goal["x"] - pose["x"], goal["y"] - pose["y"]
+                        left_now = math.hypot(gx, gy)
+                        if came_in is None and 1e-6 < left_now < WALK_NEAR_M:
+                            came_in = (gx / left_now, gy / left_now)
+                        if came_in is not None and gx * came_in[0] + gy * came_in[1] < 0:
+                            phase = "turn"      # walked past it: do not step back and forth
                     vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim)
                 self._set(pose=dict(pose), phase="align" if turn_first else phase,
                           elapsed_s=round(now, 1), error=self._errors(pose, goal))
@@ -2495,6 +2547,13 @@ class Walk:
                 reach = min(stop_m, left + WALK_GOAL_CLEARANCE - 0.05)
                 ahead = (obstacle_ahead(pose, vx, vy, list(memory) if memory else cells, reach)
                          if phase == "translate" else None)
+                if ahead is None:
+                    block_maps = 0
+                elif seen_at != block_seen:
+                    block_maps, block_seen = block_maps + 1, seen_at
+                if (ahead is not None and blocked_since is None and ahead > WALK_BLOCK_NOW_M
+                        and block_maps < WALK_BLOCK_MAPS):
+                    ahead = None                # one map only: keep going (slowing) and look again
                 if ahead is not None:
                     # Something in the way: stop, give it a moment to move off, then give up.
                     if blocked_since is None:
@@ -2551,9 +2610,9 @@ class Walk:
                       **({"pose": dict(pose), "error": self._errors(pose, goal)}
                          if pose and goal else {}))
         finally:
-            self.odom.unsubscribe()
+            self.odom.unsubscribe(internal=True)
             if looking:
-                self.lidar.unsubscribe()
+                self.lidar.unsubscribe(internal=True)
             with self.lock:
                 st = dict(self.state)
             audit("-", "walk-end", f"id={st['id']} {st['state']}",

@@ -93,6 +93,19 @@ def test_viewer_cap(stream):
     stream.unsubscribe()
 
 
+def test_the_relays_own_reader_is_never_refused(stream):
+    """A walk must get its lidar even with every viewer place taken (2026-11-11: two open
+    Navigation pages took all of them and a plan said "no obstacle map from the lidar")."""
+    assert stream.subscribe() and stream.subscribe() and not stream.subscribe()
+    assert stream.subscribe(internal=True)
+    st = stream.status()
+    assert (st["clients"], st["internal"]) == (2, 1)
+    stream.unsubscribe(internal=True)
+    assert not stream.subscribe(), "the viewer cap is unchanged by the relay's own reader"
+    stream.unsubscribe()
+    stream.unsubscribe()
+
+
 def test_bridge_stops_after_the_last_viewer_leaves(stream):
     assert stream.subscribe()
     proc = stream.proc

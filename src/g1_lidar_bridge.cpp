@@ -21,9 +21,9 @@
 // Then the points are placed in the odometry frame with the pose of rt/state_estimator/odom_torso
 // at the moment they arrive, so a turning robot does not smear its own map.
 //
-// WHAT IS AN OBSTACLE: a point between FLOOR + LIDAR_MIN_H (10 cm, plus r * tan(2°) at r metres:
+// WHAT IS AN OBSTACLE: a point between FLOOR + LIDAR_MIN_H (10 cm, plus r * tan(3°) at r metres:
 // LIDAR_TILT_TOL_DEG) and FLOOR + LIDAR_MAX_H
-// (1.5 m, the robot is 1.32 m), from LIDAR_SELF_M (0.35 m, its own arms and body) to
+// (1.5 m, the robot is 1.32 m), from LIDAR_SELF_M (0.45 m, its own arms and body) to
 // LIDAR_RANGE_M (6 m) away. The floor is found in the points themselves: the densest low layer.
 // Kept for LIDAR_WINDOW_MS (300 ms = 3 lidar frames): something that moves away is gone soon.
 //
@@ -202,8 +202,12 @@ int main(int argc, char** argv) {
     const double min_h = env_d("LIDAR_MIN_H", 0.10), max_h = env_d("LIDAR_MAX_H", 1.50);
     // The floor's band grows with distance: a residual tilt of this many degrees lifts the floor
     // r*tan(tilt) at r metres, so far away a little more height is needed to call it an obstacle.
-    const double tilt_tol = std::tan(env_d("LIDAR_TILT_TOL_DEG", 2.0) * M_PI / 180);
-    const double self_m = env_d("LIDAR_SELF_M", 0.35), range_m = env_d("LIDAR_RANGE_M", 6.0);
+    // 3° (was 2): walking, the levelled tilt swings 0.4-5° and the floor 3-5 m off rose into 30-60
+    // "obstacles" a map (recorded on the robot 2026-11-11).
+    const double tilt_tol = std::tan(env_d("LIDAR_TILT_TOL_DEG", 3.0) * M_PI / 180);
+    // 0.45 m (was 0.35): the robot's own right hand showed as an obstacle 0.41 m from the lidar,
+    // 0.33 ahead and 0.25 right (2026-11-11), and stopped a walk "0.29 m ahead".
+    const double self_m = env_d("LIDAR_SELF_M", 0.45), range_m = env_d("LIDAR_RANGE_M", 6.0);
     const long long window_ms = (long long)env_d("LIDAR_WINDOW_MS", 300);
     double hz = env_d("LIDAR_RATE_HZ", 5);
     if (!(hz >= 1 && hz <= 20)) hz = 5;
