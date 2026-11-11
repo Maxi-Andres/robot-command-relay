@@ -157,6 +157,15 @@ WALK_VX = float(os.environ.get("WALK_VX", "0.3"))           # m/s forward/back, 
 WALK_VY = float(os.environ.get("WALK_VY", "0.15"))          # m/s sideways
 WALK_VYAW = float(os.environ.get("WALK_VYAW", "0.4"))       # rad/s
 WALK_MIN_V = 0.08            # slower than this the robot marks time instead of stepping
+# ...in Walk. In Run it stood 19-20 cm short marking time at 0.08 for good (2026-11-11): a guess,
+# to be measured, that Run needs more to step at all.
+WALK_MIN_V_RUN = float(os.environ.get("WALK_MIN_V_RUN", "0.15"))
+# NOT GETTING CLOSER = DONE: within WALK_STALL_NEAR_M of the goal, less than WALK_STALL_GAIN_M
+# closer in WALK_STALL_S, and it stops trying — the final turn, then success or uncertain by
+# WALK_OK_POS as always, saying how short it stopped. Never again a walk that never ends.
+WALK_STALL_NEAR_M = 0.35
+WALK_STALL_GAIN_M = 0.02
+WALK_STALL_S = 3.0
 WALK_MIN_W = 0.12
 WALK_GAIN = 1.0              # 1/s: speed = distance left x this, between the two above
 WALK_YAW_GAIN = 1.5
@@ -1824,7 +1833,7 @@ def validate_goto(body):
     return dx, dy, dyaw
 
 
-def walk_command(pose, goal, phase, aim=None, face=None, lim=None):
+def walk_command(pose, goal, phase, aim=None, face=None, lim=None, min_v=WALK_MIN_V):
     """(vx, vy, vyaw, phase) toward `goal` from `pose`, both {x, y, yaw} in the odom frame.
 
     With a planned path, `aim` (x, y) is the point on it to head for now — the speed still comes
@@ -1856,8 +1865,8 @@ def walk_command(pose, goal, phase, aim=None, face=None, lim=None):
             scale = min(1.0, lvx / max(abs(vx), 1e-9), lvy / max(abs(vy), 1e-9))
             vx, vy = vx * scale, vy * scale
             speed = math.hypot(vx, vy)
-            if speed < WALK_MIN_V:
-                vx, vy = vx * WALK_MIN_V / speed, vy * WALK_MIN_V / speed
+            if speed < min_v:
+                vx, vy = vx * min_v / speed, vy * min_v / speed
             hold = wrap_angle((goal["hold"] if face is None else face) - yaw)
             vyaw = max(-lvyaw, min(lvyaw, WALK_YAW_GAIN * hold))
             return vx, vy, vyaw, "translate"
@@ -2420,6 +2429,8 @@ class Walk:
                 raise RuntimeError("no odometry from the robot")
             if mode is not None:
                 seen, pose = self._switch_mode(seen, pose, mode)
+            min_v = WALK_MIN_V_RUN if WALK_FSM.get(pose.get("fsm")) == "run" else WALK_MIN_V
+            stall_at, stall_left, short = None, math.inf, None
             lim = WALK_AUTO_CAP if auto else (lim or (WALK_VX, WALK_VY, WALK_VYAW))
             cap = lim
 
@@ -2546,7 +2557,13 @@ class Walk:
                             came_in = (gx / left_now, gy / left_now)
                         if came_in is not None and gx * came_in[0] + gy * came_in[1] < 0:
                             phase = "turn"      # walked past it: do not step back and forth
-                    vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim)
+                        if left_now < WALK_STALL_NEAR_M:
+                            if left_now < stall_left - WALK_STALL_GAIN_M:
+                                stall_at, stall_left = now, left_now
+                            elif stall_at is not None and now - stall_at > WALK_STALL_S:
+                                phase = "turn"  # not getting any closer: stop trying
+                                short = left_now
+                    vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim, min_v)
                 self._set(face=round(face, 4) if turn_first else None,
                           pose=dict(pose), phase="align" if turn_first else phase,
                           elapsed_s=round(now, 1), error=self._errors(pose, goal))
@@ -2588,8 +2605,8 @@ class Walk:
                         f = (near - stop_m) / max(slow_m - stop_m, 1e-6)
                         f = max(WALK_SLOW_MIN, min(1.0, f))
                         speed = math.hypot(vx, vy)
-                        if speed * f < WALK_MIN_V:
-                            f = WALK_MIN_V / max(speed, 1e-6)
+                        if speed * f < min_v:
+                            f = min_v / max(speed, 1e-6)
                         vx, vy = vx * min(1.0, f), vy * min(1.0, f)
                 if now - last_send >= 1.0 / self.hz:
                     self._send(f"move {vx:.3f} {vy:.3f} {vyaw:.3f}")
@@ -2603,9 +2620,11 @@ class Walk:
                     pose = fresh
             err = self._errors(pose, goal)
             ok = err["pos_m"] <= WALK_OK_POS and abs(math.radians(err["yaw_deg"])) <= WALK_OK_YAW
+            why = (f"it stopped getting closer {short * 100:.0f} cm from the point"
+                   if short is not None else "stopped further off than expected")
             self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
                       error=err, elapsed_s=round(self.clock() - t0, 1),
-                      reason=None if ok else "stopped further off than expected")
+                      reason=None if ok else why)
         except _WalkCancelled:
             with self.lock:
                 why = self.state.get("cancel_reason") or "cancelled"

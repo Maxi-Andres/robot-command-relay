@@ -775,3 +775,34 @@ def test_turning_in_place_holds_the_heading_it_set_out_for_while_it_drifts():
         time.sleep(0.0005)
     assert wait_done(walk)["state"] in ("success", "uncertain")
     assert len(faces) == 1, f"the heading it turned toward moved while it turned: {sorted(faces)}"
+
+
+class StuckShortRobot(SimRobot):
+    """Marks time instead of stepping below 0.12 m/s, as the G1 in Run did 19-20 cm short of the
+    point (2026-11-11)."""
+
+    def next_line(self, seen, timeout):
+        with self.lock:
+            if math.hypot(self.v[0], self.v[1]) < 0.12:
+                self.v = (0.0, 0.0, self.v[2])
+        return super().next_line(seen, timeout)
+
+
+def test_a_walk_that_stops_getting_closer_ends_and_says_how_short():
+    robot = StuckShortRobot(x=0, y=0, yaw=0)
+    walk = walk_for(robot)
+    walk.start(1.0, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] in ("success", "uncertain"), st
+    if st["state"] == "uncertain":
+        assert "stopped getting closer" in st["reason"], st
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_run_mode_steps_at_its_own_minimum_speed():
+    robot = SimRobot(x=0, y=0, yaw=0, fsm=801)
+    walk = walk_for(robot)
+    walk.start(1.0, 0, 0)
+    assert wait_done(walk)["state"] == "success"
+    speeds = [math.hypot(float(ln.split()[1]), float(ln.split()[2])) for ln in moves(robot)]
+    assert min(s for s in speeds if s > 0) >= relay_server.WALK_MIN_V_RUN - 1e-3
