@@ -2074,6 +2074,36 @@ WALK_SLOW_HALF = 0.35
 WALK_SLOW_MIN = 0.35
 
 
+# A GOAL MARKED AGAINST A WALL is moved to the nearest point it can stand on, at most
+# WALK_GOAL_SNAP_M away, instead of failing ("the point is 12 cm from something: it needs 22",
+# 2026-11-11, a click next to a wall). Once, on the first map: a goal that wandered with every map
+# would follow a person standing there.
+WALK_GOAL_SNAP_M = 0.30
+
+
+def free_goal(goal, cells, clearance=WALK_GOAL_CLEARANCE, within=WALK_GOAL_SNAP_M, step=0.05):
+    """(x, y) nearest to `goal` that is `clearance` from every cell, at most `within` away —
+    `goal` itself when it already is — or None when there is none that close."""
+    pts = list(cells)
+
+    def room(x, y):
+        return min((math.hypot(x - cx, y - cy) for cx, cy in pts), default=math.inf)
+
+    if room(*goal) >= clearance:
+        return tuple(goal)
+    best = None
+    n = int(within / step)
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            d = math.hypot(i * step, j * step)
+            if d > within or (best is not None and d >= best[0]):
+                continue
+            x, y = goal[0] + i * step, goal[1] + j * step
+            if room(x, y) >= clearance:
+                best = (d, (x, y))
+    return best[1] if best else None
+
+
 class NoWay(RuntimeError):
     """No path: the message says why, in words for the operator and the agent."""
 
@@ -2334,6 +2364,11 @@ class Walk:
             if math.hypot(dx, dy) < 0.01:
                 path = [(pose["x"], pose["y"])]          # a turn in place: no way to plan
             else:
+                moved = free_goal((goal["x"], goal["y"]), cells)
+                if moved is not None and moved != (goal["x"], goal["y"]):
+                    out["goal_moved_cm"] = round(100 * math.hypot(moved[0] - goal["x"],
+                                                                  moved[1] - goal["y"]))
+                    goal["x"], goal["y"] = moved
                 try:
                     path = plan_path((pose["x"], pose["y"]), (goal["x"], goal["y"]), cells)
                 except NoWay as exc:
@@ -2424,6 +2459,7 @@ class Walk:
             planned_ok = -math.inf              # when the last plan was found
             block_maps, block_seen = 0, None    # maps in a row with something in the way
             came_in = None                      # the way it came within WALK_NEAR_M (unit x, y)
+            snapped = False                     # the goal checked against the first map
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
@@ -2476,6 +2512,15 @@ class Walk:
                     continue                    # the first map is on its way: do not move yet
                 aim = face = None
                 if cells is not None and phase == "translate":
+                    if not snapped and dist >= 0.01:
+                        snapped = True
+                        moved = free_goal((goal["x"], goal["y"]), cells)
+                        if moved is not None and moved != (goal["x"], goal["y"]):
+                            cm = round(100 * math.hypot(moved[0] - goal["x"], moved[1] - goal["y"]))
+                            goal["x"], goal["y"] = moved
+                            audit("-", "walk-goal-moved", f"{cm} cm off a wall", "-")
+                            self._set(goal={k: goal[k] for k in ("x", "y", "yaw")},
+                                      goal_moved_cm=cm)
                     if seen_at != planned_at:   # a new map: remember it, plan again
                         t_seen = self.clock()
                         for c in cells:

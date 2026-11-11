@@ -806,3 +806,17 @@ def test_run_mode_steps_at_its_own_minimum_speed():
     assert wait_done(walk)["state"] == "success"
     speeds = [math.hypot(float(ln.split()[1]), float(ln.split()[2])) for ln in moves(robot)]
     assert min(s for s in speeds if s > 0) >= relay_server.WALK_MIN_V_RUN - 1e-3
+
+
+def test_a_goal_against_a_wall_moves_to_where_it_can_stand():
+    wall = [(1.0, -1.0 + k * 0.05) for k in range(41)]               # a wall 1 m ahead
+    assert relay_server.free_goal((2.0, 0.0), wall) == (2.0, 0.0)     # clear already
+    moved = relay_server.free_goal((0.9, 0.0), wall)                  # 10 cm from it
+    assert moved is not None and 1.0 - moved[0] >= relay_server.WALK_GOAL_CLEARANCE - 1e-9
+    assert relay_server.free_goal((1.0, 0.0), wall, within=0.1) is None   # too far to move
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, wall))
+    walk.start(0.9, 0, 0)
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert st["goal_moved_cm"] >= 10 and robot.x <= 1.0 - 0.2
