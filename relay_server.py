@@ -2037,6 +2037,11 @@ WALK_ALIGN_RAD = math.radians(35)
 # "turning to face the way, 9° off" for good.
 WALK_ALIGNED_RAD = math.radians(15)
 WALK_FREEZE_FACE_M = 0.35
+# The heading it faces is toward a point this far along the path, and while it turns in place that
+# heading is held. With the 0.3 m steering point, the few cm a G1 drifts turning in place swung the
+# wanted heading ~18° and it turned after it for good ("turning to face the way, 18° off",
+# 2026-11-11).
+WALK_FACE_LOOK_M = 1.0
 # SPEED AND MODE, chosen per walk on the page (2026-11-05), as on the drive pad: the walk's top
 # speeds come with the request, up to WALK_CAPS (the command sender clamps at the same 1.2 / 0.5 /
 # 1.2 anyway). Faster means stopping sooner: the stop distance grows WALK_STOP_PER_MS metres for
@@ -2493,10 +2498,15 @@ class Walk:
                         if not facing:          # a short step round something: hold heading
                             face = math.atan2(aim[1] - pose["y"], aim[0] - pose["x"])
                 if facing and phase == "translate":
-                    target = aim if aim is not None else (goal["x"], goal["y"])
-                    if math.hypot(goal["x"] - pose["x"], goal["y"] - pose["y"]) > WALK_FREEZE_FACE_M:
-                        last_face = math.atan2(target[1] - pose["y"], target[0] - pose["x"])
-                    face = last_face
+                    if aligning and last_face is not None:
+                        face = last_face        # turning in place: hold the heading it set out for
+                    else:
+                        target = (lookahead(plan, pose, WALK_FACE_LOOK_M) if plan is not None
+                                  else (goal["x"], goal["y"]))
+                        if math.hypot(goal["x"] - pose["x"],
+                                      goal["y"] - pose["y"]) > WALK_FREEZE_FACE_M:
+                            last_face = math.atan2(target[1] - pose["y"], target[0] - pose["x"])
+                        face = last_face
                 if no_way is not None and phase == "translate":
                     if blocked_since is None:
                         self._send("stop_move")
@@ -2537,7 +2547,8 @@ class Walk:
                         if came_in is not None and gx * came_in[0] + gy * came_in[1] < 0:
                             phase = "turn"      # walked past it: do not step back and forth
                     vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim)
-                self._set(pose=dict(pose), phase="align" if turn_first else phase,
+                self._set(face=round(face, 4) if turn_first else None,
+                          pose=dict(pose), phase="align" if turn_first else phase,
                           elapsed_s=round(now, 1), error=self._errors(pose, goal))
                 if phase == "done":
                     break

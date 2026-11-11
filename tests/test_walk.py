@@ -745,3 +745,33 @@ def test_it_sets_off_within_15_degrees_instead_of_turning_for_good():
     walk.start(2.0, 0.6, 0)                          # 17° left of where it faces
     st = wait_done(walk)
     assert st["state"] == "success", st
+
+
+class DriftingRobot(SimRobot):
+    """Turning in place, it drifts sideways, away from the way it turns, as the G1 did
+    (2026-11-11): 15 cm/s, enough to swing the bearing to a point 0.3 m ahead faster than the
+    turn closes it, so chasing that bearing never ends."""
+
+    def next_line(self, seen, timeout):
+        with self.lock:
+            vx, vy, w = self.v
+            if vx == 0 and vy == 0 and w != 0:
+                side = -math.copysign(0.15, w)            # turning left, it slips right
+                self.x += -math.sin(self.yaw) * side * DT
+                self.y += math.cos(self.yaw) * side * DT
+        return super().next_line(seen, timeout)
+
+
+def test_turning_in_place_holds_the_heading_it_set_out_for_while_it_drifts():
+    robot = DriftingRobot(x=0, y=0, yaw=0)
+    walk = seeing_walk(robot, FakeLidar(robot, []))
+    walk.start(0.5, 1.6, 0)                          # 73° left: it turns first
+    faces = set()
+    end = time.time() + 10
+    while walk.running() and time.time() < end:
+        f = walk.status().get("face")
+        if f is not None:
+            faces.add(f)
+        time.sleep(0.0005)
+    assert wait_done(walk)["state"] in ("success", "uncertain")
+    assert len(faces) == 1, f"the heading it turned toward moved while it turned: {sorted(faces)}"
