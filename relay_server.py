@@ -2118,6 +2118,31 @@ NAV2_LIMIT_S_PER_M = 15.0
 NAV2_SILENT_S = 2.0           # the bridge not answering this long = cancel, failure
 NAV2_OK_POS = 0.3             # Nav2 arrives within 0.25 m (g1_nav config/nav2_g1.yaml)
 NAV2_OK_YAW = math.radians(25)
+# A GOAL WITH ROOM FOR THE ROBOT (2026-11-12): a point marked on a wall or against furniture
+# is one Nav2 never reaches — its controller stops ~0.6 m short of what is ahead, so the walk
+# waited and asked for the way until the operator cancelled. Before Nav2 gets a goal (plan and
+# goto, the page's and the agent's), it is moved at most NAV2_GOAL_SNAP_M to a spot
+# NAV2_GOAL_CLEARANCE from everything the lidar sees, or refused with words saying why.
+NAV2_GOAL_CLEARANCE = float(os.environ.get("NAV2_GOAL_CLEARANCE", "0.35"))
+NAV2_GOAL_SNAP_M = 0.30
+
+
+def nav2_goal_room(pose, dx, dy, cells, clearance=NAV2_GOAL_CLEARANCE, within=NAV2_GOAL_SNAP_M):
+    """(dx, dy, moved_cm): the goal dx forward, dy left of `pose`, moved to where the robot
+    fits if it must (moved_cm 0 when it did not). Raises NoWay when there is no such spot
+    within `within`. `cells` are the lidar's obstacle cells (x, y) in the odometry frame."""
+    c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+    gx, gy = pose["x"] + c * dx - s * dy, pose["y"] + s * dx + c * dy
+    near = [p for p in cells if math.hypot(p[0] - gx, p[1] - gy) <= within + clearance]
+    moved = free_goal((gx, gy), near, clearance=clearance, within=within)
+    if moved is None:
+        raise NoWay(f"that spot is on or against an obstacle: mark one at least "
+                    f"{round(clearance * 100)} cm from walls and things")
+    if moved == (gx, gy):
+        return dx, dy, 0
+    ex, ey = moved[0] - pose["x"], moved[1] - pose["y"]
+    return (c * ex + s * ey, -s * ex + c * ey,
+            round(100 * math.hypot(moved[0] - gx, moved[1] - gy)))
 
 
 class Nav2Client:
@@ -2764,17 +2789,47 @@ class Walk:
             audit("-", "walk-end", f"id={st['id']} {st['state']}",
                   f"{st.get('reason') or '-'} error={st.get('error')}")
 
-    def _plan_nav2(self, dx, dy, dyaw):
+    def _nav2_room(self, pose, dx, dy, wait_s=1.0):
+        """nav2_goal_room() against what the lidar sees now; the goal as it is when there is no
+        map (Nav2 has the same eyes, so it would be as blind)."""
+        if self.lidar is None or not self.lidar.subscribe(internal=True):
+            return dx, dy, 0
+        try:
+            cells, seen, end = None, 0, self.clock() + wait_s
+            while cells is None and self.clock() < end:
+                seen, line = self.lidar.next_line(seen, 0.3)
+                if line is not None:
+                    cells, _d = parse_lidar(line)
+        finally:
+            self.lidar.unsubscribe(internal=True)
+        if cells is None:
+            return dx, dy, 0
+        return nav2_goal_room(pose, dx, dy, cells)
+
+    def _plan_nav2(self, dx, dy, dyaw, wait_s=1.5):
         """plan() by Nav2's planner, in the same answer shape (start, goal, path in odom)."""
-        code, out = self.nav2.plan(dx, dy, dyaw)
         req = {"dx": dx, "dy": dy, "dyaw": dyaw}
+        moved_cm = 0
+        if self.odom.subscribe(internal=True):
+            try:
+                _seen, pose = self._pose(0, wait_s)
+            finally:
+                self.odom.unsubscribe(internal=True)
+            if pose is not None:
+                try:
+                    dx, dy, moved_cm = self._nav2_room(pose, dx, dy)
+                except NoWay as exc:
+                    return 200, {"ok": False, "plan": {"request": req, "path": None,
+                                                       "eyes": "nav2"}, "error": str(exc)}
+        code, out = self.nav2.plan(dx, dy, dyaw)
         if code != 200 or not out.get("ok"):
             return (503 if code in (0, 503) else 200), {
                 "ok": False, "plan": {"request": req, "path": None, "eyes": "nav2"},
                 "error": out.get("error") or f"Nav2 planner: HTTP {code}"}
         return 200, {"ok": True, "plan": {"start": out.get("start"), "goal": out.get("goal"),
                                           "request": req, "path": out.get("path"),
-                                          "eyes": "nav2"}}
+                                          "eyes": "nav2",
+                                          **({"goal_moved_cm": moved_cm} if moved_cm else {})}}
 
     def nav2_move(self, body):
         """(http code, answer) for POST /walk/move, the bridge's velocity for a walk handed to
@@ -2812,6 +2867,10 @@ class Walk:
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
                 raise RuntimeError("no odometry from the robot")
+            dx, dy, moved_cm = self._nav2_room(pose, dx, dy)     # NoWay: refused, unmoved
+            if moved_cm:
+                audit("-", "walk-goal-moved", f"{moved_cm} cm off a wall", "-")
+                self._set(goal_moved_cm=moved_cm)
             if mode is not None:
                 seen, pose = self._switch_mode(seen, pose, mode)
             c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])

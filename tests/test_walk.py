@@ -949,6 +949,51 @@ def test_without_nav2_or_for_a_turn_in_place_the_relay_walks_itself():
     assert wait_done(walk)["state"] == "success" and not up.calls
 
 
+def wall_at(x, y0=-1.0, y1=1.0):
+    """Obstacle points of a wall across the way at x, every 5 cm."""
+    return [(x, y0 + i * 0.05) for i in range(round((y1 - y0) / 0.05) + 1)]
+
+
+def seeing_nav2_walk(robot, nav2, lidar):
+    walk = relay_server.Walk(robot, robot, None, clock=robot.clock, settle_s=0.3, nav2=nav2,
+                             nav2_poll_s=0.0, lidar=lidar)
+    nav2.walk = walk
+    return walk
+
+
+def test_a_goal_on_a_wall_is_refused_before_nav2_sees_it():
+    # 2026-11-12: a point marked on the wall; Nav2 stopped short and waited for ever.
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot)
+    walk = seeing_nav2_walk(robot, nav2, FakeLidar(robot, wall_at(1.5)))
+    code, out = walk.plan(1.5, 0.0, 0.0)
+    assert code == 200 and not out["ok"] and "obstacle" in out["error"]
+    assert not [c for c in nav2.calls if c[0] == "plan"]
+    walk.start(1.5, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "failure" and "obstacle" in st["reason"], st
+    assert not [c for c in nav2.calls if c[0] == "goto"] and not moves(robot)
+
+
+def test_a_goal_close_to_a_wall_is_moved_off_it_for_nav2():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot)
+    walk = seeing_nav2_walk(robot, nav2, FakeLidar(robot, wall_at(1.5)))
+    code, out = walk.plan(1.3, 0.0, 0.0)                  # 20 cm from the wall
+    assert code == 200 and out["ok"] and out["plan"]["goal_moved_cm"] == 15
+    _op, dx, dy, _dyaw = nav2.calls[-1]
+    assert dx == pytest.approx(1.15, abs=0.01) and dy == pytest.approx(0.0, abs=0.01)
+    code, out = walk.plan(1.0, 0.0, 0.0)                  # room enough: as asked
+    assert out["ok"] and "goal_moved_cm" not in out["plan"]
+    assert nav2.calls[-1] == ("plan", 1.0, 0.0, 0.0)
+
+
+def test_nav2_goal_room_turns_the_moved_goal_back_into_the_robots_frame():
+    pose = {"x": 1.0, "y": 2.0, "yaw": math.pi / 2}       # facing +y
+    dx, dy, cm = relay_server.nav2_goal_room(pose, 1.3, 0.0, [(x / 20, 3.5) for x in range(0, 41)])
+    assert cm == 15 and dx == pytest.approx(1.15, abs=0.01) and dy == pytest.approx(0, abs=0.01)
+
+
 def test_a_plan_comes_from_nav2_in_the_same_shape():
     robot = SimRobot(x=0, y=0, yaw=0)
     walk = nav2_walk(robot, FakeNav2(robot))
