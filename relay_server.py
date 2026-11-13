@@ -167,6 +167,13 @@ WALK_STALL_NEAR_M = 0.35
 WALK_STALL_GAIN_M = 0.02
 WALK_STALL_S = 3.0
 WALK_MIN_W = 0.12
+# The same for the turn at the end: within WALK_TURN_STALL_NEAR of the heading, less than
+# WALK_TURN_STALL_GAIN nearer in WALK_STALL_S, and it stops turning — judged by WALK_OK_YAW as
+# always. The G1 stands ~9 deg off for good below its turning speed (2026-11-11), and a turn in
+# place waited out its whole limit for it: "not there after 43 s", then the agent turned it again
+# (2026-11-13).
+WALK_TURN_STALL_NEAR = math.radians(20)
+WALK_TURN_STALL_GAIN = math.radians(1)
 WALK_GAIN = 1.0              # 1/s: speed = distance left x this, between the two above
 WALK_YAW_GAIN = 1.5
 WALK_POS_TOL = 0.06          # m: this close = arrived
@@ -2563,6 +2570,7 @@ class Walk:
                 seen, pose = self._switch_mode(seen, pose, mode)
             min_v = WALK_MIN_V_RUN if WALK_FSM.get(pose.get("fsm")) == "run" else WALK_MIN_V
             stall_at, stall_left, short = None, math.inf, None
+            turn_at, turn_left, turn_short = None, math.inf, None
             lim = WALK_AUTO_CAP if auto else (lim or (WALK_VX, WALK_VY, WALK_VYAW))
             cap = lim
 
@@ -2704,6 +2712,14 @@ class Walk:
                             elif stall_at is not None and now - stall_at > WALK_STALL_S:
                                 phase = "turn"  # not getting any closer: stop trying
                                 short = left_now
+                    if phase == "turn":
+                        yaw_left = abs(wrap_angle(goal["yaw"] - pose["yaw"]))
+                        if yaw_left < WALK_TURN_STALL_NEAR:
+                            if yaw_left < turn_left - WALK_TURN_STALL_GAIN:
+                                turn_at, turn_left = now, yaw_left
+                            elif turn_at is not None and now - turn_at > WALK_STALL_S:
+                                phase = "done"  # not turning any further: stop trying
+                                turn_short = yaw_left
                     vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim, min_v)
                 self._set(face=round(face, 4) if turn_first else None,
                           pose=dict(pose), phase="align" if turn_first else phase,
@@ -2762,7 +2778,9 @@ class Walk:
             err = self._errors(pose, goal)
             ok = err["pos_m"] <= WALK_OK_POS and abs(math.radians(err["yaw_deg"])) <= WALK_OK_YAW
             why = (f"it stopped getting closer {short * 100:.0f} cm from the point"
-                   if short is not None else "stopped further off than expected")
+                   if short is not None else
+                   f"it stopped turning {math.degrees(turn_short):.0f} deg short of the heading"
+                   if turn_short is not None else "stopped further off than expected")
             self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
                       error=err, elapsed_s=round(self.clock() - t0, 1),
                       reason=None if ok else why)

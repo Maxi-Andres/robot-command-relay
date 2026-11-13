@@ -799,6 +799,32 @@ def test_a_walk_that_stops_getting_closer_ends_and_says_how_short():
     assert robot.lines[-1] == "stop_move"
 
 
+class StuckTurningRobot(SimRobot):
+    """Does not turn at all below 0.2 rad/s: the G1 stood 9 deg off its heading for good."""
+
+    def next_line(self, seen, timeout):
+        with self.lock:
+            if abs(self.v[2]) < 0.2 and self.v[0] == self.v[1] == 0:
+                self.v = (0.0, 0.0, 0.0)
+        return super().next_line(seen, timeout)
+
+
+@pytest.mark.parametrize("turn", [math.radians(45), -math.radians(45), math.radians(90)])
+def test_a_turn_that_stops_turning_ends_soon_and_says_how_short(turn):
+    """2026-11-13: a 45 deg turn waited out its 43 s limit 9 deg off, and the agent took the
+    failure for "not turned" and turned it again."""
+    robot = StuckTurningRobot(x=0, y=0, yaw=0)
+    walk = walk_for(robot)
+    walk.start(0.0, 0.0, turn)
+    st = wait_done(walk)
+    assert st["state"] in ("success", "uncertain"), st          # never "not there after 43 s"
+    assert st["elapsed_s"] < 15, st
+    if st["state"] == "uncertain":
+        assert "stopped turning" in st["reason"] and "short of the heading" in st["reason"], st
+    assert math.copysign(1, robot.yaw) == math.copysign(1, turn)  # it did turn, the right way
+    assert robot.lines[-1] == "stop_move"
+
+
 def test_run_mode_steps_at_its_own_minimum_speed():
     robot = SimRobot(x=0, y=0, yaw=0, fsm=801)
     walk = walk_for(robot)
