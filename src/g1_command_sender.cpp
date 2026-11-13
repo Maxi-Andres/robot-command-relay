@@ -34,6 +34,9 @@
 //                  ends it — the app's own toggle (shake_hand holds the hand out until then).
 //   arm_*          the arm actions the app was not watched sending, by the ARM service's id
 //                  (api 7106) — the ids the robot itself published (GetActionList).
+//                  arm_clap (17, the robot's "clamp") is the clap: action_clap (565) is what
+//                  the app calls "High five clap", and the agent and the pad sent it for "clap"
+//                  (seen on the robot 2026-11-13). arm_clap is not tried on the robot yet.
 //   dance_*        the robot's stored routines, by name (arm api 7108). SAFE-GATED.
 //   stop_dance     arm api 7113.
 //
@@ -148,6 +151,7 @@ int main() {
             {"arm_hand_on_heart",    arm_id(33)},
             {"arm_hands_up_right",   arm_id(34)},
             {"arm_forward_push",     arm_id(36)},
+            {"arm_clap",             arm_id(17)},
             {"dance_waist_drum",     dance("Waist_Drum_Dance")},
             {"dance_scratch_head",   dance("Scratch_head")},
             {"dance_spin_discs",     dance("Spin_discs")},

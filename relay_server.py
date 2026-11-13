@@ -80,7 +80,7 @@ RELAY_UDP_PORT = int(_udp) if _udp.isascii() and _udp.isdigit() and 1024 <= int(
 G1_ACTIONS = (
     {f"action_{a}" for a in ("hug", "clap", "face_wave", "left_kiss", "heart", "hands_up",
                              "x_ray", "right_hand_up", "reject", "shake_hand")}
-    | {f"arm_{a}" for a in ("release_arm", "turn_back_wave", "two_hand_kiss", "right_kiss",
+    | {f"arm_{a}" for a in ("release_arm", "turn_back_wave", "two_hand_kiss", "right_kiss", "clap",
                             "right_heart", "high_wave", "box_win_left", "box_win_right",
                             "box_win_both", "hand_on_heart", "hands_up_right", "forward_push")}
     | {f"dance_{d}" for d in ("waist_drum", "scratch_head", "spin_discs", "throw_money")}
