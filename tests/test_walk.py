@@ -855,8 +855,9 @@ class FakeNav2:
     """Nav2 through relay_bridge, as the relay sees it: it takes a goal, and while it runs it
     drives the robot through the relay's own /walk/move (walk.nav2_move), like the bridge."""
 
-    def __init__(self, robot, up=True, blocked_polls=0, gives_up=False):
+    def __init__(self, robot, up=True, blocked_polls=0, gives_up=False, tolerance=0.05):
         self.robot, self.up, self.walk = robot, up, None
+        self.tolerance = tolerance                    # the real one: 0.25 (nav2_g1.yaml)
         self.blocked_polls, self.gives_up = blocked_polls, gives_up
         self.goal, self.state, self.calls, self.refused = None, "idle", [], []
 
@@ -897,7 +898,7 @@ class FakeNav2:
             else:
                 r = self.robot
                 dx, dy = self.goal[0] - r.x, self.goal[1] - r.y
-                if math.hypot(dx, dy) < 0.05:
+                if math.hypot(dx, dy) < self.tolerance:
                     self.drive({"verb": "stop_move"})
                     self.state = "succeeded"
                 else:
@@ -973,6 +974,94 @@ def test_without_nav2_or_for_a_turn_in_place_the_relay_walks_itself():
     walk = nav2_walk(robot, up)
     walk.start(0.0, 0.0, 1.0)                          # a turn in place: not Nav2's
     assert wait_done(walk)["state"] == "success" and not up.calls
+
+
+def test_nav2_stopping_short_is_finished_by_the_relay_to_the_same_point():
+    # 2026-11-13 on the robot: Nav2 calls a goal reached within 25 cm, and 0.5-1 m walks
+    # stopped ~24 cm short as a success.
+    robot = SimRobot(x=0.5, y=-1.0, yaw=0.4)
+    nav2 = FakeNav2(robot, tolerance=0.25)
+    walk = nav2_walk(robot, nav2)
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "success", st
+    assert [c[0] for c in nav2.calls] == ["goto"]
+    assert 0.06 < st["nav2_left"]["pos_m"] <= 0.25, st    # where Nav2 left it
+    gx, gy = 0.5 + math.cos(0.4), -1.0 + math.sin(0.4)
+    assert math.hypot(robot.x - gx, robot.y - gy) <= relay_server.WALK_POS_TOL + 0.03
+    assert st["error"]["pos_m"] <= relay_server.WALK_POS_TOL + 0.03
+    assert st["start"]["x"] == pytest.approx(0.5) and st["start"]["y"] == pytest.approx(-1.0)
+    assert walk.nav2_move({"verb": "move", "vx": 0.3})[0] == 409   # Nav2 is done with it
+    assert robot.lines[-1] == "stop_move"
+
+
+def test_nav2_arriving_close_enough_is_not_walked_again():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    walk = nav2_walk(robot, FakeNav2(robot, tolerance=0.04))
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "success" and "nav2_left" not in st, st
+
+
+def test_a_step_shorter_than_nav2_can_tell_is_the_relays_own():
+    # 2026-11-13: "walk 20 cm" went to Nav2, which called it done where it stood.
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, tolerance=0.25)
+    walk = nav2_walk(robot, nav2)
+    code, out = walk.start(0.2, 0.0, 0.0)
+    assert code == 200 and out["walk"]["eyes"] != "nav2"
+    st = wait_done(walk)
+    assert st["state"] == "success" and not nav2.calls, (st, nav2.calls)
+    assert robot.x == pytest.approx(0.2, abs=relay_server.WALK_POS_TOL + 0.02)
+    assert walk.plan(0.2, 0.0, 0.0)[1]["plan"].get("eyes") != "nav2" and not nav2.calls
+
+
+def test_the_operator_cancels_the_finish_too():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, tolerance=0.25)
+    walk = nav2_walk(robot, nav2)
+    own_walk = walk._run
+
+    def stop_pressed_as_the_finish_starts(*args, **kw):
+        walk.cancel("stop from the page")
+        own_walk(*args, **kw)
+
+    walk._run = stop_pressed_as_the_finish_starts
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "cancelled" and st["reason"] == "stop from the page", st
+    assert robot.lines[-1] == "stop_move"
+    assert robot.x == pytest.approx(0.75, abs=0.05)          # where Nav2 left it, no further
+
+
+def test_the_finish_walks_with_the_lidar_watching():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, tolerance=0.25)
+    walk = seeing_nav2_walk(robot, nav2, FakeLidar(robot, wall_at(3.0)))
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "success" and st["nav2_left"]["pos_m"] > 0.06, st
+    assert robot.x == pytest.approx(1.0, abs=relay_server.WALK_POS_TOL + 0.02)
+
+
+def test_a_finish_blocked_for_good_ends_uncertain_saying_how_near():
+    robot = SimRobot(x=0, y=0, yaw=0)
+    nav2 = FakeNav2(robot, tolerance=0.25)
+    lidar = FakeLidar(robot, wall_at(3.0))
+    walk = seeing_nav2_walk(robot, nav2, lidar)
+    walk.blocked_wait_s = 0.5
+    own_walk = walk._run
+
+    def someone_steps_in(*args, **kw):          # in front of it as Nav2 hands over
+        lidar.obstacles = [(robot.x + 0.15, y / 20) for y in range(-6, 7)]
+        own_walk(*args, **kw)
+
+    walk._run = someone_steps_in
+    walk.start(1.0, 0.0, 0.0)
+    st = wait_done(walk)
+    assert st["state"] == "uncertain", st
+    assert st["reason"].startswith("Nav2 took it 25 cm from the point, and the rest could not"), st
+    assert robot.lines[-1] == "stop_move"
 
 
 def wall_at(x, y0=-1.0, y1=1.0):

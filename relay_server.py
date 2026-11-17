@@ -2123,8 +2123,15 @@ NAV2_POLL_S = 0.25
 NAV2_LIMIT_BASE_S = 150.0     # its own tree waits up to ~1.5 min for a blocked way
 NAV2_LIMIT_S_PER_M = 15.0
 NAV2_SILENT_S = 2.0           # the bridge not answering this long = cancel, failure
-NAV2_OK_POS = 0.3             # Nav2 arrives within 0.25 m (g1_nav config/nav2_g1.yaml)
-NAV2_OK_YAW = math.radians(25)
+# NAV2 TAKES THE ROBOT THERE, THE WALK BELOW FINISHES (2026-11-17). Nav2 calls a goal reached
+# within its 25 cm (xy_goal_tolerance, which cannot go finer: a G1 step is longer, and finer had
+# it rock back and forth, 2026-11-11). On the robot (2026-11-13) that was "walk 20 cm" ending
+# at once as a success without a step, and 0.5-1 m walks stopping ~24 cm short. So: a walk no
+# longer than NAV2_MIN_M is the walk below's from the start (Nav2 would call it done where it
+# stands), and after Nav2 arrives, the walk below takes the robot the rest of the way to the
+# SAME odometry point when it stands further than WALK_POS_TOL or WALK_OK_YAW from it — with
+# the lidar watching, as any walk of its own.
+NAV2_MIN_M = 0.3              # Nav2 arrives within 0.25 m (g1_nav config/nav2_g1.yaml)
 # A GOAL WITH ROOM FOR THE ROBOT (2026-11-12): a point marked on a wall or against furniture
 # is one Nav2 never reaches — its controller stops ~0.6 m short of what is ahead, so the walk
 # waited and asked for the way until the operator cancelled. Before Nav2 gets a goal (plan and
@@ -2194,6 +2201,10 @@ class Nav2Client:
 
 class NoWay(RuntimeError):
     """No path: the message says why, in words for the operator and the agent."""
+
+
+class Blocked(RuntimeError):
+    """Something stood in the way and did not move off: the message says how far."""
 
 
 def plan_path(start, goal, cells, res=WALK_PLAN_RES, clearance=WALK_CLEARANCE,
@@ -2404,10 +2415,10 @@ class Walk:
         if self.joint_control is not None and self.joint_control.busy():
             return 409, {"ok": False, "error": "the Joints page holds the arms: release them "
                                                "first"}
-        # Asked before taking the lock (it is an HTTP call): a goto that goes somewhere is
-        # Nav2's whenever it is up; a turn in place stays below.
-        use_nav2 = (self.nav2 is not None and math.hypot(dx, dy) >= 0.01
-                    and self.nav2.available())
+        # Asked before taking the lock (it is an HTTP call): a goto that goes further than
+        # Nav2 can tell apart from standing still is Nav2's whenever it is up; a short step or a
+        # turn in place stays below (NAV2_MIN_M).
+        use_nav2 = self._nav2_walks(dx, dy)
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 return 409, {"ok": False, "error": "a walk is already running",
@@ -2424,7 +2435,7 @@ class Walk:
                 zip(("vx", "vy", "vyaw"), lim or (WALK_VX, WALK_VY, WALK_VYAW)))
             self.state["mode"] = mode
             if use_nav2:
-                self.thread = threading.Thread(target=self._run_nav2, args=(dx, dy, dyaw, mode),
+                self.thread = threading.Thread(target=self._walk_nav2, args=(dx, dy, dyaw, mode),
                                                name="walk-nav2", daemon=True)
             else:
                 self.thread = threading.Thread(target=self._run,
@@ -2433,11 +2444,17 @@ class Walk:
             self.thread.start()
             return 200, {"ok": True, "walk": dict(self.state)}
 
+    def _nav2_walks(self, dx, dy):
+        """Whether a walk of dx, dy goes to Nav2: it is up, and the walk is longer than what Nav2
+        already calls arrived (NAV2_MIN_M)."""
+        return (self.nav2 is not None and math.hypot(dx, dy) > NAV2_MIN_M
+                and self.nav2.available())
+
     def plan(self, dx, dy, dyaw, wait_s=1.5):
         """(http code, answer) for a walk NOT taken: where it would go and the way it would take,
         from where the robot stands now and what the lidar sees now. Nothing moves. The page
         shows it and the operator accepts it (a goto), which plans again as it walks."""
-        if (self.nav2 is not None and math.hypot(dx, dy) >= 0.01 and self.nav2.available()):
+        if self._nav2_walks(dx, dy):
             return self._plan_nav2(dx, dy, dyaw)
         if not self.odom.subscribe(internal=True):
             return 503, {"ok": False, "error": "the odometry stream has no room for one more"}
@@ -2546,12 +2563,16 @@ class Walk:
                     return seen, pose
         raise RuntimeError(f"it did not switch to {mode} in {MODE_SWITCH_S:g} s")
 
-    def _run(self, dx, dy, dyaw, lim=None, mode=None, auto=False):
+    def _run(self, dx, dy, dyaw, lim=None, mode=None, auto=False, finish=None):
+        """The walk itself. With `finish` (from _run_nav2): the rest of a walk Nav2 took most of
+        the way — to finish["goal"] in the odometry frame, not dx/dy/dyaw, its start and its time
+        so far kept in what it reports."""
         if not self.odom.subscribe(internal=True):
             self._set(state="failure", reason="the odometry stream has no room for one more")
             return
         looking = self.lidar is not None and self.lidar.subscribe(internal=True)
         t0 = self.clock()
+        t_off = finish["elapsed_s"] if finish else 0.0     # Nav2's part of the walk
         pose = goal = None
         try:
             if self.require_lidar and not looking:
@@ -2568,6 +2589,11 @@ class Walk:
                 raise RuntimeError("no odometry from the robot")
             if mode is not None:
                 seen, pose = self._switch_mode(seen, pose, mode)
+            if finish is not None:              # the same point Nav2 was given, from here
+                fx, fy = finish["goal"]["x"] - pose["x"], finish["goal"]["y"] - pose["y"]
+                c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+                dx, dy = c * fx + s * fy, -s * fx + c * fy
+                dyaw = wrap_angle(finish["goal"]["yaw"] - pose["yaw"])
             min_v = WALK_MIN_V_RUN if WALK_FSM.get(pose.get("fsm")) == "run" else WALK_MIN_V
             stall_at, stall_left, short = None, math.inf, None
             turn_at, turn_left, turn_short = None, math.inf, None
@@ -2591,8 +2617,9 @@ class Walk:
                           (dx < 0 and abs(dy) <= 0.3 and dist <= WALK_BACKSTEP_M))
             last_face = None
             aligning = False
-            self._set(state="running", start=dict(pose), pose=dict(pose),
-                      goal={k: goal[k] for k in ("x", "y", "yaw")}, limit_s=round(limit, 1))
+            self._set(state="running", start=dict(finish["start"] if finish else pose),
+                      pose=dict(pose), goal={k: goal[k] for k in ("x", "y", "yaw")},
+                      limit_s=round(limit, 1))
             phase = "translate" if dist >= 0.01 else "turn"
             last_send = -1.0
             blocked_since, waited = None, 0.0
@@ -2723,7 +2750,7 @@ class Walk:
                     vx, vy, vyaw, phase = walk_command(pose, goal, phase, aim, face, lim, min_v)
                 self._set(face=round(face, 4) if turn_first else None,
                           pose=dict(pose), phase="align" if turn_first else phase,
-                          elapsed_s=round(now, 1), error=self._errors(pose, goal))
+                          elapsed_s=round(t_off + now, 1), error=self._errors(pose, goal))
                 if phase == "done":
                     break
                 # Only what lies before the goal can be in the way: a table the walk ends 30 cm
@@ -2747,7 +2774,7 @@ class Walk:
                         audit("-", "walk-blocked", f"{ahead:.2f} m ahead", "-")
                     self._set(blocked={"dist_m": round(ahead, 2)})
                     if now - blocked_since > self.blocked_wait_s:
-                        raise RuntimeError(f"blocked: something {ahead:.2f} m ahead did not move "
+                        raise Blocked(f"blocked: something {ahead:.2f} m ahead did not move "
                                            f"in {self.blocked_wait_s:g} s")
                     continue
                 if blocked_since is not None:
@@ -2782,7 +2809,7 @@ class Walk:
                    f"it stopped turning {math.degrees(turn_short):.0f} deg short of the heading"
                    if turn_short is not None else "stopped further off than expected")
             self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
-                      error=err, elapsed_s=round(self.clock() - t0, 1),
+                      error=err, elapsed_s=round(t_off + self.clock() - t0, 1),
                       reason=None if ok else why)
         except _WalkCancelled:
             with self.lock:
@@ -2790,12 +2817,18 @@ class Walk:
                 stop = self.state.get("cancel_stops", True)
             if stop:
                 self._stop_quietly()
-            self._set(state="cancelled", reason=why, elapsed_s=round(self.clock() - t0, 1),
+            self._set(state="cancelled", reason=why, elapsed_s=round(t_off + self.clock() - t0, 1),
                       **({"pose": dict(pose), "error": self._errors(pose, goal)}
                          if pose and goal else {}))
         except Exception as exc:                  # every way out stops the robot
             self._stop_quietly()
-            self._set(state="failure", reason=str(exc), elapsed_s=round(self.clock() - t0, 1),
+            # Finishing what Nav2 walked, a way blocked for the last centimetres leaves the
+            # robot near the point, not a failed walk: "uncertain", saying how near.
+            short = finish is not None and isinstance(exc, (NoWay, Blocked)) and pose and goal
+            self._set(state="uncertain" if short else "failure",
+                      reason=(f"Nav2 took it {100 * finish['nav2_left']['pos_m']:.0f} cm from the "
+                              f"point, and the rest could not be walked: {exc}") if short else str(exc),
+                      elapsed_s=round(t_off + self.clock() - t0, 1),
                       **({"pose": dict(pose), "error": self._errors(pose, goal)}
                          if pose and goal else {}))
         finally:
@@ -2875,12 +2908,13 @@ class Walk:
 
     def _run_nav2(self, dx, dy, dyaw, mode=None):
         """The walk, by Nav2 (see WALK_NAV2_URL): this thread hands it the goal, follows it, and
-        reports in the same shape as _run; the robot's moves come in on nav2_move()."""
+        reports in the same shape as _run; the robot's moves come in on nav2_move(). Returns what
+        _run needs to finish the walk when Nav2 arrived short of the point (else None)."""
         if not self.odom.subscribe(internal=True):
             self._set(state="failure", reason="the odometry stream has no room for one more")
-            return
+            return None
         t0 = self.clock()
-        pose = goal = None
+        pose = goal = finish = None
         try:
             seen, pose = self._pose(0, WALK_ODOM_STALE_S * 2)
             if pose is None:
@@ -2900,7 +2934,8 @@ class Walk:
             code, out = self.nav2.goto(dx, dy, dyaw)
             if code != 200 or not out.get("ok"):
                 raise RuntimeError(f"Nav2 did not take the goal: {out.get('error') or code}")
-            self._set(state="running", start=dict(pose), pose=dict(pose), goal=dict(goal),
+            start = dict(pose)
+            self._set(state="running", start=start, pose=dict(pose), goal=dict(goal),
                       limit_s=round(limit, 1), phase="translate")
             silent_since = None
             while True:
@@ -2943,10 +2978,15 @@ class Walk:
                 if fresh is not None:
                     pose = fresh
             err = self._errors(pose, goal)
-            ok = err["pos_m"] <= NAV2_OK_POS and abs(math.radians(err["yaw_deg"])) <= NAV2_OK_YAW
-            self._set(state="success" if ok else "uncertain", phase="done", pose=dict(pose),
-                      error=err, blocked=None, elapsed_s=round(self.clock() - t0, 1),
-                      reason=None if ok else "Nav2 arrived further off than expected")
+            if err["pos_m"] > WALK_POS_TOL or abs(math.radians(err["yaw_deg"])) > WALK_OK_YAW:
+                # Nav2 calls it arrived within its 25 cm: the walk below does the rest.
+                elapsed = round(self.clock() - t0, 1)
+                self._set(pose=dict(pose), error=err, blocked=None, elapsed_s=elapsed,
+                          nav2_left=err)
+                finish = {"goal": goal, "start": start, "elapsed_s": elapsed, "nav2_left": err}
+                return finish
+            self._set(state="success", phase="done", pose=dict(pose), error=err, blocked=None,
+                      elapsed_s=round(self.clock() - t0, 1))
         except _WalkCancelled:
             with self.lock:
                 self.nav2_active = False
@@ -2970,8 +3010,19 @@ class Walk:
             self.odom.unsubscribe(internal=True)
             with self.lock:
                 st = dict(self.state)
-            audit("-", "walk-end", f"id={st['id']} {st['state']} nav2",
-                  f"{st.get('reason') or '-'} error={st.get('error')}")
+            if finish is not None:
+                audit("-", "walk-nav2-short", f"id={st['id']} the relay finishes",
+                      f"error={st.get('error')}")
+            else:
+                audit("-", "walk-end", f"id={st['id']} {st['state']} nav2",
+                      f"{st.get('reason') or '-'} error={st.get('error')}")
+        return None
+
+    def _walk_nav2(self, dx, dy, dyaw, mode=None):
+        """A walk by Nav2, finished by the walk below when Nav2 stopped short of the point."""
+        finish = self._run_nav2(dx, dy, dyaw, mode)
+        if finish is not None:
+            self._run(0.0, 0.0, 0.0, finish=finish)
 
     def _stop_quietly(self):
         try:
