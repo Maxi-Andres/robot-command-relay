@@ -260,3 +260,35 @@ def test_the_stream_needs_the_token_and_a_mic(relay):
     srv.mic = None
     code, _ctype, body = get(url, "/audio/mic/stream")
     assert code == 404 and b"no microphone" in body
+
+
+def test_the_robots_own_voice_reaches_the_streams_as_silence(relay):
+    """Catches (2026-11-17): Nav2's "Con permiso.", played from the robot, run by the agent."""
+    _url, srv = relay
+    now = [100.0]
+    srv.mic.clock = lambda: now[0]
+    assert srv.mic.heard(b"\x03\x00") == b"\x03\x00"
+    srv.mic.quiet(1.5)
+    assert srv.mic.heard(b"\x03\x00" * 4) == bytes(8)
+    now[0] += 1.5 + relay_server.MIC_SELF_GUARD_S + 0.01
+    assert srv.mic.heard(b"\x03\x00") == b"\x03\x00"
+
+
+def say(url, seconds):
+    from test_relay_audio import make_wav
+    req = urllib.request.Request(url + "/audio/say", data=make_wav(seconds), method="POST",
+                                 headers={"Authorization": f"Bearer {TOKEN}",
+                                          "Content-Type": "audio/wav"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status
+
+
+@pytest.mark.parametrize("from_the_robot", [True, False])
+def test_only_a_sound_played_from_the_robot_itself_quiets_the_mic(relay, monkeypatch,
+                                                                  from_the_robot):
+    """The app's own speech keeps the mic open: its ear mutes itself and still hears "Bender"."""
+    url, srv = relay
+    if not from_the_robot:                  # the tests call from 127.0.0.1: make it someone else
+        monkeypatch.setattr(relay_server, "MIC_SELF_SOURCES", ())
+    assert say(url, 2.0) == 200
+    assert (srv.mic.heard(b"\x03\x00") == bytes(2)) is from_the_robot

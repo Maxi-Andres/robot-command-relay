@@ -156,10 +156,14 @@ WALK_MAX_TURN = math.pi                                     # per request, eithe
 WALK_VX = float(os.environ.get("WALK_VX", "0.3"))           # m/s forward/back, at most
 WALK_VY = float(os.environ.get("WALK_VY", "0.15"))          # m/s sideways
 WALK_VYAW = float(os.environ.get("WALK_VYAW", "0.4"))       # rad/s
-WALK_MIN_V = 0.08            # slower than this the robot marks time instead of stepping
-# ...in Walk. In Run it stood 19-20 cm short marking time at 0.08 for good (2026-11-11): a guess,
-# to be measured, that Run needs more to step at all.
-WALK_MIN_V_RUN = float(os.environ.get("WALK_MIN_V_RUN", "0.15"))
+# Slower than this the robot marks time instead of stepping. MEASURED with Nav2 (2026-11-11,
+# nav2_g1.yaml): below ~0.3 m/s the G1 marks time, in Walk and in Run — it stopped dead 0.48 m
+# short when the controller eased down to 0.2. The 0.08 here before was a guess, and so was
+# 0.15 for Run: finishing the last 25 cm of a Nav2 walk in Run, it marked time 21 cm short
+# (2026-11-17). So nothing here asks less while it walks: the last centimetres at a walking
+# pace, ending on WALK_POS_TOL or on walking past the point.
+WALK_MIN_V = float(os.environ.get("WALK_MIN_V", "0.3"))
+WALK_MIN_V_RUN = float(os.environ.get("WALK_MIN_V_RUN", str(WALK_MIN_V)))
 # NOT GETTING CLOSER = DONE: within WALK_STALL_NEAR_M of the goal, less than WALK_STALL_GAIN_M
 # closer in WALK_STALL_S, and it stops trying — the final turn, then success or uncertain by
 # WALK_OK_POS as always, saying how short it stopped. Never again a walk that never ends.
@@ -580,6 +584,14 @@ MIC_FIRST_PACKET_S = float(os.environ.get("MIC_FIRST_PACKET_S", "3"))
 # Mic mode stays on this long after the last listen, so a conversation does not pay the
 # stream's start-up on every phrase; then it is switched off (it also runs the robot's ASR).
 MIC_IDLE_OFF_S = float(os.environ.get("MIC_IDLE_OFF_S", "60"))
+# THE ROBOT'S OWN VOICE IS NOT AN INSTRUCTION (2026-11-17): Nav2 asking for the way out loud
+# (g1_nav relay_bridge, "Con permiso.") was heard by the app's ear and run by the agent as
+# "con permiso". What the APP says the app's ear already mutes itself for (still listening for
+# "Bender" over it, to be interrupted); a sound played from this machine — the robot itself —
+# is one the app knows nothing about, so the streams carry silence while it plays, and
+# MIC_SELF_GUARD_S after (the room's echo).
+MIC_SELF_GUARD_S = 0.6
+MIC_SELF_SOURCES = ("127.0.0.1", "::1")
 
 
 def mic_local_ip():
@@ -665,6 +677,17 @@ class Mic:
         self.on = False
         self.streams = 0
         self.timer = None
+        self.clock = time.monotonic
+        self.quiet_until = 0.0
+
+    def quiet(self, seconds):
+        """The streams carry silence for `seconds` from now, plus MIC_SELF_GUARD_S."""
+        with self.state:
+            self.quiet_until = max(self.quiet_until, self.clock() + seconds + MIC_SELF_GUARD_S)
+
+    def heard(self, data):
+        """A packet as the streams pass it: silence of the same length while quiet."""
+        return bytes(len(data)) if self.clock() < self.quiet_until else data
 
     def _ensure_on(self):              # caller holds self.state
         if self.timer:
@@ -1874,6 +1897,9 @@ def walk_command(pose, goal, phase, aim=None, face=None, lim=None, min_v=WALK_MI
             speed = math.hypot(vx, vy)
             if speed < min_v:
                 vx, vy = vx * min_v / speed, vy * min_v / speed
+                # ...but never over the top speeds (sideways is slower: WALK_VY)
+                scale = min(1.0, lvx / max(abs(vx), 1e-9), lvy / max(abs(vy), 1e-9))
+                vx, vy = vx * scale, vy * scale
             hold = wrap_angle((goal["hold"] if face is None else face) - yaw)
             vyaw = max(-lvyaw, min(lvyaw, WALK_YAW_GAIN * hold))
             return vx, vy, vyaw, "translate"
@@ -3515,10 +3541,16 @@ class Handler(BaseHTTPRequestHandler):
             with tempfile.NamedTemporaryFile(prefix="relay-say-", suffix=".wav",
                                              delete=False) as fh:
                 fh.write(body)
+            mic = getattr(self.server, "mic", None)
+            own_voice = mic is not None and src in MIC_SELF_SOURCES
+            if own_voice:                     # quiet from before it starts (MIC_SELF_SOURCES)
+                mic.quiet(info["seconds"])
             try:
                 reply = self.server.audio.send(f"say {fh.name}")
             finally:
                 os.unlink(fh.name)
+            if own_voice:                     # ...to after it ends: it plays once uploaded
+                mic.quiet(info["seconds"])
             audit(src, "audio-say", f"seconds={info['seconds']} rate={info['rate']}", reply)
             if not reply.startswith("ok"):
                 return self._json(502, {"ok": False, "error": reply})
@@ -3597,7 +3629,7 @@ class Handler(BaseHTTPRequestHandler):
                     data, _src = sock.recvfrom(65535)
                 except socket.timeout:
                     continue
-                self.wfile.write(data)
+                self.wfile.write(mic.heard(data))
                 self.wfile.flush()
                 sent += len(data)
         except (BrokenPipeError, ConnectionResetError, OSError):

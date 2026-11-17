@@ -574,13 +574,15 @@ def test_it_slows_down_coming_up_to_something():
     robot = SimRobot(x=0, y=0, yaw=0)
     table = [(1.6, -1.0 + k * 0.05) for k in range(41)]
     walk = seeing_walk(robot, FakeLidar(robot, table))
-    walk.start(1.3, 0, 0)                           # to 30 cm from a table edge
+    # Faster than the slowest it steps at: at 0.3 (WALK_VX) there is nothing to slow down to.
+    walk.start(1.3, 0, 0, lim=(0.6, 0.3, 0.4))      # to 30 cm from a table edge
     st = wait_done(walk)
     assert st["state"] == "success", st
     speeds = [float(ln.split()[1]) for ln in moves(robot)]
-    assert max(speeds) == pytest.approx(relay_server.WALK_VX)       # full speed when clear
-    # Within the slow zone (the last stretch) it never ran at full speed.
-    assert max(speeds[-5:]) < relay_server.WALK_VX * 0.8
+    assert max(speeds) == pytest.approx(0.6)                        # full speed when clear
+    # Within the slow zone (the last stretch) it never ran at full speed, nor marked time.
+    assert max(speeds[-5:]) < 0.6 * 0.8
+    assert min(s for s in speeds if s > 0) >= relay_server.WALK_MIN_V - 1e-3
 
 
 def test_a_walk_to_the_side_turns_and_walks_forward_not_like_a_crab():
@@ -823,6 +825,18 @@ def test_a_turn_that_stops_turning_ends_soon_and_says_how_short(turn):
         assert "stopped turning" in st["reason"] and "short of the heading" in st["reason"], st
     assert math.copysign(1, robot.yaw) == math.copysign(1, turn)  # it did turn, the right way
     assert robot.lines[-1] == "stop_move"
+
+
+def test_the_last_centimetres_are_walked_at_a_walking_pace():
+    # 2026-11-17: finishing a Nav2 walk in Run at 0.15-0.25 m/s, the G1 marked time 21 cm short.
+    assert relay_server.WALK_MIN_V >= 0.3 and relay_server.WALK_MIN_V_RUN >= 0.3
+    goal = {"x": 1.0, "y": 0.0, "yaw": 0.0, "hold": 0.0}
+    vx, vy, _w, _ = relay_server.walk_command({"x": 0.79, "y": 0, "yaw": 0}, goal, "translate",
+                                               min_v=relay_server.WALK_MIN_V_RUN)
+    assert math.hypot(vx, vy) == pytest.approx(0.3)
+    # sideways it still keeps to the sideways top speed
+    vx, vy, _w, _ = relay_server.walk_command({"x": 1.0, "y": -0.2, "yaw": 0}, goal, "translate")
+    assert abs(vy) <= relay_server.WALK_VY + 1e-9
 
 
 def test_run_mode_steps_at_its_own_minimum_speed():
